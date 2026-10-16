@@ -21,7 +21,8 @@ use crate::render::{ClockPulses, RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{self, Transport, TransportEffect};
 
-/// How many rendered events can wait for submission, without allocating.
+/// How many rendered events can wait for submission on each port, without
+/// allocating.
 const RENDER_CAPACITY: usize = 4096;
 
 /// The longest the engine sleeps before checking for commands and new
@@ -34,11 +35,54 @@ const CLOCK_SETUP: Duration = Duration::from_millis(1);
 /// All Notes Off, which panic sends on every channel.
 const ALL_NOTES_OFF: U7 = U7::saturating(123);
 
-/// A snapshot staged for a playback bar, including any early submission.
+/// A snapshot staged for a playback bar.
 struct SnapshotSwitch {
     line: Ticks,
     project: Arc<Project>,
-    submitted: bool,
+}
+
+/// One port's share of playback. Each port renders and sends at its own
+/// pace, its latency ahead of when its messages are heard.
+struct PortStream {
+    /// How much earlier than they are heard its messages go out.
+    latency: Duration,
+    /// Rendered events not sent yet, in send order.
+    rendered: Vec<RenderedEvent>,
+    /// The next tick to render.
+    cursor: Ticks,
+    /// The last event rendered when a full buffer splits a tick.
+    render_after: Option<RenderedEvent>,
+    /// Whether this port has submitted its side of the waiting switch,
+    /// perhaps early. Only delivery makes the switch irreversible.
+    switched: bool,
+}
+
+impl PortStream {
+    fn new(settings: &PortSettings) -> Self {
+        Self {
+            latency: settings.latency,
+            rendered: Vec::with_capacity(RENDER_CAPACITY),
+            cursor: Ticks::ZERO,
+            render_after: None,
+            switched: false,
+        }
+    }
+
+    /// Drops the events not sent yet.
+    fn clear(&mut self) {
+        self.rendered.clear();
+        self.render_after = None;
+        self.switched = false;
+    }
+
+    /// Drops what was rendered from `tick` on, to render it again.
+    fn rewind(&mut self, tick: Ticks) {
+        self.rendered.retain(|event| event.tick < tick);
+        if self.cursor >= tick {
+            self.cursor = tick;
+            self.render_after = None;
+        }
+    }
 }
 
 /// Ownership follows a submission through delivery and cancellation.
@@ -91,6 +135,11 @@ impl Default for EngineConfig {
 /// for live playback, `ManualClock` and a recording to render offline or to
 /// test.
 ///
+/// The timebase says when each tick is heard. Each port sends its messages
+/// its latency earlier, so a port with more latency runs ahead of the others.
+/// Playback starts, and changes take effect, no earlier than the port with
+/// the most latency can still play them, so every port plays them together.
+///
 /// [`SystemClock`]: crate::SystemClock
 pub struct Engine<O, C> {
     link: EngineLink,
@@ -106,14 +155,19 @@ pub struct Engine<O, C> {
     delivered_pulses: Vec<Option<Ticks>>,
     /// A bounded mirror of scheduled work, for restoring state on cancel.
     scheduled: Vec<SubmittedEvent>,
-    /// Rendered events not sent yet, in send order.
-    rendered: Vec<RenderedEvent>,
-    /// Ticks to time, anchored at the last start, locate or tempo change.
+    /// Each port's rendering and sending, in `PortId` order.
+    streams: Vec<PortStream>,
+    /// The most latency of any port.
+    max_latency: Duration,
+    /// How long after a start its first tick is heard: long enough for the
+    /// port with the most latency to send it, and for clock receivers to
+    /// prepare.
+    start_lead: Duration,
+    /// When ticks are heard, anchored at the last start, locate or tempo
+    /// change.
     timebase: Timebase,
-    /// The next tick to render.
-    cursor: Ticks,
-    /// The last event rendered when a full buffer splits a tick.
-    render_after: Option<RenderedEvent>,
+    /// Where playback last started. Nothing before it plays.
+    started: Ticks,
     /// The snapshot playing.
     project: Arc<Project>,
     /// A newer snapshot, waiting for the next bar line.
@@ -130,6 +184,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     pub fn new(link: EngineLink, output: O, clock: C, config: EngineConfig) -> Self {
         let project = Guard::into_inner(link.project());
         let timebase = Timebase::new(clock.now(), Ticks::ZERO, project.tempo);
+        let latencies = config.ports.iter().map(|port| port.latency);
+        let max_latency = latencies.max().unwrap_or_default();
+        let clock_latencies = config.ports.iter().filter(|port| port.clock);
+        let start_lead = clock_latencies
+            .map(|port| port.latency + CLOCK_SETUP)
+            .fold(max_latency, Duration::max);
         Self {
             link,
             output,
@@ -140,10 +200,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             delivered_pulses: vec![None; config.ports.len()],
             // A full render batch plus one switch's note-offs on every port.
             scheduled: Vec::with_capacity(RENDER_CAPACITY + config.ports.len() * 16 * 128),
-            rendered: Vec::with_capacity(RENDER_CAPACITY),
+            streams: config.ports.iter().map(PortStream::new).collect(),
+            max_latency,
+            start_lead,
             timebase,
-            cursor: Ticks::ZERO,
-            render_after: None,
+            started: Ticks::ZERO,
             project,
             waiting: None,
             clock_ports: (0..)
@@ -188,7 +249,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             // Finish work due under the previous snapshot and tempo before
             // applying changes. A submitted switch remains replaceable until
             // playback actually reaches its boundary.
-            self.render_and_send_until(Ticks(self.timebase.tick_at(now).0 + 1), now)?;
+            self.render_and_send_until(now, Duration::ZERO, now)?;
             self.complete_switch(now);
         }
         // The snapshot comes first, so a pattern published just before Play
@@ -200,14 +261,13 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         let now = self.clock.now();
         if self.playing() {
             let ahead = self.ahead();
-            let horizon = Ticks(self.timebase.tick_at(now + ahead).0 + 1);
             let limit = match self.output.delivery() {
                 Delivery::Immediate => now,
                 Delivery::Scheduled { .. } => now + ahead,
             };
-            self.render_and_send_until(horizon, limit)?;
+            self.render_and_send_until(now, ahead, limit)?;
             self.complete_switch(now);
-            self.transport.advance_to(self.timebase.tick_at(now));
+            self.transport.advance_to(self.playhead(now));
         }
         self.output.flush()?;
         self.link.set_status(self.transport.status());
@@ -218,6 +278,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
 
     fn playing(&self) -> bool {
         self.transport.status().state == TransportState::Playing
+    }
+
+    /// The tick heard at `now`, or where playback started until that is
+    /// heard.
+    fn playhead(&self, now: Instant) -> Ticks {
+        self.timebase.tick_at(now).max(self.started)
     }
 
     /// How far ahead to render, and to hand over to a scheduled output.
@@ -231,10 +297,27 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// Picks up a newly published snapshot. While playing, its tempo applies
     /// at once and the rest waits for the next bar line. While stopped, all
     /// of it applies at once.
+    ///
+    /// While playing, a change takes effect after the last tick that the port
+    /// with the most latency may have sent. The snapshot waits while a port
+    /// already plays the waiting switch, or while the ticks before the last
+    /// tempo change are still to be heard: both end within that latency.
     fn check_snapshot(&mut self, now: Instant) -> Result<(), O::Error> {
         let latest = self.link.project();
         let newest = self.waiting.as_ref().map_or(&self.project, |s| &s.project);
         if Arc::ptr_eq(&*latest, newest) {
+            return Ok(());
+        }
+        // Later than anything any port has sent.
+        let heard = now + self.max_latency;
+        let retempo = latest.tempo != self.timebase.tempo();
+        if self.playing()
+            && (self
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| self.timebase.time_of(waiting.line) <= heard)
+                || (retempo && !self.timebase.settled(now)))
+        {
             return Ok(());
         }
         let latest = Guard::into_inner(latest);
@@ -242,30 +325,19 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.adopt(latest);
             return Ok(());
         }
-        let position = self.timebase.tick_at(now);
-        if latest.tempo != self.timebase.tempo() {
-            // All due work was sent using the old mapping. Rebuild future
-            // work, including backend submissions, from the current position
-            // and time, rather than from the future render boundary.
-            self.cancel_scheduled(now + Duration::from_nanos(1))?;
-            self.rendered.clear();
-            self.cursor = Ticks(position.0 + 1);
-            self.render_after = None;
-            self.timebase = Timebase::new(now, position, latest.tempo);
-            if let Some(waiting) = &mut self.waiting {
-                waiting.submitted = false;
-            }
+        let sent = self.timebase.tick_at(heard);
+        if retempo {
+            // All work sent so far keeps the old mapping. Rebuild everything
+            // after it, including backend submissions, at the new tempo from
+            // `heard`, rather than from the future render boundary.
+            self.rewind_from(self.timebase.time_of(Ticks(sent.0 + 1)) - self.max_latency)?;
+            self.timebase.retempo(sent, heard, latest.tempo);
         }
         let bar = self.project.time_signature.bar_length().0;
-        let line = Ticks((position.0 / bar + 1) * bar);
+        let line = Ticks((sent.0 / bar + 1) * bar);
         // The next playback bar may already be rendered or submitted. Trim
-        // both buffers there before staging the latest edit (or undo).
-        self.cancel_scheduled(self.timebase.time_of(line))?;
-        self.rendered.retain(|event| event.tick < line);
-        if self.cursor >= line {
-            self.cursor = line;
-            self.render_after = None;
-        }
+        // both there on every port before staging the latest edit (or undo).
+        self.rewind_from(self.timebase.time_of(line) - self.max_latency)?;
         if let Some(superseded) = self.waiting.take() {
             self.link.retire(superseded.project);
         }
@@ -276,7 +348,6 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.waiting = Some(SnapshotSwitch {
                 line,
                 project: latest,
-                submitted: false,
             });
         }
         Ok(())
@@ -291,7 +362,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn command(&mut self, command: TransportCommand, now: Instant) -> Result<(), O::Error> {
         if self.playing() {
             // So that Stop keeps, and Continue resumes from, where playback is.
-            self.transport.advance_to(self.timebase.tick_at(now));
+            self.transport.advance_to(self.playhead(now));
         }
         let position = self.transport.status().position;
         let effect = self.transport.apply(command);
@@ -317,10 +388,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 // Flush the cue before measuring the lead, so buffered and
                 // immediate outputs both give receivers the full interval.
                 self.output.flush()?;
-                self.clock.sleep_until(self.clock.now() + CLOCK_SETUP);
             }
-            // Anchor clips and pulses together after the receivers are ready.
-            self.timebase = Timebase::new(self.clock.now(), at, self.project.tempo);
+            // Anchor clips and pulses together, once the port with the most
+            // latency can send them and the receivers are ready.
+            let heard = self.clock.now() + self.start_lead;
+            self.timebase = Timebase::new(heard, at, self.project.tempo);
         }
         Ok(())
     }
@@ -343,21 +415,24 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Plays from `at`, starting now. Ends the notes sounding at `position`
-    /// and takes the newest snapshot at once, since nothing carries over a
-    /// jump.
+    /// Plays from `at`. Ends the notes sounding at `position` and takes the
+    /// newest snapshot at once, since nothing carries over a jump.
     fn restart(&mut self, at: Ticks, now: Instant, position: Ticks) -> Result<(), O::Error> {
         self.cancel_scheduled(now + Duration::from_nanos(1))?;
         self.end_notes(now, position)?;
         self.settle();
-        self.cursor = at;
+        self.started = at;
+        for stream in &mut self.streams {
+            stream.cursor = at;
+        }
         Ok(())
     }
 
     /// Drops the events not sent yet and moves to the newest snapshot at once.
     fn settle(&mut self) {
-        self.rendered.clear();
-        self.render_after = None;
+        for stream in &mut self.streams {
+            stream.clear();
+        }
         if let Some(newer) = self.waiting.take() {
             self.adopt(newer.project);
         }
@@ -385,15 +460,10 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// of every port, for notes the engine doesn't know about. Playback
     /// carries on.
     fn panic(&mut self, at: Instant, tick: Ticks) -> Result<(), O::Error> {
-        self.cancel_scheduled(at + Duration::from_nanos(1))?;
-        // Playback continues: render the cancelled future again, including
-        // its note-offs, after ending the notes that really sounded.
-        self.rendered.clear();
-        self.cursor = Ticks(tick.0 + 1);
-        self.render_after = None;
-        if let Some(waiting) = &mut self.waiting {
-            waiting.submitted = false;
-        }
+        // Playback continues: each port renders its cancelled future again,
+        // including its note-offs, after ending the notes that really
+        // sounded.
+        self.rewind_from(at + Duration::from_nanos(1))?;
         self.end_notes(at, tick)?;
         for port in (0..).map(PortId).take(self.sounding.len()) {
             for channel in (0..16).filter_map(Channel::from_index) {
@@ -413,27 +483,42 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Drains oversized windows in bounded batches. Scheduled backpressure
-    /// or events not due yet leave the rest for a later cycle.
-    fn render_and_send_until(&mut self, horizon: Ticks, limit: Instant) -> Result<(), O::Error> {
-        loop {
-            self.render_until(horizon);
-            self.send_until(limit)?;
-            if self.cursor >= horizon
-                || !self.rendered.is_empty()
-                || self.scheduled.len() >= RENDER_CAPACITY
-            {
-                return Ok(());
+    /// Renders each port up to what is heard `reach` after `now`, plus its
+    /// latency, and sends what is due by `limit`. Drains oversized windows in
+    /// bounded batches. Scheduled backpressure or events not due yet leave
+    /// the rest for a later cycle.
+    fn render_and_send_until(
+        &mut self,
+        now: Instant,
+        reach: Duration,
+        limit: Instant,
+    ) -> Result<(), O::Error> {
+        for index in 0..self.streams.len() {
+            let heard = now + reach + self.streams[index].latency;
+            let horizon = Ticks(self.timebase.tick_at(heard).0 + 1);
+            loop {
+                self.render_until(index, horizon);
+                self.send_until(index, limit)?;
+                let stream = &self.streams[index];
+                if stream.cursor >= horizon
+                    || !stream.rendered.is_empty()
+                    || self.scheduled.len() >= RENDER_CAPACITY
+                {
+                    break;
+                }
             }
         }
+        Ok(())
     }
 
     /// Renders only what fits, preserving a continuation within a tick.
     /// Both sides of a staged bar use their own snapshot.
-    fn render_until(&mut self, horizon: Ticks) {
-        while self.cursor < horizon && self.rendered.len() < self.rendered.capacity() {
+    fn render_until(&mut self, index: usize, horizon: Ticks) {
+        let port = PortId(index as u16);
+        let stream = &mut self.streams[index];
+        while stream.cursor < horizon && stream.rendered.len() < stream.rendered.capacity() {
             let (project, end) = match &self.waiting {
-                Some(waiting) if self.cursor >= waiting.line => (&waiting.project, horizon),
+                Some(waiting) if stream.cursor >= waiting.line => (&waiting.project, horizon),
                 Some(waiting) => (&self.project, horizon.min(waiting.line)),
                 None => (&self.project, horizon),
             };
@@ -441,24 +526,26 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 ports: &self.clock_ports,
                 from: self.pulses_from,
             };
-            self.render_after = render_bounded(
+            stream.render_after = render_bounded(
                 project,
                 clock,
-                self.cursor..end,
-                self.render_after,
-                &mut self.rendered,
+                port,
+                stream.cursor..end,
+                stream.render_after,
+                &mut stream.rendered,
             );
-            if let Some(last) = self.render_after {
-                self.cursor = last.tick;
+            if let Some(last) = stream.render_after {
+                stream.cursor = last.tick;
                 return;
             }
-            self.cursor = end;
+            stream.cursor = end;
         }
     }
 
-    /// Sends the rendered events due by `limit`. On reaching a switch's bar
-    /// line, first ends the notes of the tracks that changed.
-    fn send_until(&mut self, limit: Instant) -> Result<(), O::Error> {
+    /// Sends the port's rendered events due by `limit`. On reaching a
+    /// switch's bar line, first ends the notes of its tracks that changed.
+    fn send_until(&mut self, index: usize, limit: Instant) -> Result<(), O::Error> {
+        let latency = self.streams[index].latency;
         let mut sent = 0;
         loop {
             // Leave room for a switch's forced note-offs. If a dense window
@@ -467,50 +554,53 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             if self.scheduled.len() >= RENDER_CAPACITY {
                 break;
             }
-            let next = self.rendered.get(sent).copied();
+            let stream = &self.streams[index];
+            let next = stream.rendered.get(sent).copied();
             if let Some(waiting) = &self.waiting
-                && !waiting.submitted
-                && next.map_or(self.cursor >= waiting.line, |event| {
+                && !stream.switched
+                && next.map_or(stream.cursor >= waiting.line, |event| {
                     event.tick >= waiting.line
                 })
-                && self.timebase.time_of(waiting.line) <= limit
+                && self.timebase.time_of(waiting.line) - latency <= limit
             {
-                self.finish_switch()?;
+                self.finish_switch(index)?;
                 continue;
             }
             let Some(event) = next else { break };
-            let at = self.timebase.time_of(event.tick);
+            let at = self.timebase.time_of(event.tick) - latency;
             if at > limit {
                 break;
             }
             sent += 1;
             self.send(at, event)?;
         }
-        self.rendered.drain(..sent);
+        self.streams[index].rendered.drain(..sent);
         Ok(())
     }
 
-    /// Submits the forced note-offs before any new events at the boundary.
-    /// Keeps the snapshot pending until actual playback reaches that line.
-    fn finish_switch(&mut self) -> Result<(), O::Error> {
+    /// Submits the port's forced note-offs before any new events at the
+    /// boundary. Keeps the snapshot pending until actual playback reaches
+    /// that line.
+    fn finish_switch(&mut self, index: usize) -> Result<(), O::Error> {
         let Some(waiting) = &self.waiting else {
             return Ok(());
         };
         let line = waiting.line;
-        let at = self.timebase.time_of(line);
-        for index in 0..self.project.tracks.len() {
-            let track = &self.project.tracks[index];
+        let port = PortId(index as u16);
+        let at = self.timebase.time_of(line) - self.streams[index].latency;
+        for track_index in 0..self.project.tracks.len() {
+            let track = &self.project.tracks[track_index];
             // A muted track has no notes of its own to end.
-            if track.muted || carries_on(track, &self.waiting.as_ref().unwrap().project) {
+            if track.target.port != port
+                || track.muted
+                || carries_on(track, &self.waiting.as_ref().unwrap().project)
+            {
                 continue;
             }
-            let port = track.target.port;
             let id = track.id;
-            let Some(notes) = self.sounding.get(usize::from(port.0)) else {
-                continue;
-            };
-            let mut notes = notes.for_track(id, track.target.channel);
-            for message in notes.drain_channel(track.target.channel) {
+            let channel = track.target.channel;
+            let mut notes = self.sounding[index].for_track(id, channel);
+            for message in notes.drain_channel(channel) {
                 let message = TimedMessage {
                     at,
                     tick: line,
@@ -520,17 +610,18 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 self.emit(message, Some(id))?;
             }
         }
-        self.waiting.as_mut().unwrap().submitted = true;
+        self.streams[index].switched = true;
         Ok(())
     }
 
-    /// Only delivery, not early submission, makes a switch irreversible.
+    /// Only delivery, not early submission, makes a switch irreversible:
+    /// once every port has submitted its side, the switch completes when the
+    /// port with the most latency gets to the line.
     fn complete_switch(&mut self, now: Instant) {
-        if self
-            .waiting
-            .as_ref()
-            .is_some_and(|waiting| waiting.submitted && self.timebase.time_of(waiting.line) <= now)
-        {
+        if self.waiting.as_ref().is_some_and(|waiting| {
+            self.streams.iter().all(|stream| stream.switched)
+                && self.timebase.time_of(waiting.line) <= now + self.max_latency
+        }) {
             let waiting = self.waiting.take().unwrap();
             self.adopt(waiting.project);
         }
@@ -538,22 +629,19 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
 
     /// Sends one rendered event and keeps track of the notes it starts and
     /// ends. A note-off for a note this track no longer owns, such as one
-    /// Stop ended or another track retriggered, isn't sent. Neither is
-    /// anything for a port without settings in the configuration.
+    /// Stop ended or another track retriggered, isn't sent. Neither is a
+    /// clock pulse the receiver already has.
     fn send(&mut self, at: Instant, event: RenderedEvent) -> Result<(), O::Error> {
-        let Some(notes) = self.sounding.get(usize::from(event.port.0)) else {
-            return Ok(());
-        };
+        let port = usize::from(event.port.0);
         if event.message == MidiMessage::TimingClock
-            && self.delivered_pulses[usize::from(event.port.0)]
-                .is_some_and(|tick| event.tick <= tick)
+            && self.delivered_pulses[port].is_some_and(|tick| event.tick <= tick)
         {
             return Ok(());
         }
         if let MidiMessage::NoteOff { channel, note, .. } = event.message
             && !event
                 .track
-                .is_some_and(|track| notes.owns(track, channel, note))
+                .is_some_and(|track| self.sounding[port].owns(track, channel, note))
         {
             return Ok(());
         }
@@ -606,6 +694,29 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         });
     }
 
+    /// Withdraws everything that goes out at or after `from` and rewinds
+    /// each port to the first tick it would send from then on, to render it
+    /// again. A port with more latency sends its ticks earlier, so it keeps
+    /// more of them.
+    fn rewind_from(&mut self, from: Instant) -> Result<(), O::Error> {
+        self.cancel_scheduled(from)?;
+        for stream in &mut self.streams {
+            let kept = self
+                .timebase
+                .tick_at(from + stream.latency - Duration::from_nanos(1));
+            let first = Ticks(kept.0 + 1).max(self.started);
+            stream.rewind(first);
+            if self
+                .waiting
+                .as_ref()
+                .is_some_and(|waiting| first <= waiting.line)
+            {
+                stream.switched = false;
+            }
+        }
+        Ok(())
+    }
+
     /// Invalidates backend work and reconstructs projected notes. Delivery
     /// can race cancellation: after it returns, any removed note-on due by
     /// then might have sounded. Keep those notes until an off ends them;
@@ -651,19 +762,25 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// When to wake up: at least every poll interval, to pick up commands
-    /// and render ahead, and for an output that takes messages only when
-    /// they are due, at the next event or bar-line switch.
+    /// and render ahead, at the next queued delivery, and for an output that
+    /// takes messages only when they are due, at the next event or bar-line
+    /// switch on any port.
     fn wake_time(&self, now: Instant) -> Instant {
         let mut wake = now + POLL_INTERVAL.min(self.config.lookahead);
-        if let Some(message) = self.scheduled.first() {
-            wake = wake.min(message.timed.at);
+        // Ports send at their own pace, so the queue isn't in time order.
+        if let Some(next) = self.scheduled.iter().map(|event| event.timed.at).min() {
+            wake = wake.min(next);
         }
         if self.playing() && self.output.delivery() == Delivery::Immediate {
-            if let Some(event) = self.rendered.first() {
-                wake = wake.min(self.timebase.time_of(event.tick));
-            }
-            if let Some(waiting) = &self.waiting {
-                wake = wake.min(self.timebase.time_of(waiting.line));
+            for stream in &self.streams {
+                if let Some(event) = stream.rendered.first() {
+                    wake = wake.min(self.timebase.time_of(event.tick) - stream.latency);
+                }
+                if let Some(waiting) = &self.waiting
+                    && !stream.switched
+                {
+                    wake = wake.min(self.timebase.time_of(waiting.line) - stream.latency);
+                }
             }
         }
         wake
@@ -854,16 +971,45 @@ mod tests {
         output: O,
         first_port: PortSettings,
     ) -> (EngineHandle, Engine<O, ManualClock>) {
+        engine_with_ports(project, output, [first_port, PortSettings::default()])
+    }
+
+    /// An engine with a 20 ms lookahead and two ports with these settings.
+    fn engine_with_ports<O: MidiOutput>(
+        project: Arc<Project>,
+        output: O,
+        ports: [PortSettings; 2],
+    ) -> (EngineHandle, Engine<O, ManualClock>) {
         let (handle, link) = link(project);
         let config = EngineConfig {
             lookahead: ms(20),
-            ports: vec![first_port, PortSettings::default()],
+            ports: ports.to_vec(),
             realtime: false,
         };
         (
             handle,
             Engine::new(link, output, ManualClock::new(), config),
         )
+    }
+
+    /// A port with `millis` of latency.
+    fn latency(millis: u64) -> PortSettings {
+        PortSettings {
+            latency: ms(millis),
+            ..PortSettings::default()
+        }
+    }
+
+    /// `track`, moved to port 1.
+    fn on_port_1(track: Arc<Track>) -> Arc<Track> {
+        let mut track = (*track).clone();
+        track.target.port = PortId(1);
+        Arc::new(track)
+    }
+
+    /// Whether every port has submitted its side of the waiting switch.
+    fn submitted<O, C>(engine: &Engine<O, C>) -> bool {
+        engine.waiting.is_some() && engine.streams.iter().all(|stream| stream.switched)
     }
 
     /// Runs the engine until its clock reaches `until`.
@@ -893,28 +1039,40 @@ mod tests {
             .output
             .take()
             .iter()
-            .map(|sent| {
-                let what = match sent.message {
-                    MidiMessage::NoteOn { note, .. } => format!("on {}", note.get()),
-                    MidiMessage::NoteOff { note, .. } => format!("off {}", note.get()),
-                    MidiMessage::ControlChange {
-                        channel,
-                        controller,
-                        value,
-                    } => format!(
-                        "port {} channel {} cc {}={}",
-                        sent.port.0,
-                        channel.number(),
-                        controller.get(),
-                        value.get()
-                    ),
-                    MidiMessage::TimingClock => "clock".to_owned(),
-                    MidiMessage::SongPosition(beats) => format!("SPP {}", beats.get()),
-                    other => format!("{other:?}"),
-                };
-                format!("{:?} {what}", sent.at - origin)
-            })
+            .map(|sent| format!("{:?} {}", sent.at - origin, what(sent)))
             .collect()
+    }
+
+    /// Takes what the engine sent, as [`sent`] does, in one list per port.
+    fn sent_per_port(engine: &mut TestEngine, origin: Instant) -> [Vec<String>; 2] {
+        let mut ports = [Vec::new(), Vec::new()];
+        for sent in engine.output.take() {
+            let line = format!("{:?} {}", sent.at - origin, what(&sent));
+            ports[usize::from(sent.port.0)].push(line);
+        }
+        ports
+    }
+
+    /// What a message is, such as "off 36" or "clock".
+    fn what(sent: &TimedMessage) -> String {
+        match sent.message {
+            MidiMessage::NoteOn { note, .. } => format!("on {}", note.get()),
+            MidiMessage::NoteOff { note, .. } => format!("off {}", note.get()),
+            MidiMessage::ControlChange {
+                channel,
+                controller,
+                value,
+            } => format!(
+                "port {} channel {} cc {}={}",
+                sent.port.0,
+                channel.number(),
+                controller.get(),
+                value.get()
+            ),
+            MidiMessage::TimingClock => "clock".to_owned(),
+            MidiMessage::SongPosition(beats) => format!("SPP {}", beats.get()),
+            other => format!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1107,7 +1265,7 @@ mod tests {
             engine.clock.sleep_until(origin + ms(1990));
             assert_eq!(engine.clock.now(), origin + ms(1990));
             assert!(
-                engine.cursor > Ticks(3840),
+                engine.streams[0].cursor > Ticks(3840),
                 "the next bar is already rendered"
             );
             let mut muted = (*held).clone();
@@ -1140,7 +1298,7 @@ mod tests {
             run_until(&mut engine, origin + ms(1985));
             handle.publish(project(vec![track(1, 10, 3840, &[(0, 38, 240)])]));
             assert!(engine.cycle().unwrap());
-            assert!(engine.waiting.as_ref().unwrap().submitted);
+            assert!(submitted(&engine));
             // The original snapshot must survive until delivery, so a later
             // edit or undo still targets the same upcoming bar.
             assert!(Arc::ptr_eq(&engine.project, &initial));
@@ -1172,7 +1330,7 @@ mod tests {
         let edited = project(vec![track(1, 10, 3840, &[(0, 38, 240)])]);
         handle.publish(edited.clone());
         assert!(engine.cycle().unwrap());
-        assert!(engine.waiting.as_ref().unwrap().submitted);
+        assert!(submitted(&engine));
         engine
             .clock
             .sleep_until(origin + Duration::from_micros(1_987_500));
@@ -1328,7 +1486,7 @@ mod tests {
             muted.muted = true;
             handle.publish(project(vec![Arc::new(muted), unchanged.clone()]));
             assert!(engine.cycle().unwrap());
-            assert!(engine.waiting.as_ref().unwrap().submitted);
+            assert!(submitted(&engine));
             // Cancel the queued cleanup, then either restore the original
             // snapshot or replace it with another edit at that same bar.
             handle.publish(if undo {
@@ -1811,6 +1969,467 @@ mod tests {
     }
 
     #[test]
+    fn slower_ports_send_earlier_so_every_port_sounds_in_time() {
+        let kick = track(1, 10, 960, &[(0, 36, 240)]);
+        let bass = on_port_1(track(2, 1, 960, &[(0, 40, 240)]));
+        let (mut handle, mut engine) = engine_with_ports(
+            project(vec![kick, bass]),
+            RecordingOutput::new(),
+            [latency(30), PortSettings::default()],
+        );
+        // From beat 2, heard 30 ms later, once the slower port can play it.
+        apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(960)),
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Continue);
+        run_until(&mut engine, origin + ms(20));
+        assert!(engine.cycle().unwrap());
+        assert_eq!(handle.status().position, Ticks(960), "until it's heard");
+        run_until(&mut engine, origin + ms(280));
+        assert!(engine.cycle().unwrap());
+        assert_eq!(handle.status().position, Ticks(1440));
+        run_until(&mut engine, origin + ms(700));
+        assert_eq!(
+            sent_per_port(&mut engine, origin),
+            [
+                ["0ns on 36", "125ms off 36", "500ms on 36", "625ms off 36"],
+                ["30ms on 40", "155ms off 40", "530ms on 40", "655ms off 40"],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clock_port_with_latency_still_gets_time_to_prepare() {
+        let kick = track(1, 10, 960, &[(0, 36, 240)]);
+        let bass = on_port_1(track(2, 1, 960, &[(0, 40, 240)]));
+        let slow_clock = PortSettings {
+            latency: ms(30),
+            clock: true,
+        };
+        let (mut handle, mut engine) = engine_with_ports(
+            project(vec![kick, bass]),
+            RecordingOutput::new(),
+            [slow_clock, latency(10)],
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(45));
+        // Tick 0 is heard at 31 ms: the clock port's 30 ms of latency after
+        // the receiver's 1 ms to prepare.
+        assert_eq!(
+            sent_per_port(&mut engine, origin),
+            [
+                vec![
+                    "0ns Start",
+                    "1ms clock",
+                    "1ms on 36",
+                    "21.833334ms clock",
+                    "42.666667ms clock"
+                ],
+                vec!["21ms on 40"],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bar_switch_reaches_each_port_as_it_plays_the_line() {
+        for scheduled in [false, true] {
+            // Both hold a note over the bar line, which is heard at 2.03 s,
+            // and would play another on it.
+            let first = track(1, 1, 7680, &[(3000, 60, 1680), (3840, 64, 120)]);
+            let second = on_port_1(track(2, 2, 7680, &[(3000, 62, 1680), (3840, 65, 120)]));
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = engine_with_ports(
+                project(vec![first, second.clone()]),
+                output,
+                [latency(30), PortSettings::default()],
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            // The slower port has rendered the next bar already.
+            run_until(&mut engine, origin + ms(1985));
+            let mut muted = (*second).clone();
+            muted.muted = true;
+            handle.publish(project(vec![
+                track(1, 1, 7680, &[(3840, 71, 120), (4320, 70, 240)]),
+                Arc::new(muted),
+            ]));
+            run_until(&mut engine, origin + ms(2500));
+            assert_eq!(
+                sent_per_port(&mut engine, origin),
+                [
+                    vec![
+                        "1.5625s on 60",
+                        "2s off 60",
+                        "2s on 71",
+                        "2.0625s off 71",
+                        "2.25s on 70",
+                        "2.375s off 70"
+                    ],
+                    vec!["1.5925s on 62", "2.03s off 62"],
+                ],
+                "scheduled {scheduled}"
+            );
+        }
+    }
+
+    /// When each message is heard: when it was sent plus its port's latency,
+    /// from `origin`, with what it is. Only up to `until`.
+    fn heard(
+        sent: &[TimedMessage],
+        port: u16,
+        latency: Duration,
+        origin: Instant,
+        until: Duration,
+    ) -> Vec<(Duration, String)> {
+        sent.iter()
+            .filter(|sent| sent.port == PortId(port))
+            .map(|sent| (sent.at + latency - origin, what(sent)))
+            .filter(|(heard, _)| *heard <= until)
+            .collect()
+    }
+
+    #[test]
+    fn a_tempo_change_is_heard_from_the_same_tick_on_every_port() {
+        for scheduled in [false, true] {
+            // The kick heard at 1.03 s ends just after the change takes
+            // effect, and the slower port has already handed that note-off
+            // to a scheduled output: the change has to take it back.
+            let kicks = |id| track(id, 10, 960, &[(0, 36, 220)]);
+            let tracks = vec![kicks(1), on_port_1(kicks(2))];
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = engine_with_ports(
+                project(tracks.clone()),
+                output,
+                [latency(30), PortSettings::default()],
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1100));
+            handle.publish(Arc::new(Project {
+                tempo: Bpm::new(240.0).unwrap(),
+                tracks,
+                ..Project::default()
+            }));
+            run_until(&mut engine, origin + ms(2000));
+            let sent = engine.output.messages();
+            let slower = heard(sent, 0, ms(30), origin, ms(1900));
+            let faster = heard(sent, 1, Duration::ZERO, origin, ms(1900));
+            assert_eq!(slower, faster, "scheduled {scheduled}");
+            let kicks: Vec<Duration> = faster
+                .iter()
+                .filter(|(_, what)| what.starts_with("on"))
+                .map(|(heard, _)| *heard)
+                .collect();
+            // The change is heard from 1.13 s: the first kick after it comes
+            // 200 ms later, and the kicks are 250 ms apart from then on.
+            assert_eq!(
+                kicks,
+                [30, 530, 1030, 1330, 1580, 1830].map(ms),
+                "scheduled {scheduled}"
+            );
+        }
+    }
+
+    #[test]
+    fn tempo_changes_close_together_keep_every_port_in_time() {
+        for scheduled in [false, true] {
+            // A 16th every 16th, so every change cuts close to a note.
+            let sixteenths = |id| track(id, 10, 240, &[(0, 42, 120)]);
+            let tracks = vec![sixteenths(1), on_port_1(sixteenths(2))];
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = engine_with_ports(
+                project(tracks.clone()),
+                output,
+                [latency(30), PortSettings::default()],
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            // The first change is heard from 1.16 s. The second comes before
+            // that, and before the faster port sends the hat heard at 1.155 s
+            // at the first tempo.
+            for (at, tempo) in [(1130, 240.0), (1140, 60.0)] {
+                run_until(&mut engine, origin + ms(at));
+                handle.publish(Arc::new(Project {
+                    tempo: Bpm::new(tempo).unwrap(),
+                    tracks: tracks.clone(),
+                    ..Project::default()
+                }));
+            }
+            run_until(&mut engine, origin + ms(2500));
+            assert_eq!(engine.timebase.tempo(), Bpm::new(60.0).unwrap());
+            let sent = engine.output.messages();
+            let slower = heard(sent, 0, ms(30), origin, ms(2400));
+            let faster = heard(sent, 1, Duration::ZERO, origin, ms(2400));
+            assert_eq!(slower, faster, "scheduled {scheduled}");
+            let ons: Vec<Duration> = faster
+                .iter()
+                .filter(|(_, what)| what.starts_with("on"))
+                .map(|(heard, _)| *heard)
+                .collect();
+            let gaps: Vec<Duration> = ons.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            assert_eq!(gaps[0], ms(125), "scheduled {scheduled}");
+            assert_eq!(gaps[gaps.len() - 1], ms(250), "scheduled {scheduled}");
+        }
+    }
+
+    #[test]
+    fn a_panic_before_the_start_is_heard_plays_nothing_before_it() {
+        // A short note just before beat 2, which playback starts from.
+        let notes = |id| track(id, 10, 960, &[(0, 36, 240), (940, 38, 10)]);
+        let (mut handle, mut engine) = engine_with_ports(
+            project(vec![notes(1), on_port_1(notes(2))]),
+            RecordingOutput::new(),
+            [latency(30), PortSettings::default()],
+        );
+        apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(960)),
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Continue);
+        run_until(&mut engine, origin + ms(10));
+        apply(&mut handle, &mut engine, TransportCommand::Panic);
+        run_until(&mut engine, origin + ms(200));
+        let notes = sent_per_port(&mut engine, origin).map(|port| {
+            port.into_iter()
+                .filter(|line| !line.contains(" cc "))
+                .collect::<Vec<_>>()
+        });
+        // The slower port's note ended with the panic. The faster port
+        // hadn't started yet.
+        assert_eq!(
+            notes,
+            [
+                vec!["0ns on 36", "10ms off 36"],
+                vec!["30ms on 36", "155ms off 36"],
+            ]
+        );
+    }
+
+    #[test]
+    fn panic_leaves_no_gap_and_repeats_nothing_on_any_port() {
+        for scheduled in [false, true] {
+            // A 16th of hi-hat every 8th: heard at 31 ms, 156 ms, 281 ms...
+            let hats = |id| track(id, 10, 240, &[(0, 42, 120)]);
+            let slow_clock = PortSettings {
+                latency: ms(30),
+                clock: true,
+            };
+            let fast_clock = PortSettings {
+                clock: true,
+                ..PortSettings::default()
+            };
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = engine_with_ports(
+                project(vec![hats(1), on_port_1(hats(2))]),
+                output,
+                [slow_clock, fast_clock],
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            // The slower port has sent the hat heard at 156 ms, the faster
+            // one hasn't.
+            run_until(&mut engine, origin + ms(130));
+            apply(&mut handle, &mut engine, TransportCommand::Panic);
+            run_until(&mut engine, origin + ms(400));
+            let sent = engine.output.messages();
+            let only = |what: &str, heard: Vec<(Duration, String)>| -> Vec<Duration> {
+                heard
+                    .into_iter()
+                    .filter(|(_, line)| line == what)
+                    .map(|(heard, _)| heard)
+                    .collect()
+            };
+            for what in ["on 42", "clock"] {
+                let slower = only(what, heard(sent, 0, ms(30), origin, ms(400)));
+                let faster = only(what, heard(sent, 1, Duration::ZERO, origin, ms(400)));
+                assert_eq!(slower, faster, "{what}, scheduled {scheduled}");
+            }
+            let hats = only("on 42", heard(sent, 1, Duration::ZERO, origin, ms(400)));
+            assert_eq!(hats, [31, 156, 281].map(ms), "scheduled {scheduled}");
+            for port in [PortId(0), PortId(1)] {
+                let on_port: Vec<TimedMessage> = sent
+                    .iter()
+                    .filter(|sent| sent.port == port)
+                    .copied()
+                    .collect();
+                let ticks: Vec<u64> = pulses(&on_port).iter().map(|pulse| pulse.0).collect();
+                let every_40: Vec<u64> = (0..ticks.len() as u64).map(|n| n * 40).collect();
+                assert_eq!(ticks, every_40, "{port:?}, scheduled {scheduled}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_during_a_switch_waits_until_every_port_has_played_the_line() {
+        // Kicks on beats 1 and 3, so the rest of each bar shows which edit
+        // plays it too.
+        let kick = |id, note| track(id, id as u8, 3840, &[(0, note, 240), (1920, note, 240)]);
+        let both = |note| project(vec![kick(1, note), on_port_1(kick(2, note))]);
+        let (mut handle, mut engine) = engine_with_ports(
+            both(36),
+            RecordingOutput::new(),
+            [latency(30), PortSettings::default()],
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(1000));
+        handle.publish(both(38));
+        // The line is heard at 2.03 s, and the slower port played it at 2 s.
+        // An edit now can't change that bar on the faster port alone.
+        run_until(&mut engine, origin + ms(2015));
+        handle.publish(both(40));
+        run_until(&mut engine, origin + ms(4100));
+        assert_eq!(
+            sent_per_port(&mut engine, origin),
+            [
+                [
+                    "0ns on 36",
+                    "125ms off 36",
+                    "1s on 36",
+                    "1.125s off 36",
+                    "2s on 38",
+                    "2.125s off 38",
+                    "3s on 38",
+                    "3.125s off 38",
+                    "4s on 40"
+                ],
+                [
+                    "30ms on 36",
+                    "155ms off 36",
+                    "1.03s on 36",
+                    "1.155s off 36",
+                    "2.03s on 38",
+                    "2.155s off 38",
+                    "3.03s on 38",
+                    "3.155s off 38",
+                    "4.03s on 40"
+                ],
+            ]
+        );
+    }
+
+    /// Notes when each message actually goes out, by the engine's clock.
+    struct PunctualOutput {
+        clock: SharedClock,
+        sent: Vec<(Instant, TimedMessage)>,
+    }
+
+    impl MidiOutput for PunctualOutput {
+        type Error = Infallible;
+
+        fn delivery(&self) -> Delivery {
+            Delivery::Immediate
+        }
+
+        fn send(&mut self, message: &TimedMessage) -> Result<(), Infallible> {
+            self.sent.push((self.clock.now(), *message));
+            Ok(())
+        }
+
+        fn cancel_from(
+            &mut self,
+            _from: Instant,
+            _cancelled: &mut dyn FnMut(&TimedMessage),
+        ) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn every_port_sends_each_message_right_when_it_is_due() {
+        let kicks = |note| track(1, 10, 960, &[(0, note, 240), (480, 38, 100)]);
+        // A bass note held over the first bar line, where the edit mutes it.
+        let bass = on_port_1(track(2, 1, 3840, &[(0, 40, 700), (3000, 43, 1000)]));
+        let muted = Arc::new(Track {
+            muted: true,
+            ..(*bass).clone()
+        });
+        let (mut handle, link) = link(project(vec![kicks(36), bass.clone()]));
+        let origin = Instant::now();
+        let clock = SharedClock {
+            origin,
+            nanos: Arc::new(AtomicU64::new(0)),
+        };
+        let output = PunctualOutput {
+            clock: clock.clone(),
+            sent: Vec::new(),
+        };
+        let slow_clock = PortSettings {
+            latency: ms(30),
+            clock: true,
+        };
+        let config = EngineConfig {
+            lookahead: ms(20),
+            ports: vec![slow_clock, latency(7)],
+            realtime: false,
+        };
+        let mut engine = Engine::new(link, output, clock, config);
+        handle.command(TransportCommand::Play).unwrap();
+        // A tempo change, an edit and a panic, each in the first cycle at or
+        // after its time.
+        let mut changes = 0;
+        while engine.clock.now() < origin + ms(3000) {
+            let elapsed = engine.clock.now() - origin;
+            if changes == 0 && elapsed >= ms(700) {
+                handle.publish(Arc::new(Project {
+                    tempo: Bpm::new(97.3).unwrap(),
+                    tracks: vec![kicks(36), bass.clone()],
+                    ..Project::default()
+                }));
+                changes += 1;
+            } else if changes == 1 && elapsed >= ms(1500) {
+                handle.publish(Arc::new(Project {
+                    tempo: Bpm::new(97.3).unwrap(),
+                    tracks: vec![kicks(37), muted.clone()],
+                    ..Project::default()
+                }));
+                changes += 1;
+            } else if changes == 2 && elapsed >= ms(2600) {
+                handle.command(TransportCommand::Panic).unwrap();
+                changes += 1;
+            }
+            assert!(engine.cycle().unwrap());
+        }
+        let sent = &engine.output.sent;
+        assert!(sent.len() > 150, "{}", sent.len());
+        for (when, message) in sent {
+            assert_eq!(*when, message.at, "{message:?}");
+        }
+        let played =
+            |wanted: fn(&MidiMessage) -> bool| sent.iter().any(|(_, sent)| wanted(&sent.message));
+        assert!(played(
+            |message| matches!(message, MidiMessage::NoteOn { note, .. } if note.get() == 37)
+        ));
+        assert!(played(
+            |message| matches!(message, MidiMessage::ControlChange { controller, .. } if *controller == ALL_NOTES_OFF)
+        ));
+        // The faster port ends the bass note as it reaches the line, though it
+        // has nothing else to send then.
+        let line = engine.timebase.time_of(Ticks(3840));
+        let bass_end = sent
+            .iter()
+            .rfind(|(_, sent)| {
+                sent.port == PortId(1) && matches!(sent.message, MidiMessage::NoteOff { .. })
+            })
+            .map(|(when, sent)| (*when, what(sent)));
+        assert_eq!(bass_end, Some((line - ms(7), "off 43".to_owned())));
+    }
+
+    #[test]
     fn scheduled_outputs_get_messages_ahead_of_time() {
         let beat = track(1, 10, 960, &[(0, 36, 240)]);
         let output = RecordingOutput::scheduled(ms(50));
@@ -2132,13 +2751,13 @@ mod tests {
                 };
                 let (mut handle, mut engine) = engine(project(vec![dense]), output);
                 let capacity = engine.scheduled.capacity();
-                let render_capacity = engine.rendered.capacity();
+                let render_capacity = engine.streams[0].rendered.capacity();
                 let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
                 run_until(&mut engine, origin + ms(115));
                 if scheduled {
                     assert_eq!(engine.scheduled.len(), RENDER_CAPACITY);
                 } else {
-                    assert_eq!(engine.rendered.len(), RENDER_CAPACITY);
+                    assert_eq!(engine.streams[0].rendered.len(), RENDER_CAPACITY);
                 }
                 run_until(&mut engine, origin + ms(150));
                 let messages = engine.output.messages();
@@ -2151,8 +2770,8 @@ mod tests {
                     ));
                 }
                 assert_eq!(engine.scheduled.capacity(), capacity);
-                assert_eq!(engine.rendered.capacity(), render_capacity);
-                assert!(engine.rendered.is_empty());
+                assert_eq!(engine.streams[0].rendered.capacity(), render_capacity);
+                assert!(engine.streams[0].rendered.is_empty());
             }
         }
     }

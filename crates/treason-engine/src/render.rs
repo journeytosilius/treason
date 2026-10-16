@@ -65,17 +65,19 @@ pub fn render(
     out: &mut Vec<RenderedEvent>,
 ) {
     let first = out.len();
-    visit(project, clock, window, |event| out.push(event));
+    visit(project, clock, None, window, |event| out.push(event));
     out[first..].sort_unstable_by_key(send_order);
 }
 
-/// Appends the earliest events that fit in the remaining capacity, without
-/// allocating. If the window did not fit, returns its last appended event:
+/// Appends the earliest events for `port` that fit in the remaining
+/// capacity, without allocating: [`render`]'s events on that port, in the
+/// same order. If the window did not fit, returns its last appended event:
 /// resume at that tick, passing it as `after`, to preserve even a split tick.
 /// The caller must provide at least one free slot.
 pub(crate) fn render_bounded(
     project: &Project,
     clock: ClockPulses<'_>,
+    port: PortId,
     window: Range<Ticks>,
     after: Option<RenderedEvent>,
     out: &mut Vec<RenderedEvent>,
@@ -83,7 +85,7 @@ pub(crate) fn render_bounded(
     assert!(out.len() < out.capacity());
     let first = out.len();
     let mut overflow = false;
-    visit(project, clock, window, |event| {
+    visit(project, clock, Some(port), window, |event| {
         if after.is_some_and(|after| send_order(&event) <= send_order(&after)) {
             return;
         }
@@ -127,17 +129,20 @@ pub(crate) fn render_bounded(
     overflow.then(|| *out.last().unwrap())
 }
 
+/// Visits the events in `window`, unsorted: all of them, or only `port`'s.
 fn visit(
     project: &Project,
     clock: ClockPulses<'_>,
+    port: Option<PortId>,
     window: Range<Ticks>,
     mut emit: impl FnMut(RenderedEvent),
 ) {
     if window.start >= window.end {
         return;
     }
+    let wanted = |target: PortId| port.is_none_or(|port| port == target);
     for tick in clock_pulses(window.start.max(clock.from)..window.end) {
-        for &port in clock.ports {
+        for &port in clock.ports.iter().filter(|&&port| wanted(port)) {
             emit(RenderedEvent {
                 tick,
                 port,
@@ -149,7 +154,7 @@ fn visit(
         }
     }
     for (index, track) in project.tracks.iter().enumerate() {
-        if !track.muted {
+        if !track.muted && wanted(track.target.port) {
             render_track(index, track, window.clone(), &mut emit);
         }
     }
@@ -389,35 +394,49 @@ mod tests {
                     note(360, 62, 240),
                 ],
             ),
-            track(
-                2,
-                240,
-                vec![control(0, 101, 0), control(0, 100, 0), control(0, 6, 12)],
-            ),
+            Track {
+                target: OutputTarget {
+                    port: PortId(1),
+                    channel: Channel::DRUMS,
+                },
+                ..track(
+                    2,
+                    240,
+                    vec![control(0, 101, 0), control(0, 100, 0), control(0, 6, 12)],
+                )
+            },
         ]);
-        // Pulses on two ports crowd the ticks they share with the clips.
+        // Pulses on both ports crowd the ticks they share with the clips.
         let clock = ClockPulses {
             ports: &[PortId(0), PortId(1)],
             from: Ticks::ZERO,
         };
-        let mut expected = Vec::new();
-        render(&project, clock, Ticks::ZERO..Ticks(2000), &mut expected);
-        for capacity in 1..=7 {
-            let mut batch = Vec::with_capacity(capacity);
-            let mut actual = Vec::new();
-            let mut start = Ticks::ZERO;
-            let mut after = None;
-            loop {
-                let next = render_bounded(&project, clock, start..Ticks(2000), after, &mut batch);
-                assert_eq!(batch.capacity(), capacity);
-                actual.extend_from_slice(&batch);
-                batch.clear();
-                let Some(last) = next else { break };
-                assert_ne!(next, after, "rendering must progress");
-                start = last.tick;
-                after = next;
+        let mut everything = Vec::new();
+        render(&project, clock, Ticks::ZERO..Ticks(2000), &mut everything);
+        for port in [PortId(0), PortId(1)] {
+            let expected: Vec<_> = everything
+                .iter()
+                .filter(|event| event.port == port)
+                .copied()
+                .collect();
+            for capacity in 1..=7 {
+                let mut batch = Vec::with_capacity(capacity);
+                let mut actual = Vec::new();
+                let mut start = Ticks::ZERO;
+                let mut after = None;
+                loop {
+                    let window = start..Ticks(2000);
+                    let next = render_bounded(&project, clock, port, window, after, &mut batch);
+                    assert_eq!(batch.capacity(), capacity);
+                    actual.extend_from_slice(&batch);
+                    batch.clear();
+                    let Some(last) = next else { break };
+                    assert_ne!(next, after, "rendering must progress");
+                    start = last.tick;
+                    after = next;
+                }
+                assert_eq!(actual, expected, "port {port:?}, batch capacity {capacity}");
             }
-            assert_eq!(actual, expected, "batch capacity {capacity}");
         }
     }
 
@@ -431,6 +450,7 @@ mod tests {
             render_bounded(
                 &project,
                 NO_CLOCK,
+                PortId(0),
                 Ticks::ZERO..Ticks(241),
                 None,
                 &mut batch
@@ -438,13 +458,21 @@ mod tests {
             None
         );
         assert_eq!(batch, expected[..2]);
-        let after = render_bounded(&project, NO_CLOCK, Ticks(241)..Ticks(960), None, &mut batch);
+        let window = Ticks(241)..Ticks(960);
+        let after = render_bounded(&project, NO_CLOCK, PortId(0), window, None, &mut batch);
         assert_eq!(batch, expected[..3]);
         assert_eq!(batch.capacity(), 3);
         let last = after.expect("the fourth event must remain unrendered");
         batch.clear();
         assert_eq!(
-            render_bounded(&project, NO_CLOCK, last.tick..Ticks(960), after, &mut batch),
+            render_bounded(
+                &project,
+                NO_CLOCK,
+                PortId(0),
+                last.tick..Ticks(960),
+                after,
+                &mut batch
+            ),
             None
         );
         assert_eq!(batch, expected[3..]);
