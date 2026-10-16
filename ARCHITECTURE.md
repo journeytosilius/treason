@@ -243,6 +243,8 @@ nothing else has to link them.
   `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
   `cargo test --workspace --all-features` and
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features`.
+  CI runs them on every pull request and on `main`, and also lints with
+  default features and with each `treason-io` backend alone.
 - Channels are 1–16 wherever people or agents see them (files, tools) and
   0–15 internally. `Channel` handles the conversion.
 - Stubs carry `#[expect(unused_variables, reason = "not implemented yet")]`
@@ -252,8 +254,26 @@ nothing else has to link them.
 
 ## Next steps
 
-1. The engine: `transport`, `render` and the `runtime` loop, tested with
-   `ManualClock` and `RecordingOutput`. Then `treason serve` starts it.
-2. `notation` (step strings and pitch names), and with it the `set_steps`
-   and `set_notes` tools.
-3. Following an external clock, the ALSA queue backend, MIDI file export.
+One pull request each, in this order. Each marks its step done here. The
+first milestone ends when an agent writes a drum pattern and external
+gear plays it:
+
+1. CI: formatting, lints, tests and docs on every pull request. Done.
+2. Step patterns: step strings in `notation` and the `set_steps` tool,
+   with `get_project` showing patterns as step strings. Also an
+   `edit_track` tool, to rename a track or move it to another port,
+   channel or device without losing its clip.
+3. Engine core: `Transport::apply` and `render`.
+4. Engine loop: `Engine::run`, tested with `ManualClock` and
+   `RecordingOutput`.
+5. `treason serve` starts the engine, so `play` plays.
+
+The second milestone drives other gear:
+
+6. Clock master: MIDI clock, Start, Stop, Continue and Song Position
+   Pointer on the ports with `clock = true`, and per-port latency.
+7. Melodic parts: pitch names in `notation` and the `set_notes` tool.
+8. The ALSA sequencer queue backend, for kernel-timed delivery.
+
+Later: MIDI file export, following an external clock (which needs MIDI
+input), and probability, ratchets and conditions on events.

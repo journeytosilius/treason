@@ -119,12 +119,16 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
 
-- If you change feature-gated code in `treason-io`, also run clippy
-  without `--all-features`.
+- CI (`.github/workflows/ci.yml`) runs these on every pull request and
+  on `main`, and also lints with default features and with each
+  `treason-io` backend alone. If you change feature-gated code, run those
+  lints too.
 - If a check fails, read the whole error, fix the cause rather than the
   symptom, and run it again.
 - Building needs the ALSA development files (`libasound2-dev` on Debian
-  and Ubuntu). If you can't build, say so. Never report a check you
+  and Ubuntu) and Rust 1.95 from rustup. If `cargo --version` shows an
+  older release, a system Rust is shadowing rustup's: put `~/.cargo/bin`
+  first on `PATH`. If you can't build, say so. Never report a check you
   didn't run.
 
 ## Tests

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Format, lint, test, docs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # midir links the ALSA library on Linux.
+      - name: Install the ALSA development files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libasound2-dev
+
+      # Installs the toolchain and components named in rust-toolchain.toml.
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lint with all features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Lint with default features
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Each backend is behind its own feature, so each must build alone.
+      - name: Lint each MIDI backend alone
+        run: |
+          for features in "" midir alsa-seq smf; do
+            echo "::group::treason-io with features: ${features:-none}"
+            cargo clippy -p treason-io --all-targets --no-default-features \
+              ${features:+--features "$features"} -- -D warnings
+            echo "::endgroup::"
+          done
+
+      - name: Test
+        run: cargo test --workspace --all-features
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
