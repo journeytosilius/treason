@@ -64,7 +64,8 @@ impl Timebase {
         }
     }
 
-    /// Changes the tempo from `tick` on. Ticks up to `tick` keep their times.
+    /// Reanchors at `tick`'s current time with a new tempo. Other ticks,
+    /// including earlier ones, are extrapolated at the new tempo.
     pub fn retempo(&mut self, tick: Ticks, tempo: Bpm) {
         *self = Self::new(self.time_of(tick), tick, tempo);
     }
@@ -129,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn retempo_keeps_earlier_ticks() {
+    fn retempo_keeps_the_anchor_time() {
         let start = Instant::now();
         let mut timebase = Timebase::new(start, Ticks::ZERO, bpm(120.0));
         let bar_two = Ticks::quarters(4);

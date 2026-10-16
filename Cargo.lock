@@ -1731,6 +1731,7 @@ dependencies = [
  "thread-priority",
  "tracing",
  "treason-core",
+ "treason-io",
 ]
 
 [[package]]

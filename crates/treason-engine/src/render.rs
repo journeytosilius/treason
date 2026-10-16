@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use treason_core::midi::{MidiMessage, U7};
-use treason_core::model::{EventKind, PortId, Project, Track};
+use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
 /// Bank select, the most and least significant bytes. A program change on
@@ -17,11 +17,13 @@ pub struct RenderedEvent {
     pub tick: Ticks,
     /// Where.
     pub port: PortId,
+    /// The track that owns this event, stable across snapshot reordering.
+    pub track: TrackId,
     /// What.
     pub message: MidiMessage,
     /// The order it was rendered in: by track, then as written in the clip.
     /// Breaks ties in the send order without a sort that allocates.
-    sequence: u32,
+    sequence: (usize, u64, usize),
 }
 
 /// Appends to `out` everything `project` plays in `window`, in send order.
@@ -41,17 +43,80 @@ pub struct RenderedEvent {
 /// sequence such as an RPN's parameter selection and data entry arrives as
 /// written.
 ///
-/// `out` is reused from window to window: with its capacity reserved up
-/// front, rendering doesn't allocate.
+/// `out` is reused from window to window. This unbounded entry point may
+/// allocate if its remaining capacity cannot hold the whole window.
 pub fn render(project: &Project, window: Range<Ticks>, out: &mut Vec<RenderedEvent>) {
+    let first = out.len();
+    visit(project, window, |event| out.push(event));
+    out[first..].sort_unstable_by_key(send_order);
+}
+
+/// Appends the earliest events that fit in the remaining capacity, without
+/// allocating. If the window did not fit, returns its last appended event:
+/// resume at that tick, passing it as `after`, to preserve even a split tick.
+/// The caller must provide at least one free slot.
+pub(crate) fn render_bounded(
+    project: &Project,
+    window: Range<Ticks>,
+    after: Option<RenderedEvent>,
+    out: &mut Vec<RenderedEvent>,
+) -> Option<RenderedEvent> {
+    assert!(out.len() < out.capacity());
+    let first = out.len();
+    let mut overflow = false;
+    visit(project, window, |event| {
+        if after.is_some_and(|after| send_order(&event) <= send_order(&after)) {
+            return;
+        }
+        // A max-heap in the new portion of the existing buffer retains the
+        // earliest events even though tracks are visited in track order.
+        if out.len() < out.capacity() {
+            out.push(event);
+            let heap = &mut out[first..];
+            let mut child = heap.len() - 1;
+            while child > 0 {
+                let parent = (child - 1) / 2;
+                if send_order(&heap[parent]) >= send_order(&heap[child]) {
+                    break;
+                }
+                heap.swap(parent, child);
+                child = parent;
+            }
+        } else {
+            overflow = true;
+            let heap = &mut out[first..];
+            if send_order(&event) < send_order(&heap[0]) {
+                heap[0] = event;
+                let mut parent = 0;
+                while parent * 2 + 1 < heap.len() {
+                    let mut child = parent * 2 + 1;
+                    if child + 1 < heap.len()
+                        && send_order(&heap[child + 1]) > send_order(&heap[child])
+                    {
+                        child += 1;
+                    }
+                    if send_order(&heap[parent]) >= send_order(&heap[child]) {
+                        break;
+                    }
+                    heap.swap(parent, child);
+                    parent = child;
+                }
+            }
+        }
+    });
+    out[first..].sort_unstable_by_key(send_order);
+    overflow.then(|| *out.last().unwrap())
+}
+
+fn visit(project: &Project, window: Range<Ticks>, mut emit: impl FnMut(RenderedEvent)) {
     if window.start >= window.end {
         return;
     }
-    let first = out.len();
-    for track in project.tracks.iter().filter(|track| !track.muted) {
-        render_track(track, window.clone(), out);
+    for (index, track) in project.tracks.iter().enumerate() {
+        if !track.muted {
+            render_track(index, track, window.clone(), &mut emit);
+        }
     }
-    out[first..].sort_unstable_by_key(send_order);
 }
 
 /// The ticks in `window` that get a MIDI clock pulse: every 40th tick,
@@ -63,8 +128,13 @@ pub fn clock_pulses(window: Range<Ticks>) -> impl Iterator<Item = Ticks> {
         .take_while(move |tick| *tick < window.end)
 }
 
-/// Appends one track's events in a non-empty `window`, unsorted.
-fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent>) {
+/// Visits one track's events in a non-empty `window`, unsorted.
+fn render_track(
+    track_index: usize,
+    track: &Track,
+    window: Range<Ticks>,
+    mut emit: impl FnMut(RenderedEvent),
+) {
     let clip = &track.clip;
     if clip.events().is_empty() {
         return;
@@ -73,15 +143,6 @@ fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent
     let loop_length = clip.length().0;
     let port = track.target.port;
     let channel = track.target.channel;
-    let mut emit = |tick, message| {
-        let sequence = u32::try_from(out.len()).unwrap_or(u32::MAX);
-        out.push(RenderedEvent {
-            tick: Ticks(tick),
-            port,
-            message,
-            sequence,
-        });
-    };
     // A note that ends in the window started at most the longest note
     // earlier, and no note is longer than the loop, so this looks back at
     // most one pass.
@@ -89,7 +150,21 @@ fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent
     for pass in from / loop_length..=(end - 1) / loop_length {
         let offset = pass * loop_length;
         let span = Ticks(from.max(offset) - offset)..Ticks(end.min(offset + loop_length) - offset);
-        for event in clip.events_in(span) {
+        let first = clip
+            .events()
+            .partition_point(|event| event.start < span.start);
+        for (index, event) in clip.events_in(span).iter().enumerate() {
+            // Stable across window boundaries and partial batches, including
+            // note-offs from the previous pass through a looping clip.
+            let mut emit = |tick, message| {
+                emit(RenderedEvent {
+                    tick: Ticks(tick),
+                    port,
+                    track: track.id,
+                    message,
+                    sequence: (track_index, pass, first + index),
+                });
+            };
             let at = offset + event.start.0;
             match event.kind {
                 EventKind::Note { velocity, .. } if velocity == U7::MIN => {}
@@ -138,7 +213,7 @@ fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent
 /// selects, program changes, other control changes and note-ons, then in the
 /// order they were rendered. No two events tie, so an unstable sort keeps
 /// that order.
-fn send_order(event: &RenderedEvent) -> (Ticks, u8, u32) {
+fn send_order(event: &RenderedEvent) -> (Ticks, u8, (usize, u64, usize)) {
     let rank = match event.message {
         MidiMessage::NoteOff { .. } => 0,
         MidiMessage::ControlChange { controller, .. }
@@ -243,6 +318,72 @@ mod tests {
             960,
             vec![note(480, 38, 240), note(0, 36, 240)],
         )])
+    }
+
+    #[test]
+    fn bounded_batches_preserve_order_within_ticks_across_tracks_and_loops() {
+        let project = project(vec![
+            track(
+                1,
+                480,
+                vec![
+                    note(0, 60, 480),
+                    control(0, 7, 90),
+                    program(0, 5),
+                    control(0, 0, 1),
+                    control(0, 32, 2),
+                    note(360, 62, 240),
+                ],
+            ),
+            track(
+                2,
+                240,
+                vec![control(0, 101, 0), control(0, 100, 0), control(0, 6, 12)],
+            ),
+        ]);
+        let mut expected = Vec::new();
+        render(&project, Ticks::ZERO..Ticks(2000), &mut expected);
+        for capacity in 1..=7 {
+            let mut batch = Vec::with_capacity(capacity);
+            let mut actual = Vec::new();
+            let mut start = Ticks::ZERO;
+            let mut after = None;
+            loop {
+                let next = render_bounded(&project, start..Ticks(2000), after, &mut batch);
+                assert_eq!(batch.capacity(), capacity);
+                actual.extend_from_slice(&batch);
+                batch.clear();
+                let Some(last) = next else { break };
+                assert_ne!(next, after, "rendering must progress");
+                start = last.tick;
+                after = next;
+            }
+            assert_eq!(actual, expected, "batch capacity {capacity}");
+        }
+    }
+
+    #[test]
+    fn bounded_rendering_counts_retained_events_against_capacity() {
+        let project = beat();
+        let mut expected = Vec::new();
+        render(&project, Ticks::ZERO..Ticks(960), &mut expected);
+        let mut batch = Vec::with_capacity(3);
+        assert_eq!(
+            render_bounded(&project, Ticks::ZERO..Ticks(241), None, &mut batch),
+            None
+        );
+        assert_eq!(batch, expected[..2]);
+        let after = render_bounded(&project, Ticks(241)..Ticks(960), None, &mut batch);
+        assert_eq!(batch, expected[..3]);
+        assert_eq!(batch.capacity(), 3);
+        let last = after.expect("the fourth event must remain unrendered");
+        batch.clear();
+        assert_eq!(
+            render_bounded(&project, last.tick..Ticks(960), after, &mut batch),
+            None
+        );
+        assert_eq!(batch, expected[3..]);
+        assert_eq!(batch.capacity(), 3);
     }
 
     #[test]
@@ -438,8 +579,9 @@ mod tests {
         let earlier = RenderedEvent {
             tick: Ticks(5000),
             port: PortId(0),
+            track: TrackId(1),
             message: MidiMessage::Stop,
-            sequence: 0,
+            sequence: (0, 0, 0),
         };
         out.push(earlier);
         let buffer = out.as_ptr();

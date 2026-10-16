@@ -5,7 +5,7 @@
 //! it on time. The engine thread's own scheduling jitter then never reaches
 //! the MIDI cable.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use treason_core::output::{Delivery, MidiOutput, TimedMessage};
@@ -50,6 +50,11 @@ impl MidiOutput for AlsaSeqOutput {
 
     fn flush(&mut self) -> Result<(), Self::Error> {
         todo!("drain the output buffer to the kernel")
+    }
+
+    #[expect(unused_variables, reason = "not implemented yet")]
+    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
+        todo!("remove queued messages at or after from, including flushed events")
     }
 }
 

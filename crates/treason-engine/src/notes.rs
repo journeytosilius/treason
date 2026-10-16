@@ -1,6 +1,7 @@
 //! Keeps track of sounding notes so the engine can always end them.
 
 use treason_core::midi::{Channel, MidiMessage, U7};
+use treason_core::model::TrackId;
 
 /// The notes sounding on one output port, one bit per channel and note.
 ///
@@ -54,24 +55,88 @@ impl ActiveNotes {
             .zip(self.channels.iter_mut())
             .flat_map(|(index, bits)| {
                 let channel = Channel::from_index(index).expect("there are 16 channels");
-                std::iter::from_fn(move || {
-                    if *bits == 0 {
-                        return None;
-                    }
-                    let note = bits.trailing_zeros() as u8;
-                    *bits &= *bits - 1;
-                    Some(MidiMessage::NoteOff {
-                        channel,
-                        note: U7::saturating(note),
-                        velocity: U7::MIN,
-                    })
-                })
+                note_offs(channel, bits)
             })
+    }
+
+    /// A note-off for every note sounding on `channel`, leaving the other
+    /// channels alone. Like [`drain_note_offs`](Self::drain_note_offs).
+    pub fn drain_channel(&mut self, channel: Channel) -> impl Iterator<Item = MidiMessage> {
+        note_offs(channel, &mut self.channels[usize::from(channel.index())])
+    }
+}
+
+/// Active MIDI keys and the track that last started each one. Storage is
+/// fixed by MIDI's 16 channels and 128 notes, regardless of track count.
+#[derive(Clone)]
+pub(crate) struct OwnedNotes {
+    pub(crate) notes: ActiveNotes,
+    owners: [[TrackId; 128]; 16],
+}
+
+impl OwnedNotes {
+    pub(crate) const fn new() -> Self {
+        Self {
+            notes: ActiveNotes::new(),
+            owners: [[TrackId(0); 128]; 16],
+        }
+    }
+
+    /// Rendered note-ons always carry a track. Engine-wide cleanup has no
+    /// owner and only emits note-offs or non-note messages.
+    pub(crate) fn observe(&mut self, message: MidiMessage, track: Option<TrackId>) {
+        if let MidiMessage::NoteOn {
+            channel,
+            note,
+            velocity,
+        } = message
+            && velocity != U7::MIN
+        {
+            self.owners[usize::from(channel.index())][usize::from(note.get())] =
+                track.expect("a rendered note-on has a track");
+        }
+        self.notes.observe(message);
+    }
+
+    pub(crate) fn owns(&self, track: TrackId, channel: Channel, note: U7) -> bool {
+        self.notes.is_sounding(channel, note)
+            && self.owners[usize::from(channel.index())][usize::from(note.get())] == track
+    }
+
+    /// Copies only this track's active keys on its channel for cleanup.
+    pub(crate) fn for_track(&self, track: TrackId, channel: Channel) -> ActiveNotes {
+        let index = usize::from(channel.index());
+        let mut bits = self.notes.channels[index];
+        let mut notes = ActiveNotes::new();
+        while bits != 0 {
+            let note = bits.trailing_zeros() as usize;
+            if self.owners[index][note] == track {
+                notes.channels[index] |= 1 << note;
+            }
+            bits &= bits - 1;
+        }
+        notes
     }
 }
 
 const fn bit(note: U7) -> u128 {
     1 << note.get()
+}
+
+/// Note-offs for the notes in `bits`, clearing each as it is yielded.
+fn note_offs(channel: Channel, bits: &mut u128) -> impl Iterator<Item = MidiMessage> + '_ {
+    std::iter::from_fn(move || {
+        if *bits == 0 {
+            return None;
+        }
+        let note = bits.trailing_zeros() as u8;
+        *bits &= *bits - 1;
+        Some(MidiMessage::NoteOff {
+            channel,
+            note: U7::saturating(note),
+            velocity: U7::MIN,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -131,5 +196,56 @@ mod tests {
             ]
         );
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn drains_one_channel_and_keeps_the_others() {
+        let bass = Channel::from_number(1).unwrap();
+        let mut notes = ActiveNotes::new();
+        for message in [
+            note_on(Channel::DRUMS, 36),
+            note_on(bass, 40),
+            note_on(bass, 43),
+        ] {
+            notes.observe(message);
+        }
+        let offs: Vec<_> = notes.drain_channel(bass).collect();
+        assert_eq!(offs, [note_off(bass, 40), note_off(bass, 43)]);
+        assert!(notes.is_sounding(Channel::DRUMS, U7::new(36).unwrap()));
+        assert!(!notes.is_sounding(bass, U7::new(40).unwrap()));
+    }
+
+    #[test]
+    fn ownership_selects_only_active_notes_of_the_requested_track_and_channel() {
+        let first = TrackId(0);
+        let second = TrackId(u32::MAX);
+        let other = Channel::from_number(1).unwrap();
+        let mut notes = OwnedNotes::new();
+        notes.observe(note_on(Channel::DRUMS, 60), Some(first));
+        notes.observe(note_on(Channel::DRUMS, 62), Some(second));
+        notes.observe(note_on(other, 64), Some(first));
+        let mut selected = notes.for_track(first, Channel::DRUMS);
+        assert_eq!(
+            selected.drain_note_offs().collect::<Vec<_>>(),
+            [note_off(Channel::DRUMS, 60)]
+        );
+        assert!(notes.owns(second, Channel::DRUMS, U7::saturating(62)));
+        assert!(notes.owns(first, other, U7::saturating(64)));
+
+        // A retrigger transfers ownership. Cleanup or a velocity-zero on
+        // clears activity even though the fixed table retains the old ID.
+        notes.observe(note_on(Channel::DRUMS, 60), Some(second));
+        assert!(notes.for_track(first, Channel::DRUMS).is_empty());
+        notes.observe(note_off(Channel::DRUMS, 60), None);
+        notes.observe(
+            MidiMessage::NoteOn {
+                channel: Channel::DRUMS,
+                note: U7::saturating(62),
+                velocity: U7::MIN,
+            },
+            Some(second),
+        );
+        assert!(notes.for_track(second, Channel::DRUMS).is_empty());
+        assert!(!notes.owns(second, Channel::DRUMS, U7::saturating(60)));
     }
 }

@@ -251,7 +251,8 @@ impl TreasonServer {
         Ok(Json(view))
     }
 
-    /// Removes a track. undo brings it back.
+    /// Removes a track. While playing, it stops at the next bar. undo
+    /// brings it back.
     #[tool]
     fn remove_track(
         &self,
@@ -261,8 +262,8 @@ impl TreasonServer {
         Ok(format!("Removed track {track}."))
     }
 
-    /// Mutes or unmutes a track. A muted track keeps its clip but plays
-    /// nothing.
+    /// Mutes or unmutes a track, at the next bar while playing. A muted
+    /// track keeps its clip but plays nothing.
     #[tool]
     fn set_muted(
         &self,
@@ -373,8 +374,8 @@ impl TreasonServer {
 it makes no sound itself. A project has a tempo, a time signature and tracks. Each track loops \
 its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
 Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
-set_notes for melodic parts, then play. Edits apply while playing: tempo at once, clips at the \
-next bar. undo reverts an edit."
+set_notes for melodic parts, then play. Edits apply while playing: tempo at once, everything \
+else at the next bar. undo reverts an edit."
 )]
 impl ServerHandler for TreasonServer {}
 

@@ -6,9 +6,10 @@ sequencer's tools. treason plays it as MIDI to external gear: drum machines,
 synths and other sequencers. It makes no sound itself.
 
 Status: scaffolded. Every crate and module is in place. Device profiles, the
-control layer, the MIDI port backend and the MCP server work. The engine
-loop is next, so nothing plays yet. See [ARCHITECTURE.md](ARCHITECTURE.md)
-for the design and for what's still a stub.
+control layer, the MIDI port backend, the MCP server and the engine work.
+`treason serve` doesn't start the engine yet, so nothing plays. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
+stub.
 
 ## Requirements
 

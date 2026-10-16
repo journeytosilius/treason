@@ -71,13 +71,13 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | devices | `profile`, `registry` | `DeviceProfile`, `DeviceRegistry` | done |
-| engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status | done |
+| engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
 | engine | `timebase` | `Timebase`: ticks to time and back | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics | done |
 | engine | `render` | `render` (clip events in a window), `clock_pulses` | done |
-| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | the loop (`run`) is a stub |
+| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
@@ -133,15 +133,40 @@ sounding note and returns.
   nanoseconds with tempo in thousandths of a BPM, so ticks and times
   round-trip exactly.
 - The engine renders a short lookahead window, on the order of 10 to 50 ms,
-  tuned per backend.
+  tuned per backend. Rendering fills at most the preallocated 4096-event
+  buffer, including any retained events. Oversized windows resume in send
+  order, even within a tick, without losing events or growing the buffer.
 - `Delivery::Immediate` backends (midir) send when called, so the engine
   sleeps until each message is due, spinning for the last stretch.
   `Delivery::Scheduled` backends (an ALSA sequencer queue) take timestamped
-  messages early, and the kernel sends them on time.
+  messages early, and the kernel sends them on time. `MidiOutput::cancel_from`
+  retracts undelivered work, including flushed events, on stop, restart,
+  locate, panic and shutdown. The engine keeps delivered note state separate
+  from queued work so cancellation still ends every sounding note. It
+  samples time again after cancellation and conservatively keeps note-ons
+  that could have raced it; a cancelled note-off never proves a note ended.
+  When submission crosses queued deadlines, it reconciles older deliveries
+  before recording the newly submitted message as delivered.
+  Its preallocated queue mirror holds a render batch plus a switch's note-offs;
+  excess events stay in the render buffer until queue space becomes free.
 - Each port has a latency offset. Messages for a slower device are due
   earlier.
-- Tempo changes and transport commands apply at once. Changes to a track's
-  clip, port or channel wait for the next bar.
+- Tempo changes and transport commands apply at once. Other edits, such
+  as a new clip, a mute or a move to another port, wait for the next bar
+  line. There the notes still sounding from tracks that changed end; a
+  track that only got a new name or device plays on. While stopped, edits
+  apply at once. The boundary comes from the playhead, even if lookahead has
+  already rendered or submitted that bar. Future work there is replaced,
+  and the previous snapshot stays available until delivery, so another edit
+  or undo can still replace the same upcoming bar.
+  Rendered events and scheduled submissions retain their track IDs. A fixed
+  ownership table per port selects only the changed tracks' notes, preserving
+  held notes from other tracks sharing the channel. When tracks retrigger
+  the same MIDI key, the most recent note-on owns it; an older track's
+  note-off cannot end that retrigger.
+- A tempo change anchors the current whole-tick position at the current
+  time. Due events keep their old times; future rendered and submitted
+  events are rebuilt using the new tempo, including any pending bar switch.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
 - At the same tick, note-offs go out first, then bank selects, program
@@ -163,7 +188,9 @@ sounding note and returns.
 2. No blocking except on the MIDI output.
 3. Communication only through the `EngineLink`: `ArcSwap`, `rtrb` and atomics.
 4. No stuck notes. `ActiveNotes`, a 256-byte bitset per port, supplies
-   note-offs on stop, panic, clip changes and shutdown.
+   note-offs on stop, panic, clip changes and shutdown. The engine adds
+   fixed ownership tables (one track ID per MIDI key) to its projected and
+   delivered sets, allocated before playback, for selective track cleanup.
 
 ## Project model
 
@@ -278,7 +305,7 @@ gear plays it:
    channel or device without losing its clip. Done.
 3. Engine core: `Transport::apply` and `render`. Done.
 4. Engine loop: `Engine::run`, tested with `ManualClock` and
-   `RecordingOutput`.
+   `RecordingOutput`. Done.
 5. `treason serve` starts the engine, so `play` plays.
 
 The second milestone drives other gear:
