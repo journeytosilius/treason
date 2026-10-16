@@ -54,24 +54,35 @@ impl ActiveNotes {
             .zip(self.channels.iter_mut())
             .flat_map(|(index, bits)| {
                 let channel = Channel::from_index(index).expect("there are 16 channels");
-                std::iter::from_fn(move || {
-                    if *bits == 0 {
-                        return None;
-                    }
-                    let note = bits.trailing_zeros() as u8;
-                    *bits &= *bits - 1;
-                    Some(MidiMessage::NoteOff {
-                        channel,
-                        note: U7::saturating(note),
-                        velocity: U7::MIN,
-                    })
-                })
+                note_offs(channel, bits)
             })
+    }
+
+    /// A note-off for every note sounding on `channel`, leaving the other
+    /// channels alone. Like [`drain_note_offs`](Self::drain_note_offs).
+    pub fn drain_channel(&mut self, channel: Channel) -> impl Iterator<Item = MidiMessage> {
+        note_offs(channel, &mut self.channels[usize::from(channel.index())])
     }
 }
 
 const fn bit(note: U7) -> u128 {
     1 << note.get()
+}
+
+/// Note-offs for the notes in `bits`, clearing each as it is yielded.
+fn note_offs(channel: Channel, bits: &mut u128) -> impl Iterator<Item = MidiMessage> + '_ {
+    std::iter::from_fn(move || {
+        if *bits == 0 {
+            return None;
+        }
+        let note = bits.trailing_zeros() as u8;
+        *bits &= *bits - 1;
+        Some(MidiMessage::NoteOff {
+            channel,
+            note: U7::saturating(note),
+            velocity: U7::MIN,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -131,5 +142,22 @@ mod tests {
             ]
         );
         assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn drains_one_channel_and_keeps_the_others() {
+        let bass = Channel::from_number(1).unwrap();
+        let mut notes = ActiveNotes::new();
+        for message in [
+            note_on(Channel::DRUMS, 36),
+            note_on(bass, 40),
+            note_on(bass, 43),
+        ] {
+            notes.observe(message);
+        }
+        let offs: Vec<_> = notes.drain_channel(bass).collect();
+        assert_eq!(offs, [note_off(bass, 40), note_off(bass, 43)]);
+        assert!(notes.is_sounding(Channel::DRUMS, U7::new(36).unwrap()));
+        assert!(!notes.is_sounding(bass, U7::new(40).unwrap()));
     }
 }

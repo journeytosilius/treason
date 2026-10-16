@@ -20,8 +20,6 @@
 //! - [`render`]: the MIDI events clips play in a window.
 //! - [`notes`]: sounding notes, so they can always be ended.
 //! - [`clock`]: time sources.
-//!
-//! The engine loop is a stub for now; see ARCHITECTURE.md, "Next steps".
 
 pub mod clock;
 pub mod link;

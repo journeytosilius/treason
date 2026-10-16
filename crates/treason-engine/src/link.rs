@@ -5,6 +5,8 @@
 //! - Transport commands go through a bounded single-producer,
 //!   single-consumer ring buffer ([`rtrb`]), lock-free at both ends.
 //! - Status (playing or not, position) comes back through atomics.
+//! - Snapshots the engine has finished with come back through a second ring
+//!   buffer, so they are freed on the control side, not on the engine thread.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +21,9 @@ use treason_core::time::Ticks;
 
 /// How many transport commands can wait for the engine.
 const COMMAND_CAPACITY: usize = 64;
+
+/// How many finished snapshots can wait to be freed on the control side.
+const RETIRED_CAPACITY: usize = 64;
 
 struct Shared {
     project: ArcSwap<Project>,
@@ -35,13 +40,16 @@ pub fn link(project: Arc<Project>) -> (EngineHandle, EngineLink) {
         position: AtomicU64::new(0),
     });
     let (commands, inbox) = RingBuffer::new(COMMAND_CAPACITY);
+    let (retire, retired) = RingBuffer::new(RETIRED_CAPACITY);
     let handle = EngineHandle {
         shared: Arc::clone(&shared),
         commands,
+        retired,
     };
     let link = EngineLink {
         shared,
         commands: inbox,
+        retire,
     };
     (handle, link)
 }
@@ -50,11 +58,14 @@ pub fn link(project: Arc<Project>) -> (EngineHandle, EngineLink) {
 pub struct EngineHandle {
     shared: Arc<Shared>,
     commands: Producer<TransportCommand>,
+    retired: Consumer<Arc<Project>>,
 }
 
 impl Playback for EngineHandle {
     fn publish(&mut self, project: Arc<Project>) {
         self.shared.project.store(project);
+        // Free the snapshots the engine has handed back.
+        while self.retired.pop().is_ok() {}
     }
 
     fn command(&mut self, command: TransportCommand) -> Result<(), PlaybackError> {
@@ -84,6 +95,7 @@ impl Playback for EngineHandle {
 pub struct EngineLink {
     shared: Arc<Shared>,
     commands: Consumer<TransportCommand>,
+    retire: Producer<Arc<Project>>,
 }
 
 impl EngineLink {
@@ -101,6 +113,14 @@ impl EngineLink {
     /// sounding notes and stops.
     pub fn is_abandoned(&self) -> bool {
         self.commands.is_abandoned()
+    }
+
+    /// Hands back a snapshot the engine has finished with, to be freed on
+    /// the control side at its next publish. Wait-free. The queue holds far
+    /// more than the engine retires between publishes; if it is ever full,
+    /// the snapshot is dropped here instead.
+    pub fn retire(&mut self, project: Arc<Project>) {
+        let _ = self.retire.push(project);
     }
 
     /// Reports where playback is.
@@ -140,6 +160,17 @@ mod tests {
         };
         engine.set_status(status);
         assert_eq!(handle.status(), status);
+    }
+
+    #[test]
+    fn retired_snapshots_are_freed_on_the_control_side() {
+        let (mut handle, mut engine) = link(Arc::new(Project::default()));
+        let old = Arc::new(Project::default());
+        let watch = Arc::downgrade(&old);
+        engine.retire(old);
+        assert!(watch.upgrade().is_some(), "the engine doesn't free it");
+        handle.publish(Arc::new(Project::default()));
+        assert!(watch.upgrade().is_none(), "the next publish does");
     }
 
     #[test]

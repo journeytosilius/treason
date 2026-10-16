@@ -71,13 +71,13 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | devices | `profile`, `registry` | `DeviceProfile`, `DeviceRegistry` | done |
-| engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status | done |
+| engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
 | engine | `timebase` | `Timebase`: ticks to time and back | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics | done |
 | engine | `render` | `render` (clip events in a window), `clock_pulses` | done |
-| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | the loop (`run`) is a stub |
+| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
@@ -140,8 +140,11 @@ sounding note and returns.
   messages early, and the kernel sends them on time.
 - Each port has a latency offset. Messages for a slower device are due
   earlier.
-- Tempo changes and transport commands apply at once. Changes to a track's
-  clip, port or channel wait for the next bar.
+- Tempo changes and transport commands apply at once. Other edits, such
+  as a new clip, a mute or a move to another port, wait for the next bar
+  line. There the notes still sounding from tracks that changed end; a
+  track that only got a new name or device plays on. While stopped, edits
+  apply at once.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
 - At the same tick, note-offs go out first, then bank selects, program
@@ -278,7 +281,7 @@ gear plays it:
    channel or device without losing its clip. Done.
 3. Engine core: `Transport::apply` and `render`. Done.
 4. Engine loop: `Engine::run`, tested with `ManualClock` and
-   `RecordingOutput`.
+   `RecordingOutput`. Done.
 5. `treason serve` starts the engine, so `play` plays.
 
 The second milestone drives other gear:
