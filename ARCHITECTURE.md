@@ -140,8 +140,10 @@ sounding note and returns.
   messages early, and the kernel sends them on time. `MidiOutput::cancel_from`
   retracts undelivered work, including flushed events, on stop, restart,
   locate, panic and shutdown. The engine keeps delivered note state separate
-  from queued work so cancellation still ends every sounding note. Its
-  preallocated queue mirror holds a render batch plus a switch's note-offs;
+  from queued work so cancellation still ends every sounding note. It
+  samples time again after cancellation and conservatively keeps note-ons
+  that could have raced it; a cancelled note-off never proves a note ended.
+  Its preallocated queue mirror holds a render batch plus a switch's note-offs;
   excess events stay in the render buffer until queue space becomes free.
 - Each port has a latency offset. Messages for a slower device are due
   earlier.

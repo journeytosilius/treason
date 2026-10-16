@@ -89,7 +89,7 @@ pub struct Engine<O, C> {
     transport: Transport,
     /// The notes sounding after all submitted messages have been delivered.
     sounding: Vec<ActiveNotes>,
-    /// Notes actually delivered, before the still-queued scheduled messages.
+    /// Delivered notes, conservatively including note-ons racing cancellation.
     delivered: Vec<ActiveNotes>,
     /// A bounded mirror of scheduled work, for restoring note state on cancel.
     scheduled: Vec<TimedMessage>,
@@ -495,11 +495,26 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         });
     }
 
-    /// Invalidates backend work and reconstructs projected notes from what
-    /// really played and the part of the queue that remains valid.
+    /// Invalidates backend work and reconstructs projected notes. Delivery
+    /// can race cancellation: after it returns, any removed note-on due by
+    /// then might have sounded. Keep those notes until an off ends them;
+    /// never assume a removed note-off was delivered.
     fn cancel_scheduled(&mut self, from: Instant) -> Result<(), O::Error> {
         self.output.cancel_from(from)?;
-        self.scheduled.retain(|message| message.at < from);
+        let now = self.clock.now();
+        self.scheduled.retain(|message| {
+            if message.at < from {
+                if message.at > now {
+                    return true;
+                }
+                self.delivered[usize::from(message.port.0)].observe(message.message);
+            } else if message.at <= now
+                && matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
+            {
+                self.delivered[usize::from(message.port.0)].observe(message.message);
+            }
+            false
+        });
         self.sounding.clone_from_slice(&self.delivered);
         for message in &self.scheduled {
             self.sounding[usize::from(message.port.0)].observe(message.message);
@@ -614,6 +629,8 @@ fn raise_priority() -> Result<(), thread_priority::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, TrackId};
     use treason_core::playback::{Playback, PlaybackStatus};
     use treason_core::time::Bpm;
@@ -1157,6 +1174,7 @@ mod tests {
         queue: RecordingOutput,
         delivered: Vec<TimedMessage>,
         notes: ActiveNotes,
+        cancel_advance: Option<(SharedClock, Instant, bool)>,
     }
 
     impl ScheduledOutput {
@@ -1165,6 +1183,7 @@ mod tests {
                 queue: RecordingOutput::scheduled(ms(50)),
                 delivered: Vec::new(),
                 notes: ActiveNotes::new(),
+                cancel_advance: None,
             }
         }
 
@@ -1192,7 +1211,107 @@ mod tests {
         }
 
         fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
+            if let Some((mut clock, until, cancel_first)) = self.cancel_advance.take() {
+                if cancel_first {
+                    self.queue.cancel_from(from)?;
+                }
+                clock.sleep_until(until);
+                self.deliver_until(clock.now());
+            }
             self.queue.cancel_from(from)
+        }
+    }
+
+    /// Shared with the backend so time can pass inside cancellation.
+    #[derive(Clone)]
+    struct SharedClock {
+        origin: Instant,
+        nanos: Arc<AtomicU64>,
+    }
+
+    impl Clock for SharedClock {
+        fn now(&self) -> Instant {
+            self.origin + Duration::from_nanos(self.nanos.load(Ordering::Relaxed))
+        }
+
+        fn sleep_until(&mut self, deadline: Instant) {
+            let nanos = deadline.saturating_duration_since(self.origin).as_nanos();
+            self.nanos
+                .fetch_max(u64::try_from(nanos).unwrap(), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn transport_cleanup_ends_notes_that_race_cancellation() {
+        for cancel_first in [false, true] {
+            for command in [
+                Some(TransportCommand::Stop),
+                Some(TransportCommand::Play),
+                Some(TransportCommand::Locate(Ticks(960))),
+                Some(TransportCommand::Panic),
+                None,
+            ] {
+                let initial = project(vec![track(1, 10, 1920, &[(0, 60, 216), (216, 62, 240)])]);
+                let (mut handle, link) = link(initial);
+                let origin = Instant::now();
+                let clock = SharedClock {
+                    origin,
+                    nanos: Arc::new(AtomicU64::new(0)),
+                };
+                let mut engine = Engine::new(
+                    link,
+                    ScheduledOutput::new(),
+                    clock,
+                    EngineConfig {
+                        ports: vec![PortSettings::default()],
+                        realtime: false,
+                        ..EngineConfig::default()
+                    },
+                );
+                handle.command(TransportCommand::Play).unwrap();
+                while engine.clock.now() < origin + ms(110) {
+                    assert!(engine.cycle().unwrap());
+                }
+                engine.output.deliver_until(engine.clock.now());
+                assert_eq!(engine.scheduled.len(), 2);
+                // Stop samples 110 ms. Inside cancel_from, time reaches
+                // 113 ms, crossing the queued off/on pair at 112.5 ms.
+                engine.output.cancel_advance =
+                    Some((engine.clock.clone(), origin + ms(113), cancel_first));
+                if let Some(command) = command {
+                    handle.command(command).unwrap();
+                    assert!(engine.cycle().unwrap());
+                    engine.output.deliver_until(engine.clock.now());
+                    if command != TransportCommand::Panic {
+                        assert!(
+                            !engine
+                                .output
+                                .notes
+                                .is_sounding(Channel::DRUMS, U7::saturating(62)),
+                            "{command:?}"
+                        );
+                    }
+                    while engine.clock.now() < origin + ms(400) {
+                        assert!(engine.cycle().unwrap());
+                    }
+                    handle.command(TransportCommand::Stop).unwrap();
+                    assert!(engine.cycle().unwrap());
+                } else {
+                    drop(handle);
+                    assert!(!engine.cycle().unwrap());
+                }
+                engine.output.deliver_until(origin + ms(1000));
+                assert!(
+                    engine.output.notes.is_empty(),
+                    "{command:?}, cancellation first: {cancel_first}"
+                );
+                if !cancel_first {
+                    assert!(engine.output.delivered.iter().any(|message| {
+                        message.at == origin + Duration::from_micros(112_500)
+                            && matches!(message.message, MidiMessage::NoteOn { note, .. } if note.get() == 62)
+                    }), "the backend must actually deliver the racing note-on");
+                }
+            }
         }
     }
 
