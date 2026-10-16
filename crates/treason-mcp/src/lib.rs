@@ -22,5 +22,5 @@ pub mod pattern;
 mod serve;
 pub mod server;
 
-pub use serve::{ServeError, serve_http, serve_stdio};
+pub use serve::{ServeError, serve_http, serve_http_on, serve_stdio};
 pub use server::{SharedSession, TreasonServer};

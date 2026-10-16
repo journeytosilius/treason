@@ -120,8 +120,10 @@ rebinding, and refuses requests that carry an `Origin` header, so a web page
 can't drive the sequencer through the browser. MCP clients send no `Origin`.
 
 Shutdown runs back down the chain. Ctrl-C, SIGTERM or, with `--stdio`, the
-agent closing stdin stops the MCP server. Shutting down the async runtime
-then drops the session and its `EngineHandle`. The engine sees the handle go,
+agent closing stdin stops the MCP server. HTTP requests get up to one second
+to drain; an unfinished request body cannot delay shutdown beyond that.
+Shutting down the async runtime then drops the remaining connection tasks,
+the session and its `EngineHandle`. The engine sees the handle go,
 ends every sounding note and returns, and `treason serve` waits for it before
 exiting. The runtime gets a second to shut down. That is because a pending
 read from stdin can't be cancelled, and would otherwise hold the process

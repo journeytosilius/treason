@@ -21,5 +21,8 @@ treason-engine.workspace = true
 treason-io.workspace = true
 treason-mcp.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "test-util"] }
+
 [lints]
 workspace = true
