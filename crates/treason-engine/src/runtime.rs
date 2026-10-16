@@ -615,12 +615,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Only delivery, not early submission, makes a switch irreversible:
-    /// once every port has submitted its side, the switch completes when the
-    /// port with the most latency gets to the line.
+    /// every port must have submitted its side and reached its send boundary.
     fn complete_switch(&mut self, now: Instant) {
         if self.waiting.as_ref().is_some_and(|waiting| {
-            self.streams.iter().all(|stream| stream.switched)
-                && self.timebase.time_of(waiting.line) <= now + self.max_latency
+            self.streams.iter().all(|stream| {
+                stream.switched && self.timebase.time_of(waiting.line) - stream.latency <= now
+            })
         }) {
             let waiting = self.waiting.take().unwrap();
             self.adopt(waiting.project);
@@ -2091,6 +2091,39 @@ mod tests {
             .map(|sent| (sent.at + latency - origin, what(sent)))
             .filter(|(heard, _)| *heard <= until)
             .collect()
+    }
+
+    #[test]
+    fn a_tempo_change_keeps_queued_switch_cleanup_on_lower_latency_ports() {
+        let held = on_port_1(track(1, 1, 7680, &[(3000, 60, 1680)]));
+        let (mut handle, mut engine) = engine_with_ports(
+            project(vec![held.clone()]),
+            RecordingOutput::scheduled(ms(50)),
+            [latency(30), PortSettings::default()],
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(1985));
+        let mut muted = (*held).clone();
+        muted.muted = true;
+        let edited = project(vec![Arc::new(muted)]);
+        handle.publish(edited.clone());
+        // Both ports have submitted the switch by 2010 ms, but port 1's
+        // forced note-off at 2030 ms has not reached its send boundary.
+        run_until(&mut engine, origin + ms(2015));
+        assert!(engine.output.messages().iter().any(|message| {
+            message.at == origin + ms(2030)
+                && matches!(message.message, MidiMessage::NoteOff { .. })
+        }));
+        handle.publish(Arc::new(Project {
+            tempo: Bpm::new(240.0).unwrap(),
+            ..(*edited).clone()
+        }));
+        run_until(&mut engine, origin + ms(2600));
+        assert_eq!(engine.timebase.tempo(), Bpm::new(240.0).unwrap());
+        assert_eq!(
+            sent_per_port(&mut engine, origin),
+            [vec![], vec!["1.5925s on 60", "2.03s off 60"]]
+        );
     }
 
     #[test]

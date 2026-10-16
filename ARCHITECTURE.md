@@ -181,6 +181,8 @@ and stops, and the transport tools report that it isn't running.
   already rendered or submitted that bar. Future work there is replaced,
   and the previous snapshot stays available until delivery, so another edit
   or undo can still replace the same upcoming bar.
+  A switch completes only after every port has reached its send boundary;
+  submitting every port's cleanup early does not retire the old snapshot.
   Rendered events and scheduled submissions retain their track IDs. A fixed
   ownership table per port selects only the changed tracks' notes, preserving
   held notes from other tracks sharing the channel. When tracks retrigger
