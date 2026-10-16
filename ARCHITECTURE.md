@@ -159,6 +159,11 @@ sounding note and returns.
   already rendered or submitted that bar. Future work there is replaced,
   and the previous snapshot stays available until delivery, so another edit
   or undo can still replace the same upcoming bar.
+  Rendered events and scheduled submissions retain their track IDs. A fixed
+  ownership table per port selects only the changed tracks' notes, preserving
+  held notes from other tracks sharing the channel. When tracks retrigger
+  the same MIDI key, the most recent note-on owns it; an older track's
+  note-off cannot end that retrigger.
 - A tempo change anchors the current whole-tick position at the current
   time. Due events keep their old times; future rendered and submitted
   events are rebuilt using the new tempo, including any pending bar switch.
@@ -183,7 +188,9 @@ sounding note and returns.
 2. No blocking except on the MIDI output.
 3. Communication only through the `EngineLink`: `ArcSwap`, `rtrb` and atomics.
 4. No stuck notes. `ActiveNotes`, a 256-byte bitset per port, supplies
-   note-offs on stop, panic, clip changes and shutdown.
+   note-offs on stop, panic, clip changes and shutdown. The engine adds
+   fixed ownership tables (one track ID per MIDI key) to its projected and
+   delivered sets, allocated before playback, for selective track cleanup.
 
 ## Project model
 

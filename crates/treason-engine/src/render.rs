@@ -3,7 +3,7 @@
 use std::ops::Range;
 
 use treason_core::midi::{MidiMessage, U7};
-use treason_core::model::{EventKind, PortId, Project, Track};
+use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
 /// Bank select, the most and least significant bytes. A program change on
@@ -17,6 +17,8 @@ pub struct RenderedEvent {
     pub tick: Ticks,
     /// Where.
     pub port: PortId,
+    /// The track that owns this event, stable across snapshot reordering.
+    pub track: TrackId,
     /// What.
     pub message: MidiMessage,
     /// The order it was rendered in: by track, then as written in the clip.
@@ -158,6 +160,7 @@ fn render_track(
                 emit(RenderedEvent {
                     tick: Ticks(tick),
                     port,
+                    track: track.id,
                     message,
                     sequence: (track_index, pass, first + index),
                 });
@@ -576,6 +579,7 @@ mod tests {
         let earlier = RenderedEvent {
             tick: Ticks(5000),
             port: PortId(0),
+            track: TrackId(1),
             message: MidiMessage::Stop,
             sequence: (0, 0, 0),
         };

@@ -9,14 +9,14 @@ use std::time::{Duration, Instant};
 use arc_swap::Guard;
 use thiserror::Error;
 use treason_core::midi::{Channel, MidiMessage, U7};
-use treason_core::model::{PortId, Project, Track};
+use treason_core::model::{PortId, Project, Track, TrackId};
 use treason_core::output::{Delivery, MidiOutput, TimedMessage};
 use treason_core::playback::{TransportCommand, TransportState};
 use treason_core::time::Ticks;
 
 use crate::clock::Clock;
 use crate::link::EngineLink;
-use crate::notes::ActiveNotes;
+use crate::notes::OwnedNotes;
 use crate::render::{RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{Transport, TransportEffect};
@@ -36,6 +36,13 @@ struct SnapshotSwitch {
     line: Ticks,
     project: Arc<Project>,
     submitted: bool,
+}
+
+/// Ownership follows a submission through delivery and cancellation.
+#[derive(Clone, Copy)]
+struct SubmittedEvent {
+    timed: TimedMessage,
+    track: Option<TrackId>,
 }
 
 /// The engine thread's `SCHED_FIFO` priority on Unix, from 1 to 99.
@@ -88,11 +95,11 @@ pub struct Engine<O, C> {
     config: EngineConfig,
     transport: Transport,
     /// The notes sounding after all submitted messages have been delivered.
-    sounding: Vec<ActiveNotes>,
+    sounding: Vec<OwnedNotes>,
     /// Delivered notes, conservatively including note-ons racing cancellation.
-    delivered: Vec<ActiveNotes>,
+    delivered: Vec<OwnedNotes>,
     /// A bounded mirror of scheduled work, for restoring note state on cancel.
-    scheduled: Vec<TimedMessage>,
+    scheduled: Vec<SubmittedEvent>,
     /// Rendered events not sent yet, in send order.
     rendered: Vec<RenderedEvent>,
     /// Ticks to time, anchored at the last start, locate or tempo change.
@@ -118,8 +125,8 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             output,
             clock,
             transport: Transport::new(),
-            sounding: vec![ActiveNotes::new(); config.ports.len()],
-            delivered: vec![ActiveNotes::new(); config.ports.len()],
+            sounding: vec![OwnedNotes::new(); config.ports.len()],
+            delivered: vec![OwnedNotes::new(); config.ports.len()],
             // A full render batch plus one switch's note-offs on every port.
             scheduled: Vec::with_capacity(RENDER_CAPACITY + config.ports.len() * 16 * 128),
             rendered: Vec::with_capacity(RENDER_CAPACITY),
@@ -309,7 +316,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn end_notes(&mut self, at: Instant, tick: Ticks) -> Result<(), O::Error> {
         for index in 0..self.sounding.len() {
             let port = PortId(index as u16);
-            let mut notes = self.sounding[index].clone();
+            let mut notes = self.sounding[index].notes.clone();
             for message in notes.drain_note_offs() {
                 let message = TimedMessage {
                     at,
@@ -317,7 +324,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                     port,
                     message,
                 };
-                self.emit(message)?;
+                self.emit(message, None)?;
             }
         }
         Ok(())
@@ -349,7 +356,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                         value: U7::MIN,
                     },
                 };
-                self.emit(message)?;
+                self.emit(message, None)?;
             }
         }
         Ok(())
@@ -442,10 +449,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 continue;
             }
             let port = track.target.port;
+            let id = track.id;
             let Some(notes) = self.sounding.get(usize::from(port.0)) else {
                 continue;
             };
-            let mut notes = notes.clone();
+            let mut notes = notes.for_track(id, track.target.channel);
             for message in notes.drain_channel(track.target.channel) {
                 let message = TimedMessage {
                     at,
@@ -453,7 +461,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                     port,
                     message,
                 };
-                self.emit(message)?;
+                self.emit(message, Some(id))?;
             }
         }
         self.waiting.as_mut().unwrap().submitted = true;
@@ -473,34 +481,40 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Sends one rendered event and keeps track of the notes it starts and
-    /// ends. A note-off for a note that isn't sounding, such as one Stop
-    /// already ended, isn't sent. Neither is anything for a port without
-    /// settings in the configuration.
+    /// ends. A note-off for a note this track no longer owns, such as one
+    /// Stop ended or another track retriggered, isn't sent. Neither is
+    /// anything for a port without settings in the configuration.
     fn send(&mut self, at: Instant, event: RenderedEvent) -> Result<(), O::Error> {
-        let Some(notes) = self.sounding.get_mut(usize::from(event.port.0)) else {
+        let Some(notes) = self.sounding.get(usize::from(event.port.0)) else {
             return Ok(());
         };
         if let MidiMessage::NoteOff { channel, note, .. } = event.message
-            && !notes.is_sounding(channel, note)
+            && !notes.owns(event.track, channel, note)
         {
             return Ok(());
         }
-        self.emit(TimedMessage {
-            at,
-            tick: event.tick,
-            port: event.port,
-            message: event.message,
-        })
+        self.emit(
+            TimedMessage {
+                at,
+                tick: event.tick,
+                port: event.port,
+                message: event.message,
+            },
+            Some(event.track),
+        )
     }
 
     /// Submits a message, tracking delivered and projected notes separately.
-    fn emit(&mut self, message: TimedMessage) -> Result<(), O::Error> {
+    fn emit(&mut self, message: TimedMessage, track: Option<TrackId>) -> Result<(), O::Error> {
         self.output.send(&message)?;
-        self.sounding[usize::from(message.port.0)].observe(message.message);
+        self.sounding[usize::from(message.port.0)].observe(message.message, track);
         if matches!(self.output.delivery(), Delivery::Scheduled { .. }) {
             let now = self.clock.now();
             if message.at > now {
-                self.scheduled.push(message);
+                self.scheduled.push(SubmittedEvent {
+                    timed: message,
+                    track,
+                });
                 return Ok(());
             }
             // Submission can cross queued deadlines. Observe those older
@@ -508,15 +522,16 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             // by a retrigger of the same note.
             self.advance_delivery(now);
         }
-        self.delivered[usize::from(message.port.0)].observe(message.message);
+        self.delivered[usize::from(message.port.0)].observe(message.message, track);
         Ok(())
     }
 
     /// Advances actual note state as the backend's timestamps elapse.
     fn advance_delivery(&mut self, now: Instant) {
-        self.scheduled.retain(|message| {
+        self.scheduled.retain(|event| {
+            let message = &event.timed;
             if message.at <= now {
-                self.delivered[usize::from(message.port.0)].observe(message.message);
+                self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
                 false
             } else {
                 true
@@ -531,22 +546,24 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn cancel_scheduled(&mut self, from: Instant) -> Result<(), O::Error> {
         self.output.cancel_from(from)?;
         let now = self.clock.now();
-        self.scheduled.retain(|message| {
+        self.scheduled.retain(|event| {
+            let message = &event.timed;
             if message.at < from {
                 if message.at > now {
                     return true;
                 }
-                self.delivered[usize::from(message.port.0)].observe(message.message);
+                self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
             } else if message.at <= now
                 && matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
             {
-                self.delivered[usize::from(message.port.0)].observe(message.message);
+                self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
             }
             false
         });
         self.sounding.clone_from_slice(&self.delivered);
-        for message in &self.scheduled {
-            self.sounding[usize::from(message.port.0)].observe(message.message);
+        for event in &self.scheduled {
+            let message = &event.timed;
+            self.sounding[usize::from(message.port.0)].observe(message.message, event.track);
         }
         Ok(())
     }
@@ -557,7 +574,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn wake_time(&self, now: Instant) -> Instant {
         let mut wake = now + POLL_INTERVAL.min(self.config.lookahead);
         if let Some(message) = self.scheduled.first() {
-            wake = wake.min(message.at);
+            wake = wake.min(message.timed.at);
         }
         if self.playing() && self.output.delivery() == Delivery::Immediate {
             if let Some(event) = self.rendered.first() {
@@ -668,6 +685,7 @@ mod tests {
     use super::*;
     use crate::clock::ManualClock;
     use crate::link::{EngineHandle, link};
+    use crate::notes::ActiveNotes;
 
     // At the default 120 BPM, a beat (960 ticks) is 500 ms and a 4/4 bar two
     // seconds.
@@ -1126,6 +1144,130 @@ mod tests {
     }
 
     #[test]
+    fn changing_a_track_preserves_held_notes_on_its_shared_channel() {
+        for scheduled in [false, true] {
+            for edit in ["mute", "remove", "clip", "port", "channel"] {
+                let changed = track(7, 10, 7680, &[(3000, 60, 1680)]);
+                let unchanged = track(42, 10, 7680, &[(3000, 62, 1680)]);
+                let output = if scheduled {
+                    RecordingOutput::scheduled(ms(50))
+                } else {
+                    RecordingOutput::new()
+                };
+                let (mut handle, mut engine) =
+                    engine(project(vec![changed.clone(), unchanged.clone()]), output);
+                let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                run_until(&mut engine, origin + ms(1990));
+                // The bar is already rendered/submitted. Reorder tracks as
+                // well, so ownership must use stable IDs, not vector indices.
+                let mut newer = (*changed).clone();
+                match edit {
+                    "mute" => newer.muted = true,
+                    "remove" => {}
+                    "clip" => newer.clip = Clip::default(),
+                    "port" => newer.target.port = PortId(1),
+                    "channel" => newer.target.channel = Channel::from_number(2).unwrap(),
+                    _ => unreachable!(),
+                }
+                let mut tracks = vec![unchanged];
+                if edit != "remove" {
+                    tracks.push(Arc::new(newer));
+                }
+                handle.publish(project(tracks));
+                run_until(&mut engine, origin + ms(2500));
+                let messages = engine.output.messages();
+                assert_eq!(messages.len(), 4, "{edit}, scheduled {scheduled}");
+                assert_eq!(messages[2].port, PortId(0));
+                assert_eq!(messages[2].at, origin + ms(2000));
+                assert!(matches!(messages[2].message,
+                    MidiMessage::NoteOff { channel: Channel::DRUMS, note, .. } if note.get() == 60
+                ));
+                assert_eq!(messages[3].at, origin + Duration::from_micros(2_437_500));
+                assert!(
+                    matches!(messages[3].message,
+                        MidiMessage::NoteOff { channel: Channel::DRUMS, note, .. } if note.get() == 62
+                    ),
+                    "{edit}, scheduled {scheduled}"
+                );
+                assert!(engine.sounding.iter().all(|notes| notes.notes.is_empty()));
+            }
+        }
+    }
+
+    #[test]
+    fn replacing_or_undoing_a_submitted_switch_restores_track_ownership() {
+        for undo in [false, true] {
+            let changed = track(7, 10, 7680, &[(3000, 60, 1680)]);
+            let unchanged = track(42, 10, 7680, &[(3000, 62, 1680)]);
+            let initial = project(vec![changed.clone(), unchanged.clone()]);
+            let (mut handle, mut engine) = engine(initial.clone(), ScheduledOutput::new());
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1980));
+            let mut muted = (*changed).clone();
+            muted.muted = true;
+            handle.publish(project(vec![Arc::new(muted), unchanged.clone()]));
+            assert!(engine.cycle().unwrap());
+            assert!(engine.waiting.as_ref().unwrap().submitted);
+            // Cancel the queued cleanup, then either restore the original
+            // snapshot or replace it with another edit at that same bar.
+            handle.publish(if undo {
+                initial
+            } else {
+                project(vec![unchanged])
+            });
+            run_until(&mut engine, origin + ms(2010));
+            engine.output.deliver_until(origin + ms(2010));
+            assert_eq!(
+                engine
+                    .output
+                    .notes
+                    .is_sounding(Channel::DRUMS, U7::saturating(60)),
+                undo
+            );
+            assert!(
+                engine
+                    .output
+                    .notes
+                    .is_sounding(Channel::DRUMS, U7::saturating(62))
+            );
+            run_until(&mut engine, origin + ms(2500));
+            engine.output.deliver_until(origin + ms(2500));
+            assert!(engine.output.notes.is_empty());
+            assert_eq!(engine.output.delivered.len(), 4);
+            let off = engine.output.delivered[2];
+            assert_eq!(
+                off.at,
+                origin
+                    + if undo {
+                        Duration::from_micros(2_437_500)
+                    } else {
+                        ms(2000)
+                    }
+            );
+        }
+    }
+
+    #[test]
+    fn an_older_tracks_note_off_cannot_end_another_tracks_retrigger() {
+        for scheduled in [false, true] {
+            let first = track(7, 10, 7680, &[(3000, 60, 960)]);
+            let retrigger = track(42, 10, 7680, &[(3360, 60, 1320)]);
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = engine(project(vec![first, retrigger]), output);
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(2500));
+            assert_eq!(
+                sent(&mut engine, origin),
+                ["1.5625s on 60", "1.75s on 60", "2.4375s off 60",]
+            );
+        }
+    }
+
+    #[test]
     fn panic_ends_notes_and_sends_all_notes_off_everywhere() {
         let held = track(1, 10, 1920, &[(0, 60, 960)]);
         let (mut handle, mut engine) = engine(project(vec![held]), RecordingOutput::new());
@@ -1304,7 +1446,7 @@ mod tests {
             assert_eq!(engine.clock.now(), origin + ms(105));
             assert_eq!(engine.scheduled.len(), 1);
             assert_eq!(
-                engine.scheduled[0].at,
+                engine.scheduled[0].timed.at,
                 origin + Duration::from_micros(112_500)
             );
             // The next cycle submits the retrigger at 125 ms. Time passes
