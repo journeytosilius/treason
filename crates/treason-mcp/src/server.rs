@@ -7,18 +7,16 @@ use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use treason_control::{ControlError, Edit, Session};
 use treason_core::midi::Channel;
-use treason_core::model::{Clip, OutputTarget, PortId, Track, TrackId};
+use treason_core::model::{Clip, OutputTarget, PortId, Project, Track, TrackId};
 use treason_core::playback::{Playback, TransportCommand};
 use treason_core::time::{Bpm, Ticks, TimeSignature};
+use treason_devices::DeviceProfile;
 
 use crate::dto::{
     AddTrack, DeviceList, DeviceView, EditTrack, Play, PortList, ProjectView, SetMuted, SetNotes,
     SetSteps, SetTempo, SetTimeSignature, StatusView, TrackRef, TrackView,
 };
-use crate::pattern;
-
-/// What placeholder tools answer.
-const NOT_IMPLEMENTED: &str = "not implemented yet in this build of treason";
+use crate::{notes, pattern};
 
 /// The session behind the server: one project, shared by every agent.
 pub type SharedSession = Arc<Mutex<Session<Box<dyn Playback + Send>>>>;
@@ -56,6 +54,30 @@ impl TreasonServer {
 
     fn command(&self, command: TransportCommand) -> Result<(), String> {
         self.session().command(command).map_err(describe)
+    }
+
+    /// Replaces a track's clip with the one `clip` makes from the track's
+    /// device and the project, and describes the track as it will play.
+    fn replace_clip(
+        &self,
+        track: u32,
+        clip: impl FnOnce(Option<&DeviceProfile>, &Project) -> Result<Clip, String>,
+    ) -> Result<Json<TrackView>, String> {
+        let mut session = self.session();
+        let mut track = find_track(&session, track)?;
+        let device = track
+            .device
+            .as_deref()
+            .and_then(|id| session.devices().get(id));
+        track.clip = clip(device, session.project())?;
+        let view = TrackView::new(&track, &self.ports, session.devices());
+        session
+            .apply(Edit::SetClip {
+                track: track.id,
+                clip: track.clip,
+            })
+            .map_err(describe)?;
+        Ok(Json(view))
     }
 
     /// The port called `name`, or the first port.
@@ -100,7 +122,9 @@ fn parse_channel(number: u8) -> Result<Channel, String> {
 
 #[tool_router]
 impl TreasonServer {
-    /// Shows the project: tempo, time signature and every track.
+    /// Shows the project: tempo, time signature and every track, with each
+    /// clip as step strings or notes, in the form set_steps or set_notes
+    /// takes.
     #[tool(annotations(read_only_hint = true))]
     fn get_project(&self) -> Json<ProjectView> {
         let session = self.session();
@@ -286,29 +310,31 @@ impl TreasonServer {
         &self,
         Parameters(request): Parameters<SetSteps>,
     ) -> Result<Json<TrackView>, String> {
-        let mut session = self.session();
-        let mut track = find_track(&session, request.track)?;
-        let device = track
-            .device
-            .as_deref()
-            .and_then(|id| session.devices().get(id));
-        track.clip = pattern::clip_from_steps(&request.steps, request.steps_per_beat, device)
-            .map_err(|error| error.to_string())?;
-        let view = TrackView::new(&track, &self.ports, session.devices());
-        session
-            .apply(Edit::SetClip {
-                track: track.id,
-                clip: track.clip,
-            })
-            .map_err(describe)?;
-        Ok(Json(view))
+        self.replace_clip(request.track, |device, _| {
+            pattern::clip_from_steps(&request.steps, request.steps_per_beat, device)
+                .map_err(|error| error.to_string())
+        })
     }
 
-    /// Replaces a track's clip with notes, for basslines, chords and melodies.
-    /// While playing, the new clip starts at the next bar.
+    /// Replaces a track's clip with notes, for basslines, chords and
+    /// melodies. Name each note by pitch, such as "C4" (middle C), "F#2" or
+    /// "Bb3", by MIDI note number, or by a voice of the track's device, and
+    /// time it in beats from the start of the loop. For example, a bass
+    /// figure: {"track": 2, "notes": [{"note": "C2", "start": 0, "length":
+    /// 0.5}, {"note": "Eb2", "start": 1.5, "length": 0.5}]}. While playing,
+    /// the new clip starts at the next bar. Returns the track as it will
+    /// play: as step strings if the notes fit a step grid, otherwise as
+    /// notes.
     #[tool]
-    fn set_notes(&self, Parameters(_): Parameters<SetNotes>) -> Result<String, String> {
-        Err(NOT_IMPLEMENTED.into())
+    fn set_notes(
+        &self,
+        Parameters(request): Parameters<SetNotes>,
+    ) -> Result<Json<TrackView>, String> {
+        self.replace_clip(request.track, |device, project| {
+            let bar = project.time_signature.bar_length();
+            notes::clip_from_notes(&request.notes, request.loop_beats, bar, device)
+                .map_err(|error| error.to_string())
+        })
     }
 
     /// Starts playing from bar 1, or from `from_bar`. Every track loops its
@@ -383,13 +409,16 @@ impl ServerHandler for TreasonServer {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
 
+    use treason_core::midi::U7;
     use treason_core::model::Project;
     use treason_core::playback::{PlaybackError, PlaybackStatus};
     use treason_devices::DeviceRegistry;
 
     use super::*;
+    use crate::dto::{NoteRef, NoteSpec};
 
     /// Accepts everything and plays nothing.
     struct Silent;
@@ -595,6 +624,188 @@ mod tests {
         let mut request = steps(track, &[("kick", "x...")]);
         request.0.steps_per_beat = Some(7);
         assert!(rejected(server.set_steps(request)).contains("steps_per_beat must be"));
+        assert_eq!(
+            server.get_project().0.tracks[0].events,
+            0,
+            "nothing changed"
+        );
+    }
+
+    fn notes(track: u32, notes: &[(&str, f64, f64)]) -> Parameters<SetNotes> {
+        Parameters(SetNotes {
+            track,
+            notes: notes
+                .iter()
+                .map(|&(note, start, length)| NoteSpec {
+                    note: NoteRef::Name(note.into()),
+                    start,
+                    length,
+                    velocity: None,
+                })
+                .collect(),
+            loop_beats: None,
+        })
+    }
+
+    /// A track's notes as (note, start, length, velocity).
+    fn read_notes(view: &TrackView) -> Vec<(&str, f64, f64, u8)> {
+        view.notes
+            .as_deref()
+            .expect("notes read back")
+            .iter()
+            .map(|note| (note.note.as_str(), note.start, note.length, note.velocity))
+            .collect()
+    }
+
+    #[test]
+    fn melodies_replace_the_clip_and_read_back_as_notes() {
+        let server = server();
+        let track = add(&server, None);
+        let mut request = notes(
+            track,
+            &[("C2", 0.0, 0.5), ("Eb2", 1.5, 0.5), ("G2", 3.0, 1.0)],
+        );
+        request.0.notes[2].velocity = Some(90);
+        let Json(view) = server.set_notes(request).unwrap();
+        assert_eq!((view.loop_beats, view.events), (4.0, 3));
+        assert!(view.pattern.is_none());
+        assert_eq!(
+            read_notes(&view),
+            [
+                ("C2", 0.0, 0.5, 100),
+                ("D#2", 1.5, 0.5, 100),
+                ("G2", 3.0, 1.0, 90)
+            ]
+        );
+        assert_eq!(server.get_project().0.tracks, [view]);
+
+        server.undo();
+        let empty = &server.get_project().0.tracks[0];
+        assert_eq!((empty.events, empty.notes.is_none()), (0, true));
+    }
+
+    #[test]
+    fn notes_read_back_with_the_device_voice_names() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        // A flam: off the step grid, so it reads back as notes. C4 is the
+        // kit's high bongo, while C6 is past its last voice.
+        let request = notes(
+            track,
+            &[
+                ("sd", 1.0, 0.25),
+                ("snare", 0.96875, 0.03125),
+                ("C4", 2.0, 1.0),
+                ("C6", 3.0, 1.0),
+            ],
+        );
+        let Json(view) = server.set_notes(request).unwrap();
+        assert_eq!(
+            read_notes(&view),
+            [
+                ("snare", 0.96875, 0.03125, 100),
+                ("snare", 1.0, 0.25, 100),
+                ("high_bongo", 2.0, 1.0, 100),
+                ("C6", 3.0, 1.0, 100),
+            ]
+        );
+    }
+
+    #[test]
+    fn notes_round_trip_when_a_voice_or_alias_shadows_a_pitch() {
+        for (voice, aliases) in [
+            ("A1", BTreeMap::new()),
+            ("low", BTreeMap::from([("A1".into(), "low".into())])),
+        ] {
+            let device = DeviceProfile {
+                id: "pitched".into(),
+                name: "Pitched".into(),
+                manufacturer: None,
+                default_channel: Channel::from_number(1).unwrap(),
+                voices: BTreeMap::from([(voice.into(), U7::new(40).unwrap())]),
+                aliases,
+                params: BTreeMap::new(),
+            };
+            device.validate().unwrap();
+            let mut devices = DeviceRegistry::new();
+            devices.insert(device);
+            let playback: Box<dyn Playback + Send> = Box::new(Silent);
+            let session = Session::new(Arc::new(Project::default()), devices, playback);
+            let server = TreasonServer::new(session, vec!["out".into()]);
+            let track = add(&server, Some("pitched"));
+            let mut request = notes(
+                track,
+                &[("33", 0.0, 0.5), ("A1", 1.0, 0.5), ("A2", 2.0, 0.5)],
+            );
+            request.0.notes[0].note = NoteRef::Number(33);
+            // Ensure the clip reads back as notes rather than step strings.
+            request.0.notes[0].velocity = Some(90);
+            server.set_notes(request).unwrap();
+            let original = server.session().project().tracks[0].clip.clone();
+            let view = server.get_project().0.tracks.remove(0);
+            let notes = serde_json::from_str(
+                &serde_json::to_string(view.notes.as_ref().expect("notes read back")).unwrap(),
+            )
+            .unwrap();
+            let Json(rewritten) = server
+                .set_notes(Parameters(SetNotes {
+                    track,
+                    notes,
+                    loop_beats: Some(view.loop_beats),
+                }))
+                .unwrap();
+            assert_eq!(
+                server.session().project().tracks[0].clip,
+                original,
+                "voice {voice}: unchanged readback must preserve MIDI notes"
+            );
+            assert_eq!(rewritten, view);
+            assert_eq!(
+                read_notes(&view),
+                [
+                    ("33", 0.0, 0.5, 90),
+                    (voice, 1.0, 0.5, 100),
+                    ("A2", 2.0, 0.5, 100),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn notes_on_a_step_grid_read_back_as_steps() {
+        let server = server();
+        let track = add(&server, None);
+        let Json(view) = server
+            .set_notes(notes(track, &[("C2", 0.0, 0.25), ("C2", 2.0, 0.25)]))
+            .unwrap();
+        assert!(view.notes.is_none());
+        assert_eq!(view.pattern.unwrap().steps["36"], "x... .... x... ....");
+    }
+
+    #[test]
+    fn bad_notes_say_how_to_fix_them() {
+        let server = server();
+        let track = add(&server, None);
+        let cases = [
+            (notes(99, &[("C2", 0.0, 1.0)]), "see get_project"),
+            (notes(track, &[("kick", 0.0, 1.0)]), "edit_track"),
+            (
+                notes(track, &[("C2", 0.0, 1.0), ("H2", 1.0, 1.0)]),
+                "note 2 (`H2`)",
+            ),
+            (
+                notes(track, &[("C2", 0.0, 2.0), ("C2", 1.0, 1.0)]),
+                "notes 1 and 2 are both `C2` and overlap",
+            ),
+            (notes(track, &[]), "give at least one note"),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.set_notes(request));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        let mut request = notes(track, &[("C2", 0.0, 1.0)]);
+        request.0.loop_beats = Some(0.0);
+        assert!(rejected(server.set_notes(request)).contains("loop_beats must be"));
         assert_eq!(
             server.get_project().0.tracks[0].events,
             0,

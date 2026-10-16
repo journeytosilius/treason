@@ -5,13 +5,13 @@ pattern, a bassline, a change of feel) and the agent builds it with the
 sequencer's tools. treason plays it as MIDI to external gear: drum machines,
 synths and other sequencers. It makes no sound itself.
 
-Status: early. `treason serve` plays what an agent writes with step
-patterns, such as drum parts, on the MIDI ports in `treason.toml`. Ports
-with `clock = true` get MIDI clock and Start, Stop and Continue, so their
-gear plays along. A port's `latency_ms` makes up for its gear's delay, so
-everything sounds together. Still to come: melodic parts written with pitch
-names. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's
-still a stub.
+Status: early. `treason serve` plays what an agent writes on the MIDI ports
+in `treason.toml`: drum parts as step patterns, and melodic parts as notes
+with pitch names such as `C4`. Ports with `clock = true` get MIDI clock and
+Start, Stop and Continue, so their gear plays along. A port's `latency_ms`
+makes up for its gear's delay, so everything sounds together. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
+stub.
 
 ## Requirements
 

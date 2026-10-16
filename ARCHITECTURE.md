@@ -83,10 +83,11 @@ seams between modules are fixed and compile-checked before the logic exists.
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
 | io | `smf` (feature `smf`) | `write`: Standard MIDI Files | stub |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
-| mcp | `server` | `TreasonServer`: the tools | `set_notes` is a placeholder |
+| mcp | `server` | `TreasonServer`: the tools | done |
 | mcp | `dto` | tool inputs and outputs | done |
-| mcp | `notation` | step strings and pitch names | pitch names are a stub |
+| mcp | `notation` | step strings and pitch names | done |
 | mcp | `pattern` | step patterns to clips and back | done |
+| mcp | `notes` | lists of notes in beats to clips | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
 | treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml` | done |
 
@@ -260,8 +261,9 @@ Profiles for real gear can be generated from the MIDI Guide dataset
 ## Agent interface
 
 The tools are designed for the model rather than mirroring the internal
-model: voice names instead of note numbers, step strings such as
-`"x...x...x..x.x.."`, channels 1–16, positions in bars and beats.
+model: voice names and pitch names such as `C4` instead of note numbers,
+step strings such as `"x...x...x..x.x.."`, channels 1–16, positions in bars
+and beats.
 `treason-mcp` converts between the two, so either side can change without
 breaking the other.
 
@@ -269,7 +271,7 @@ breaking the other.
 |---|---|
 | `get_project`, `status`, `list_devices`, `list_ports` | read only |
 | `add_track`, `edit_track`, `remove_track`, `set_muted` | tracks |
-| `set_steps`, `set_notes` | clips (`set_notes` is a placeholder until pitch names are written) |
+| `set_steps`, `set_notes` | clips |
 | `set_tempo`, `set_time_signature` | project |
 | `play`, `stop`, `panic` | transport |
 | `undo`, `redo` | history |
@@ -280,8 +282,12 @@ call comes back as a tool error whose message says how to fix it, such as
 "there is no port `x`; see list_ports", so the agent can correct itself.
 
 `get_project` shows a clip that fits a step grid as step strings, in the
-form `set_steps` takes, so the agent reads back patterns the way it wrote
-them.
+form `set_steps` takes, and any other clip as a list of notes, in the form
+`set_notes` takes. So the agent reads back what it wrote, in the same terms.
+Notes go by the device's voice names where it has them and by pitch
+otherwise, with sharps: C4 is middle C, note 60. If that pitch name is a
+device voice or alias for another note, readback uses the decimal MIDI
+number instead, so writing the notes back preserves their pitches.
 
 ## Configuration
 
@@ -355,6 +361,7 @@ The second milestone drives other gear:
 7. Per-port latency: messages for slower devices go out earlier, so every
    port sounds in time. Done.
 8. Melodic parts: pitch names in `notation` and the `set_notes` tool.
+   Done.
 9. The ALSA sequencer queue backend, for kernel-timed delivery.
 
 Later: MIDI file export, following an external clock (which needs MIDI
