@@ -14,11 +14,12 @@ use crate::time::Ticks;
 /// Transport commands, with MIDI transport semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportCommand {
-    /// Play from the beginning. Sends MIDI Start.
+    /// Play from the beginning, even while playing. Sends MIDI Start.
     Play,
     /// Stop and keep the position. Sends MIDI Stop and ends sounding notes.
     Stop,
-    /// Play from the current position. Sends MIDI Continue.
+    /// Play from the current position. Sends MIDI Continue, or Start at the
+    /// beginning. Does nothing while playing.
     Continue,
     /// Move to a position. Sends Song Position Pointer.
     Locate(Ticks),

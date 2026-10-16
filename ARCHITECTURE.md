@@ -75,8 +75,8 @@ seams between modules are fixed and compile-checked before the logic exists.
 | engine | `timebase` | `Timebase`: ticks to time and back | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
-| engine | `transport` | `Transport`: MIDI transport semantics | stub |
-| engine | `render` | `render` (clip events in a window), `clock_pulses` | `render` is a stub |
+| engine | `transport` | `Transport`: MIDI transport semantics | done |
+| engine | `render` | `render` (clip events in a window), `clock_pulses` | done |
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | the loop (`run`) is a stub |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
@@ -142,8 +142,14 @@ sounding note and returns.
   earlier.
 - Tempo changes and transport commands apply at once. Changes to a track's
   clip, port or channel wait for the next bar.
-- At the same tick, note-offs go out before note-ons, so a retriggered note
-  isn't cut short.
+- Play starts from the top, and restarts there while playing. Continue
+  resumes where playback stopped, and Stop keeps the position.
+- At the same tick, note-offs go out first, then bank selects, program
+  changes, other control changes and note-ons. A retriggered note isn't cut
+  short, a program change gets the bank selected with it, and a note plays
+  with the program and controller values set on its tick. Within each
+  group, events keep their order, by track and then as written in the
+  clip, so RPN sequences and repeated controllers arrive as written.
 - treason is the clock master: a MIDI clock pulse every 40 ticks while
   playing, plus Start, Stop, Continue and Song Position Pointer, on the ports
   configured with `clock = true`. Following an external clock is planned.
@@ -168,7 +174,8 @@ sounding note and returns.
   `Clip`.
 - A `Clip` has its own length, so clips of different lengths give polymeter.
   It holds note, control-change and program-change events sorted by start
-  tick. Micro-timing is just where an event sits.
+  tick. Micro-timing is just where an event sits. A note can run past the
+  loop point into the next pass, but can't be longer than the loop.
 - Planned event fields: probability, ratchets, conditions (every N loops,
   fills) and per-step control values.
 - The engine sees only resolved MIDI. Names such as "kick" or "cutoff" live
@@ -269,7 +276,7 @@ gear plays it:
    with `get_project` showing patterns as step strings. Also an
    `edit_track` tool, to rename a track or move it to another port,
    channel or device without losing its clip. Done.
-3. Engine core: `Transport::apply` and `render`.
+3. Engine core: `Transport::apply` and `render`. Done.
 4. Engine loop: `Engine::run`, tested with `ManualClock` and
    `RecordingOutput`.
 5. `treason serve` starts the engine, so `play` plays.

@@ -95,12 +95,16 @@ pub struct Track {
 ///
 /// Every track loops its own clip, so clips of different lengths give
 /// polymeter. Events are kept sorted by start, which lets the engine find the
-/// events in a time window with a binary search.
+/// events in a time window with a binary search. A note may run past the
+/// loop point into the next pass, but no note is longer than the loop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawClip")]
 pub struct Clip {
     length: Ticks,
     events: Vec<ClipEvent>,
+    /// Kept so the engine knows how far back a note ending now can start.
+    #[serde(skip)]
+    longest_note: Ticks,
 }
 
 impl Clip {
@@ -109,6 +113,7 @@ impl Clip {
         if length == Ticks::ZERO {
             return Err(ClipError::ZeroLength);
         }
+        let mut longest_note = Ticks::ZERO;
         for event in &events {
             if event.start >= length {
                 return Err(ClipError::EventOutsideClip {
@@ -117,16 +122,30 @@ impl Clip {
                 });
             }
             if let EventKind::Note {
-                length: Ticks::ZERO,
+                length: note_length,
                 ..
             } = event.kind
             {
-                return Err(ClipError::ZeroLengthNote { start: event.start });
+                if note_length == Ticks::ZERO {
+                    return Err(ClipError::ZeroLengthNote { start: event.start });
+                }
+                if note_length > length {
+                    return Err(ClipError::NoteLongerThanClip {
+                        start: event.start,
+                        note_length,
+                        length,
+                    });
+                }
+                longest_note = longest_note.max(note_length);
             }
         }
         // A stable sort keeps the given order of events that start together.
         events.sort_by_key(|event| event.start);
-        Ok(Self { length, events })
+        Ok(Self {
+            length,
+            events,
+            longest_note,
+        })
     }
 
     /// The loop length.
@@ -137,6 +156,11 @@ impl Clip {
     /// All events, sorted by start.
     pub fn events(&self) -> &[ClipEvent] {
         &self.events
+    }
+
+    /// The length of the longest note, or zero if there are no notes.
+    pub const fn longest_note(&self) -> Ticks {
+        self.longest_note
     }
 
     /// The events that start within `range`, for one pass through the loop.
@@ -155,6 +179,7 @@ impl Default for Clip {
         Self {
             length: TimeSignature::COMMON.bar_length(),
             events: Vec::new(),
+            longest_note: Ticks::ZERO,
         }
     }
 }
@@ -185,6 +210,13 @@ pub enum ClipError {
     /// A note has no length.
     #[error("the note at {start} has zero length")]
     ZeroLengthNote { start: Ticks },
+    /// A note outlasts the loop, so it would overlap its own next pass.
+    #[error("the note at {start} lasts {note_length}, longer than the clip's {length}")]
+    NoteLongerThanClip {
+        start: Ticks,
+        note_length: Ticks,
+        length: Ticks,
+    },
 }
 
 /// Something that happens at a point in a clip.
@@ -251,6 +283,33 @@ mod tests {
             })
         );
         assert_eq!(Clip::new(Ticks::ZERO, vec![]), Err(ClipError::ZeroLength));
+    }
+
+    #[test]
+    fn notes_can_cross_the_loop_point_but_not_outlast_the_loop() {
+        let note = |start, length| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Note {
+                note: U7::MAX,
+                velocity: U7::MAX,
+                length: Ticks(length),
+            },
+        };
+        let clip = Clip::new(Ticks(960), vec![note(720, 480), note(0, 960)]).unwrap();
+        assert_eq!(clip.longest_note(), Ticks(960));
+        assert_eq!(
+            Clip::new(Ticks(960), vec![note(0, 240), note(480, 961)]),
+            Err(ClipError::NoteLongerThanClip {
+                start: Ticks(480),
+                note_length: Ticks(961),
+                length: Ticks(960),
+            })
+        );
+        assert_eq!(Clip::default().longest_note(), Ticks::ZERO);
+
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(!json.contains("longest"), "{json}");
+        assert_eq!(serde_json::from_str::<Clip>(&json).unwrap(), clip);
     }
 
     #[test]

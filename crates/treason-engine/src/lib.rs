@@ -21,8 +21,7 @@
 //! - [`notes`]: sounding notes, so they can always be ended.
 //! - [`clock`]: time sources.
 //!
-//! The engine loop, the transport and rendering are stubs for now; see
-//! ARCHITECTURE.md, "Next steps".
+//! The engine loop is a stub for now; see ARCHITECTURE.md, "Next steps".
 
 pub mod clock;
 pub mod link;
