@@ -312,7 +312,8 @@ impl TreasonServer {
     }
 
     /// Starts playing from bar 1, or from `from_bar`. Every track loops its
-    /// clip until stop.
+    /// clip until stop. Gear on ports that get MIDI clock starts with it,
+    /// from the same bar.
     #[tool]
     fn play(&self, Parameters(Play { from_bar }): Parameters<Play>) -> Result<String, String> {
         let bar = from_bar.unwrap_or(1);
@@ -332,7 +333,8 @@ impl TreasonServer {
         Ok(format!("Playing from bar {bar}."))
     }
 
-    /// Stops playing and ends every sounding note. The position stays.
+    /// Stops playing and ends every sounding note. The position stays. Gear
+    /// on ports that get MIDI clock stops too.
     #[tool]
     fn stop(&self) -> Result<String, String> {
         self.command(TransportCommand::Stop)?;

@@ -15,9 +15,10 @@
 //!
 //! - [`link`](mod@link): the connection to the control side.
 //! - [`runtime`]: the [`Engine`] and its thread.
-//! - [`transport`]: play, stop, continue, locate and panic.
+//! - [`transport`]: play, stop, continue, locate and panic, and the MIDI
+//!   transport messages they send.
 //! - [`timebase`]: ticks to wall-clock time and back.
-//! - [`render`]: the MIDI events clips play in a window.
+//! - [`render`]: the MIDI events clips and the clock play in a window.
 //! - [`notes`]: sounding notes, so they can always be ended.
 //! - [`clock`]: time sources.
 

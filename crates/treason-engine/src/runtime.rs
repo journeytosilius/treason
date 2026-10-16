@@ -17,9 +17,9 @@ use treason_core::time::Ticks;
 use crate::clock::Clock;
 use crate::link::EngineLink;
 use crate::notes::OwnedNotes;
-use crate::render::{RenderedEvent, render_bounded};
+use crate::render::{ClockPulses, RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
-use crate::transport::{Transport, TransportEffect};
+use crate::transport::{self, Transport, TransportEffect};
 
 /// How many rendered events can wait for submission, without allocating.
 const RENDER_CAPACITY: usize = 4096;
@@ -112,6 +112,10 @@ pub struct Engine<O, C> {
     project: Arc<Project>,
     /// A newer snapshot, waiting for the next bar line.
     waiting: Option<SnapshotSwitch>,
+    /// The ports that get MIDI clock and transport messages.
+    clock_ports: Vec<PortId>,
+    /// The first tick with a clock pulse since playback last started.
+    pulses_from: Ticks,
 }
 
 impl<O: MidiOutput, C: Clock> Engine<O, C> {
@@ -135,6 +139,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             render_after: None,
             project,
             waiting: None,
+            clock_ports: (0..)
+                .map(PortId)
+                .zip(&config.ports)
+                .filter_map(|(port, settings)| settings.clock.then_some(port))
+                .collect(),
+            pulses_from: Ticks::ZERO,
             config,
         }
     }
@@ -161,6 +171,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         if self.link.is_abandoned() {
             self.cancel_scheduled(now + Duration::from_nanos(1))?;
             self.end_notes(now, self.transport.status().position)?;
+            if self.playing() {
+                self.cue(TransportEffect::Stop, now)?;
+            }
             self.output.flush()?;
             return Ok(false);
         }
@@ -273,20 +286,39 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.transport.advance_to(self.timebase.tick_at(now));
         }
         let position = self.transport.status().position;
-        match self.transport.apply(command) {
-            TransportEffect::None => {}
-            TransportEffect::Start { at, .. } => self.restart(at, now, position)?,
+        let effect = self.transport.apply(command);
+        match effect {
+            TransportEffect::None | TransportEffect::Locate(_) => {}
+            TransportEffect::Start { at, .. } => {
+                self.restart(at, now, position)?;
+                self.pulses_from = transport::first_pulse(at);
+            }
             TransportEffect::Stop => {
                 self.cancel_scheduled(now + Duration::from_nanos(1))?;
                 self.end_notes(now, position)?;
                 self.settle();
             }
-            TransportEffect::Locate(to) => {
-                if self.playing() {
-                    self.restart(to, now, position)?;
-                }
-            }
             TransportEffect::Panic => self.panic(now, position)?,
+        }
+        // After any note-offs, so the receivers stop or move once our own
+        // notes have ended.
+        self.cue(effect, now)
+    }
+
+    /// Sends `effect`'s MIDI transport messages to the clock ports at `at`.
+    fn cue(&mut self, effect: TransportEffect, at: Instant) -> Result<(), O::Error> {
+        let tick = self.transport.status().position;
+        for index in 0..self.clock_ports.len() {
+            let port = self.clock_ports[index];
+            for message in effect.clock_messages() {
+                let message = TimedMessage {
+                    at,
+                    tick,
+                    port,
+                    message,
+                };
+                self.emit(message, None)?;
+            }
         }
         Ok(())
     }
@@ -386,8 +418,13 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 Some(waiting) => (&self.project, horizon.min(waiting.line)),
                 None => (&self.project, horizon),
             };
+            let clock = ClockPulses {
+                ports: &self.clock_ports,
+                from: self.pulses_from,
+            };
             self.render_after = render_bounded(
                 project,
+                clock,
                 self.cursor..end,
                 self.render_after,
                 &mut self.rendered,
@@ -489,7 +526,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             return Ok(());
         };
         if let MidiMessage::NoteOff { channel, note, .. } = event.message
-            && !notes.owns(event.track, channel, note)
+            && !event
+                .track
+                .is_some_and(|track| notes.owns(track, channel, note))
         {
             return Ok(());
         }
@@ -500,7 +539,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 port: event.port,
                 message: event.message,
             },
-            Some(event.track),
+            event.track,
         )
     }
 
@@ -743,10 +782,31 @@ mod tests {
         project: Arc<Project>,
         output: O,
     ) -> (EngineHandle, Engine<O, ManualClock>) {
+        engine_with(project, output, PortSettings::default())
+    }
+
+    /// An engine like [`engine`]'s whose first port, where [`track`]s play,
+    /// also gets MIDI clock.
+    fn clocked<O: MidiOutput>(
+        project: Arc<Project>,
+        output: O,
+    ) -> (EngineHandle, Engine<O, ManualClock>) {
+        let clock = PortSettings {
+            clock: true,
+            ..PortSettings::default()
+        };
+        engine_with(project, output, clock)
+    }
+
+    fn engine_with<O: MidiOutput>(
+        project: Arc<Project>,
+        output: O,
+        first_port: PortSettings,
+    ) -> (EngineHandle, Engine<O, ManualClock>) {
         let (handle, link) = link(project);
         let config = EngineConfig {
             lookahead: ms(20),
-            ports: vec![PortSettings::default(); 2],
+            ports: vec![first_port, PortSettings::default()],
             realtime: false,
         };
         (
@@ -776,7 +836,7 @@ mod tests {
     }
 
     /// Takes what the engine sent, one line per message with its time from
-    /// `origin`, such as "125ms off 36".
+    /// `origin`, such as "125ms off 36" or "20.833334ms clock".
     fn sent(engine: &mut TestEngine, origin: Instant) -> Vec<String> {
         engine
             .output
@@ -797,6 +857,8 @@ mod tests {
                         controller.get(),
                         value.get()
                     ),
+                    MidiMessage::TimingClock => "clock".to_owned(),
+                    MidiMessage::SongPosition(beats) => format!("SPP {}", beats.get()),
                     other => format!("{other:?}"),
                 };
                 format!("{:?} {what}", sent.at - origin)
@@ -1333,6 +1395,214 @@ mod tests {
         drop(handle);
         assert!(!engine.cycle().unwrap());
         assert_eq!(sent(&mut engine, origin), ["0ns on 60", "100ms off 60"]);
+    }
+
+    #[test]
+    fn clock_ports_get_start_a_pulse_every_40_ticks_and_stop() {
+        let kick = track(1, 10, 960, &[(0, 36, 240)]);
+        let mut bass = (*track(2, 1, 960, &[(0, 40, 240)])).clone();
+        bass.target.port = PortId(1);
+        let (mut handle, mut engine) =
+            clocked(project(vec![kick, Arc::new(bass)]), RecordingOutput::new());
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(45));
+        engine.clock.sleep_until(origin + ms(50));
+        apply(&mut handle, &mut engine, TransportCommand::Stop);
+        // Stopped at tick 96, between 16ths. The receivers resume at the
+        // next one, tick 240, which comes 75 ms after Continue.
+        engine.clock.sleep_until(origin + ms(60));
+        apply(&mut handle, &mut engine, TransportCommand::Continue);
+        run_until(&mut engine, origin + ms(160));
+
+        let notes = |sent: &&TimedMessage| {
+            matches!(
+                sent.message,
+                MidiMessage::NoteOn { .. } | MidiMessage::NoteOff { .. }
+            )
+        };
+        let mut clock = engine.output.messages().iter().filter(|sent| !notes(sent));
+        assert!(
+            clock.all(|sent| sent.port == PortId(0)),
+            "only the clock port"
+        );
+        assert_eq!(
+            sent(&mut engine, origin),
+            [
+                "0ns Start",
+                "0ns clock",
+                "0ns on 36",
+                "0ns on 40",
+                "20.833334ms clock",
+                "41.666667ms clock",
+                "50ms off 36",
+                "50ms off 40",
+                "50ms Stop",
+                "60ms SPP 1",
+                "60ms Continue",
+                "135ms clock",
+                "155.833334ms clock",
+            ]
+        );
+    }
+
+    #[test]
+    fn restarting_or_locating_stops_the_clock_before_moving_it() {
+        let kick = track(1, 10, 960, &[(0, 36, 480)]);
+        let (mut handle, mut engine) = clocked(project(vec![kick]), RecordingOutput::new());
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(25));
+        engine.clock.sleep_until(origin + ms(30));
+        apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(55));
+        engine.clock.sleep_until(origin + ms(60));
+        // Tick 1000 is between 16ths, so the clock resumes at tick 1200.
+        apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(1000)),
+        );
+        run_until(&mut engine, origin + ms(165));
+        engine.clock.sleep_until(origin + ms(170));
+        apply(&mut handle, &mut engine, TransportCommand::Stop);
+        engine.clock.sleep_until(origin + ms(180));
+        apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(2400)),
+        );
+        assert_eq!(
+            sent(&mut engine, origin),
+            [
+                "0ns Start",
+                "0ns clock",
+                "0ns on 36",
+                "20.833334ms clock",
+                "30ms off 36",
+                "30ms Stop",
+                "30ms Start",
+                "30ms clock",
+                "30ms on 36",
+                "50.833334ms clock",
+                "60ms off 36",
+                "60ms Stop",
+                "60ms SPP 5",
+                "60ms Continue",
+                "164.166667ms clock",
+                "170ms Stop",
+                "180ms SPP 10",
+            ]
+        );
+    }
+
+    #[test]
+    fn dropping_the_handle_stops_the_clock_after_ending_notes() {
+        for playing in [true, false] {
+            let held = track(1, 10, 1920, &[(0, 60, 960)]);
+            let (mut handle, mut engine) = clocked(project(vec![held]), RecordingOutput::new());
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            if !playing {
+                apply(&mut handle, &mut engine, TransportCommand::Stop);
+            }
+            run_until(&mut engine, origin + ms(10));
+            engine.output.take();
+            drop(handle);
+            assert!(!engine.cycle().unwrap());
+            let expected: &[&str] = if playing {
+                &["10ms off 60", "10ms Stop"]
+            } else {
+                &[]
+            };
+            assert_eq!(sent(&mut engine, origin), expected);
+        }
+    }
+
+    /// The ticks and times of the clock pulses sent.
+    fn pulses(sent: &[TimedMessage]) -> Vec<(u64, Instant)> {
+        sent.iter()
+            .filter(|sent| sent.message == MidiMessage::TimingClock)
+            .map(|sent| (sent.tick.0, sent.at))
+            .collect()
+    }
+
+    #[test]
+    fn panic_leaves_the_clock_running() {
+        let held = track(1, 10, 1920, &[(0, 60, 960)]);
+        let (mut handle, mut engine) = clocked(project(vec![held]), RecordingOutput::new());
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(100));
+        apply(&mut handle, &mut engine, TransportCommand::Panic);
+        run_until(&mut engine, origin + ms(300));
+        let sent = engine.output.take();
+        // Every pulse up to tick 576, at 300 ms, once and in order.
+        let ticks: Vec<u64> = pulses(&sent).iter().map(|pulse| pulse.0).collect();
+        assert_eq!(ticks, (0..15).map(|pulse| pulse * 40).collect::<Vec<_>>());
+        let transport = sent.iter().filter(|sent| {
+            matches!(
+                sent.message,
+                MidiMessage::Start
+                    | MidiMessage::Stop
+                    | MidiMessage::Continue
+                    | MidiMessage::SongPosition(_)
+            )
+        });
+        assert_eq!(transport.count(), 1, "only the Start");
+    }
+
+    #[test]
+    fn stopping_withdraws_pulses_queued_on_a_scheduled_output() {
+        let (mut handle, mut engine) = clocked(project(vec![]), RecordingOutput::scheduled(ms(50)));
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(100));
+        let stopped = engine.clock.now();
+        assert!(
+            engine
+                .output
+                .messages()
+                .iter()
+                .any(|sent| sent.at > stopped),
+            "pulses are queued ahead"
+        );
+        apply(&mut handle, &mut engine, TransportCommand::Stop);
+        let sent = engine.output.take();
+        let last = sent.last().unwrap();
+        assert_eq!((last.at, last.message), (stopped, MidiMessage::Stop));
+        assert!(sent.iter().all(|sent| sent.at <= stopped));
+    }
+
+    #[test]
+    fn the_clock_runs_on_through_bar_switches_and_tempo_changes() {
+        for scheduled in [false, true] {
+            let kicks = |note| track(1, 10, 960, &[(0, note, 240)]);
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) = clocked(project(vec![kicks(36)]), output);
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1990));
+            handle.publish(project(vec![kicks(38)]));
+            run_until(&mut engine, origin + ms(2500));
+            handle.publish(Arc::new(Project {
+                tempo: Bpm::new(240.0).unwrap(),
+                tracks: vec![kicks(38)],
+                ..Project::default()
+            }));
+            run_until(&mut engine, origin + ms(3000));
+
+            let pulses = pulses(engine.output.messages());
+            let ticks: Vec<u64> = pulses.iter().map(|pulse| pulse.0).collect();
+            let every_40: Vec<u64> = (0..ticks.len() as u64).map(|n| n * 40).collect();
+            assert_eq!(ticks, every_40, "scheduled {scheduled}");
+            // 24 a beat: 20.8 ms apart at 120 BPM, then 10.4 ms at 240.
+            let gaps: Vec<u128> = pulses
+                .windows(2)
+                .map(|pair| (pair[1].1 - pair[0].1).as_micros())
+                .collect();
+            assert_eq!(gaps[0], 20_833, "scheduled {scheduled}");
+            assert_eq!(gaps[gaps.len() - 1], 10_416, "scheduled {scheduled}");
+            assert!(ticks.len() > 150, "scheduled {scheduled}: {}", ticks.len());
+        }
     }
 
     #[test]

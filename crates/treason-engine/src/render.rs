@@ -18,15 +18,28 @@ pub struct RenderedEvent {
     /// Where.
     pub port: PortId,
     /// The track that owns this event, stable across snapshot reordering.
-    pub track: TrackId,
+    /// `None` for MIDI clock.
+    pub track: Option<TrackId>,
     /// What.
     pub message: MidiMessage,
-    /// The order it was rendered in: by track, then as written in the clip.
-    /// Breaks ties in the send order without a sort that allocates.
+    /// The order it was rendered in: by track, then as written in the clip,
+    /// or for a clock pulse, by port. Breaks ties in the send order without a
+    /// sort that allocates.
     sequence: (usize, u64, usize),
 }
 
-/// Appends to `out` everything `project` plays in `window`, in send order.
+/// MIDI clock to render along with a project's clips.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClockPulses<'a> {
+    /// The ports that get a pulse every 40 ticks, counting from tick 0.
+    pub ports: &'a [PortId],
+    /// The first tick that can get a pulse. Earlier pulses are left out, so
+    /// that the receivers wait where a Song Position Pointer put them.
+    pub from: Ticks,
+}
+
+/// Appends to `out` everything `project` plays in `window`, along with the
+/// pulses of `clock`, in send order.
 ///
 /// Every unmuted track loops its clip from tick 0, so an event at clip
 /// position `p` plays at `p + k × length` for every `k`. A note's note-off
@@ -34,20 +47,25 @@ pub struct RenderedEvent {
 /// window holds the note-offs that fall inside it. Notes with velocity 0
 /// play nothing.
 ///
-/// Events are ordered by tick. At the same tick, note-offs come first, then
-/// bank selects (controllers 0 and 32), program changes, other control
-/// changes and note-ons. A retriggered note isn't cut short, a program
-/// change gets the bank selected with it, and a note plays with the program
-/// and controller values set on its tick. Within each of those groups,
-/// events keep their order, by track and then as written in the clip, so a
-/// sequence such as an RPN's parameter selection and data entry arrives as
-/// written.
+/// Events are ordered by tick. At the same tick, clock pulses come first, so
+/// the tick starts on time, then note-offs, bank selects (controllers 0 and
+/// 32), program changes, other control changes and note-ons. A retriggered
+/// note isn't cut short, a program change gets the bank selected with it,
+/// and a note plays with the program and controller values set on its tick.
+/// Within each of those groups, events keep their order, by track and then
+/// as written in the clip, so a sequence such as an RPN's parameter
+/// selection and data entry arrives as written.
 ///
 /// `out` is reused from window to window. This unbounded entry point may
 /// allocate if its remaining capacity cannot hold the whole window.
-pub fn render(project: &Project, window: Range<Ticks>, out: &mut Vec<RenderedEvent>) {
+pub fn render(
+    project: &Project,
+    clock: ClockPulses<'_>,
+    window: Range<Ticks>,
+    out: &mut Vec<RenderedEvent>,
+) {
     let first = out.len();
-    visit(project, window, |event| out.push(event));
+    visit(project, clock, window, |event| out.push(event));
     out[first..].sort_unstable_by_key(send_order);
 }
 
@@ -57,6 +75,7 @@ pub fn render(project: &Project, window: Range<Ticks>, out: &mut Vec<RenderedEve
 /// The caller must provide at least one free slot.
 pub(crate) fn render_bounded(
     project: &Project,
+    clock: ClockPulses<'_>,
     window: Range<Ticks>,
     after: Option<RenderedEvent>,
     out: &mut Vec<RenderedEvent>,
@@ -64,7 +83,7 @@ pub(crate) fn render_bounded(
     assert!(out.len() < out.capacity());
     let first = out.len();
     let mut overflow = false;
-    visit(project, window, |event| {
+    visit(project, clock, window, |event| {
         if after.is_some_and(|after| send_order(&event) <= send_order(&after)) {
             return;
         }
@@ -108,9 +127,26 @@ pub(crate) fn render_bounded(
     overflow.then(|| *out.last().unwrap())
 }
 
-fn visit(project: &Project, window: Range<Ticks>, mut emit: impl FnMut(RenderedEvent)) {
+fn visit(
+    project: &Project,
+    clock: ClockPulses<'_>,
+    window: Range<Ticks>,
+    mut emit: impl FnMut(RenderedEvent),
+) {
     if window.start >= window.end {
         return;
+    }
+    for tick in clock_pulses(window.start.max(clock.from)..window.end) {
+        for &port in clock.ports {
+            emit(RenderedEvent {
+                tick,
+                port,
+                track: None,
+                message: MidiMessage::TimingClock,
+                // Pulses rank on their own, so this only orders their ports.
+                sequence: (0, 0, usize::from(port.0)),
+            });
+        }
     }
     for (index, track) in project.tracks.iter().enumerate() {
         if !track.muted {
@@ -160,7 +196,7 @@ fn render_track(
                 emit(RenderedEvent {
                     tick: Ticks(tick),
                     port,
-                    track: track.id,
+                    track: Some(track.id),
                     message,
                     sequence: (track_index, pass, first + index),
                 });
@@ -209,21 +245,22 @@ fn render_track(
     }
 }
 
-/// Where an event goes in the send order: by tick, then note-offs, bank
-/// selects, program changes, other control changes and note-ons, then in the
-/// order they were rendered. No two events tie, so an unstable sort keeps
-/// that order.
+/// Where an event goes in the send order: by tick, then clock pulses,
+/// note-offs, bank selects, program changes, other control changes and
+/// note-ons, then in the order they were rendered. No two events tie, so an
+/// unstable sort keeps that order.
 fn send_order(event: &RenderedEvent) -> (Ticks, u8, (usize, u64, usize)) {
     let rank = match event.message {
-        MidiMessage::NoteOff { .. } => 0,
+        MidiMessage::TimingClock => 0,
+        MidiMessage::NoteOff { .. } => 1,
         MidiMessage::ControlChange { controller, .. }
             if BANK_SELECT.contains(&controller.get()) =>
         {
-            1
+            2
         }
-        MidiMessage::ProgramChange { .. } => 2,
-        MidiMessage::ControlChange { .. } => 3,
-        _ => 4,
+        MidiMessage::ProgramChange { .. } => 3,
+        MidiMessage::ControlChange { .. } => 4,
+        _ => 5,
     };
     (event.tick, rank, event.sequence)
 }
@@ -236,6 +273,11 @@ mod tests {
     use treason_core::model::{Clip, ClipEvent, OutputTarget, TrackId};
 
     use super::*;
+
+    const NO_CLOCK: ClockPulses<'static> = ClockPulses {
+        ports: &[],
+        from: Ticks::ZERO,
+    };
 
     fn note(start: u64, note: u8, length: u64) -> ClipEvent {
         ClipEvent {
@@ -290,11 +332,23 @@ mod tests {
 
     /// What plays in `window`, one line per event, such as "240 off 36".
     fn play(project: &Project, window: Range<u64>) -> Vec<String> {
+        play_clocked(project, NO_CLOCK, window)
+    }
+
+    /// What plays in `window` with `clock`, one line per event. Pulses
+    /// show their port, such as "40 clock 1".
+    fn play_clocked(project: &Project, clock: ClockPulses<'_>, window: Range<u64>) -> Vec<String> {
         let mut out = Vec::new();
-        render(project, Ticks(window.start)..Ticks(window.end), &mut out);
+        render(
+            project,
+            clock,
+            Ticks(window.start)..Ticks(window.end),
+            &mut out,
+        );
         out.iter()
             .map(|event| {
                 let what = match event.message {
+                    MidiMessage::TimingClock => format!("clock {}", event.port.0),
                     MidiMessage::NoteOn { note, .. } => format!("on {}", note.get()),
                     MidiMessage::NoteOff { note, .. } => format!("off {}", note.get()),
                     MidiMessage::ControlChange {
@@ -341,15 +395,20 @@ mod tests {
                 vec![control(0, 101, 0), control(0, 100, 0), control(0, 6, 12)],
             ),
         ]);
+        // Pulses on two ports crowd the ticks they share with the clips.
+        let clock = ClockPulses {
+            ports: &[PortId(0), PortId(1)],
+            from: Ticks::ZERO,
+        };
         let mut expected = Vec::new();
-        render(&project, Ticks::ZERO..Ticks(2000), &mut expected);
+        render(&project, clock, Ticks::ZERO..Ticks(2000), &mut expected);
         for capacity in 1..=7 {
             let mut batch = Vec::with_capacity(capacity);
             let mut actual = Vec::new();
             let mut start = Ticks::ZERO;
             let mut after = None;
             loop {
-                let next = render_bounded(&project, start..Ticks(2000), after, &mut batch);
+                let next = render_bounded(&project, clock, start..Ticks(2000), after, &mut batch);
                 assert_eq!(batch.capacity(), capacity);
                 actual.extend_from_slice(&batch);
                 batch.clear();
@@ -366,20 +425,26 @@ mod tests {
     fn bounded_rendering_counts_retained_events_against_capacity() {
         let project = beat();
         let mut expected = Vec::new();
-        render(&project, Ticks::ZERO..Ticks(960), &mut expected);
+        render(&project, NO_CLOCK, Ticks::ZERO..Ticks(960), &mut expected);
         let mut batch = Vec::with_capacity(3);
         assert_eq!(
-            render_bounded(&project, Ticks::ZERO..Ticks(241), None, &mut batch),
+            render_bounded(
+                &project,
+                NO_CLOCK,
+                Ticks::ZERO..Ticks(241),
+                None,
+                &mut batch
+            ),
             None
         );
         assert_eq!(batch, expected[..2]);
-        let after = render_bounded(&project, Ticks(241)..Ticks(960), None, &mut batch);
+        let after = render_bounded(&project, NO_CLOCK, Ticks(241)..Ticks(960), None, &mut batch);
         assert_eq!(batch, expected[..3]);
         assert_eq!(batch.capacity(), 3);
         let last = after.expect("the fourth event must remain unrendered");
         batch.clear();
         assert_eq!(
-            render_bounded(&project, last.tick..Ticks(960), after, &mut batch),
+            render_bounded(&project, NO_CLOCK, last.tick..Ticks(960), after, &mut batch),
             None
         );
         assert_eq!(batch, expected[3..]);
@@ -539,7 +604,7 @@ mod tests {
         // Four-beat kicks against a three-beat bass line: polymeter.
         let project = project(vec![track(1, 3840, vec![note(0, 36, 240)]), bass, muted]);
         let mut out = Vec::new();
-        render(&project, Ticks(0)..Ticks(7680), &mut out);
+        render(&project, NO_CLOCK, Ticks(0)..Ticks(7680), &mut out);
         let ons: Vec<(u64, u16, u8, u8)> = out
             .iter()
             .filter_map(|event| match event.message {
@@ -579,16 +644,42 @@ mod tests {
         let earlier = RenderedEvent {
             tick: Ticks(5000),
             port: PortId(0),
-            track: TrackId(1),
+            track: Some(TrackId(1)),
             message: MidiMessage::Stop,
             sequence: (0, 0, 0),
         };
         out.push(earlier);
         let buffer = out.as_ptr();
-        render(&beat(), Ticks(0)..Ticks(1920), &mut out);
+        render(&beat(), NO_CLOCK, Ticks(0)..Ticks(1920), &mut out);
         assert_eq!(out.as_ptr(), buffer);
         assert_eq!(out.len(), 9);
         assert_eq!(out[0], earlier, "what was there stays first");
+    }
+
+    #[test]
+    fn clock_pulses_come_first_on_their_tick_from_where_they_start() {
+        let clock = ClockPulses {
+            ports: &[PortId(1), PortId(0)],
+            from: Ticks(480),
+        };
+        assert_eq!(
+            play_clocked(&beat(), clock, 440..530),
+            [
+                "480 clock 0",
+                "480 clock 1",
+                "480 on 38",
+                "520 clock 0",
+                "520 clock 1"
+            ]
+        );
+        let clock = ClockPulses {
+            ports: &[PortId(1)],
+            from: Ticks::ZERO,
+        };
+        assert_eq!(
+            play_clocked(&project(vec![]), clock, 0..100),
+            ["0 clock 1", "40 clock 1", "80 clock 1"]
+        );
     }
 
     #[test]
