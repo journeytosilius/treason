@@ -103,7 +103,8 @@ impl TrackView {
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct NoteView {
     /// The device's voice for the note if it has one, otherwise its pitch,
-    /// such as "C4".
+    /// such as "C4". A decimal MIDI number if the pitch name would resolve
+    /// to a different device voice or alias.
     pub note: String,
     /// When it starts, in beats from the start of the loop.
     pub start: f64,
@@ -127,7 +128,20 @@ impl NoteView {
                 } => Some(Self {
                     note: device
                         .and_then(|device| device.voice_name(note))
-                        .map_or_else(|| notation::format_pitch(note), str::to_owned),
+                        .map_or_else(
+                            || {
+                                let pitch = notation::format_pitch(note);
+                                if device
+                                    .and_then(|device| device.voice(&pitch))
+                                    .is_some_and(|voice| voice != note)
+                                {
+                                    note.get().to_string()
+                                } else {
+                                    pitch
+                                }
+                            },
+                            str::to_owned,
+                        ),
                     start: beats(event.start),
                     length: beats(length),
                     velocity: velocity.get(),

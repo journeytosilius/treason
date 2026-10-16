@@ -409,8 +409,10 @@ impl ServerHandler for TreasonServer {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::Path;
 
+    use treason_core::midi::U7;
     use treason_core::model::Project;
     use treason_core::playback::{PlaybackError, PlaybackStatus};
     use treason_devices::DeviceRegistry;
@@ -707,6 +709,66 @@ mod tests {
                 ("C6", 3.0, 1.0, 100),
             ]
         );
+    }
+
+    #[test]
+    fn notes_round_trip_when_a_voice_or_alias_shadows_a_pitch() {
+        for (voice, aliases) in [
+            ("A1", BTreeMap::new()),
+            ("low", BTreeMap::from([("A1".into(), "low".into())])),
+        ] {
+            let device = DeviceProfile {
+                id: "pitched".into(),
+                name: "Pitched".into(),
+                manufacturer: None,
+                default_channel: Channel::from_number(1).unwrap(),
+                voices: BTreeMap::from([(voice.into(), U7::new(40).unwrap())]),
+                aliases,
+                params: BTreeMap::new(),
+            };
+            device.validate().unwrap();
+            let mut devices = DeviceRegistry::new();
+            devices.insert(device);
+            let playback: Box<dyn Playback + Send> = Box::new(Silent);
+            let session = Session::new(Arc::new(Project::default()), devices, playback);
+            let server = TreasonServer::new(session, vec!["out".into()]);
+            let track = add(&server, Some("pitched"));
+            let mut request = notes(
+                track,
+                &[("33", 0.0, 0.5), ("A1", 1.0, 0.5), ("A2", 2.0, 0.5)],
+            );
+            request.0.notes[0].note = NoteRef::Number(33);
+            // Ensure the clip reads back as notes rather than step strings.
+            request.0.notes[0].velocity = Some(90);
+            server.set_notes(request).unwrap();
+            let original = server.session().project().tracks[0].clip.clone();
+            let view = server.get_project().0.tracks.remove(0);
+            let notes = serde_json::from_str(
+                &serde_json::to_string(view.notes.as_ref().expect("notes read back")).unwrap(),
+            )
+            .unwrap();
+            let Json(rewritten) = server
+                .set_notes(Parameters(SetNotes {
+                    track,
+                    notes,
+                    loop_beats: Some(view.loop_beats),
+                }))
+                .unwrap();
+            assert_eq!(
+                server.session().project().tracks[0].clip,
+                original,
+                "voice {voice}: unchanged readback must preserve MIDI notes"
+            );
+            assert_eq!(rewritten, view);
+            assert_eq!(
+                read_notes(&view),
+                [
+                    ("33", 0.0, 0.5, 90),
+                    (voice, 1.0, 0.5, 100),
+                    ("A2", 2.0, 0.5, 100),
+                ]
+            );
+        }
     }
 
     #[test]

@@ -285,7 +285,9 @@ call comes back as a tool error whose message says how to fix it, such as
 form `set_steps` takes, and any other clip as a list of notes, in the form
 `set_notes` takes. So the agent reads back what it wrote, in the same terms.
 Notes go by the device's voice names where it has them and by pitch
-otherwise, with sharps: C4 is middle C, note 60.
+otherwise, with sharps: C4 is middle C, note 60. If that pitch name is a
+device voice or alias for another note, readback uses the decimal MIDI
+number instead, so writing the notes back preserves their pitches.
 
 ## Configuration
 
