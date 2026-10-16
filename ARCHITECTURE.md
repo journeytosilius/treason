@@ -88,7 +88,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | mcp | `notation` | step strings and pitch names | pitch names are a stub |
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
-| treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml` | `serve` doesn't start the engine yet |
+| treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml` | done |
 
 ## Runtime
 
@@ -119,9 +119,16 @@ The HTTP server accepts only loopback `Host` headers, which stops DNS
 rebinding, and refuses requests that carry an `Origin` header, so a web page
 can't drive the sequencer through the browser. MCP clients send no `Origin`.
 
-Shutdown runs back down the chain: Ctrl-C stops the MCP server, which drops
-the session and its `EngineHandle`. The engine sees the handle go, ends every
-sounding note and returns.
+Shutdown runs back down the chain. Ctrl-C, SIGTERM or, with `--stdio`, the
+agent closing stdin stops the MCP server. HTTP requests get up to one second
+to drain; an unfinished request body cannot delay shutdown beyond that.
+Shutting down the async runtime then drops the remaining connection tasks,
+the session and its `EngineHandle`. The engine sees the handle go,
+ends every sounding note and returns, and `treason serve` waits for it before
+exiting. The runtime gets a second to shut down. That is because a pending
+read from stdin can't be cancelled, and would otherwise hold the process
+until the next line of input. If the MIDI output fails, the engine logs why
+and stops, and the transport tools report that it isn't running.
 
 ## Timing
 
@@ -306,7 +313,7 @@ gear plays it:
 3. Engine core: `Transport::apply` and `render`. Done.
 4. Engine loop: `Engine::run`, tested with `ManualClock` and
    `RecordingOutput`. Done.
-5. `treason serve` starts the engine, so `play` plays.
+5. `treason serve` starts the engine, so `play` plays. Done.
 
 The second milestone drives other gear:
 
