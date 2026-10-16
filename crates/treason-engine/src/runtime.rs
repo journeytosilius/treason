@@ -28,6 +28,9 @@ const RENDER_CAPACITY: usize = 4096;
 /// snapshots again. A shorter lookahead shortens it.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
+/// Time for clock receivers to prepare after Start or Continue.
+const CLOCK_SETUP: Duration = Duration::from_millis(1);
+
 /// All Notes Off, which panic sends on every channel.
 const ALL_NOTES_OFF: U7 = U7::saturating(123);
 
@@ -188,8 +191,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         // plays from the top.
         self.check_snapshot(now)?;
         while let Some(command) = self.link.next_command() {
-            self.command(command, now)?;
+            self.command(command, self.clock.now())?;
         }
+        let now = self.clock.now();
         if self.playing() {
             let ahead = self.ahead();
             let horizon = Ticks(self.timebase.tick_at(now + ahead).0 + 1);
@@ -302,7 +306,18 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         }
         // After any note-offs, so the receivers stop or move once our own
         // notes have ended.
-        self.cue(effect, now)
+        self.cue(effect, now)?;
+        if let TransportEffect::Start { at, .. } = effect {
+            if !self.clock_ports.is_empty() {
+                // Flush the cue before measuring the lead, so buffered and
+                // immediate outputs both give receivers the full interval.
+                self.output.flush()?;
+                self.clock.sleep_until(self.clock.now() + CLOCK_SETUP);
+            }
+            // Anchor clips and pulses together after the receivers are ready.
+            self.timebase = Timebase::new(self.clock.now(), at, self.project.tempo);
+        }
+        Ok(())
     }
 
     /// Sends `effect`'s MIDI transport messages to the clock ports at `at`.
@@ -330,7 +345,6 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         self.cancel_scheduled(now + Duration::from_nanos(1))?;
         self.end_notes(now, position)?;
         self.settle();
-        self.timebase = Timebase::new(now, at, self.project.tempo);
         self.cursor = at;
         Ok(())
     }
@@ -1398,6 +1412,59 @@ mod tests {
     }
 
     #[test]
+    fn transport_cues_lead_aligned_notes_and_pulses_on_every_start() {
+        for scheduled in [false, true] {
+            for (playing, command) in [
+                (false, TransportCommand::Play),
+                (true, TransportCommand::Play),
+                (false, TransportCommand::Continue),
+                (true, TransportCommand::Locate(Ticks(240))),
+            ] {
+                let output = if scheduled {
+                    RecordingOutput::scheduled(ms(50))
+                } else {
+                    RecordingOutput::new()
+                };
+                let beat = track(1, 10, 240, &[(0, 36, 120)]);
+                let (mut handle, mut engine) = clocked(project(vec![beat]), output);
+                if command == TransportCommand::Continue {
+                    apply(
+                        &mut handle,
+                        &mut engine,
+                        TransportCommand::Locate(Ticks(240)),
+                    );
+                } else if playing {
+                    apply(&mut handle, &mut engine, TransportCommand::Play);
+                }
+                engine.output.take();
+                let cue_at = apply(&mut handle, &mut engine, command);
+                run_until(&mut engine, cue_at + ms(10));
+                let messages = engine.output.messages();
+                let cue = messages
+                    .iter()
+                    .find(|sent| matches!(sent.message, MidiMessage::Start | MidiMessage::Continue))
+                    .unwrap();
+                let pulse = messages
+                    .iter()
+                    .find(|sent| sent.message == MidiMessage::TimingClock && sent.at > cue.at)
+                    .unwrap();
+                let note = messages
+                    .iter()
+                    .find(|sent| {
+                        matches!(sent.message, MidiMessage::NoteOn { .. }) && sent.at > cue.at
+                    })
+                    .unwrap();
+                assert_eq!(
+                    pulse.at - cue.at,
+                    CLOCK_SETUP,
+                    "{command:?}, scheduled {scheduled}"
+                );
+                assert_eq!((note.tick, note.at), (pulse.tick, pulse.at));
+            }
+        }
+    }
+
+    #[test]
     fn clock_ports_get_start_a_pulse_every_40_ticks_and_stop() {
         let kick = track(1, 10, 960, &[(0, 36, 240)]);
         let mut bass = (*track(2, 1, 960, &[(0, 40, 240)])).clone();
@@ -1408,8 +1475,8 @@ mod tests {
         run_until(&mut engine, origin + ms(45));
         engine.clock.sleep_until(origin + ms(50));
         apply(&mut handle, &mut engine, TransportCommand::Stop);
-        // Stopped at tick 96, between 16ths. The receivers resume at the
-        // next one, tick 240, which comes 75 ms after Continue.
+        // Stopped at tick 94, between 16ths. The receivers resume at the
+        // next one, tick 240, after Continue and its setup interval.
         engine.clock.sleep_until(origin + ms(60));
         apply(&mut handle, &mut engine, TransportCommand::Continue);
         run_until(&mut engine, origin + ms(160));
@@ -1429,18 +1496,18 @@ mod tests {
             sent(&mut engine, origin),
             [
                 "0ns Start",
-                "0ns clock",
-                "0ns on 36",
-                "0ns on 40",
-                "20.833334ms clock",
-                "41.666667ms clock",
+                "1ms clock",
+                "1ms on 36",
+                "1ms on 40",
+                "21.833334ms clock",
+                "42.666667ms clock",
                 "50ms off 36",
                 "50ms off 40",
                 "50ms Stop",
                 "60ms SPP 1",
                 "60ms Continue",
-                "135ms clock",
-                "155.833334ms clock",
+                "137.041667ms clock",
+                "157.875ms clock",
             ]
         );
     }
@@ -1474,20 +1541,20 @@ mod tests {
             sent(&mut engine, origin),
             [
                 "0ns Start",
-                "0ns clock",
-                "0ns on 36",
-                "20.833334ms clock",
+                "1ms clock",
+                "1ms on 36",
+                "21.833334ms clock",
                 "30ms off 36",
                 "30ms Stop",
                 "30ms Start",
-                "30ms clock",
-                "30ms on 36",
-                "50.833334ms clock",
+                "31ms clock",
+                "31ms on 36",
+                "51.833334ms clock",
                 "60ms off 36",
                 "60ms Stop",
                 "60ms SPP 5",
                 "60ms Continue",
-                "164.166667ms clock",
+                "165.166667ms clock",
                 "170ms Stop",
                 "180ms SPP 10",
             ]

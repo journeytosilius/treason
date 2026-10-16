@@ -184,7 +184,10 @@ and stops, and the transport tools report that it isn't running.
   clip, so RPN sequences and repeated controllers arrive as written.
 - treason is the clock master for the ports configured with
   `clock = true`. While playing, they get a MIDI clock pulse every 40 ticks,
-  first among the messages on its tick. Play sends them Start. Continue and
+  first among the messages on its tick. Play sends them Start. The engine
+  flushes Start or Continue and waits at least 1 ms before anchoring playback,
+  keeping the first pulse and clip events aligned while receivers prepare.
+  Continue and
   Locate send a Song Position Pointer and Continue: the receivers resume at
   the pointer's 16th, the first at or after the position, on the next pulse.
   So pulses resume there too, and none come before it. Since receivers
