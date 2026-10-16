@@ -5,9 +5,10 @@ pattern, a bassline, a change of feel) and the agent builds it with the
 sequencer's tools. treason plays it as MIDI to external gear: drum machines,
 synths and other sequencers. It makes no sound itself.
 
-Status: scaffolded. Every crate and module is in place. Device profiles, the
-control layer, the MIDI port backend, the MCP server and the engine work.
-`treason serve` doesn't start the engine yet, so nothing plays. See
+Status: early. `treason serve` plays what an agent writes with step
+patterns, such as drum parts, on the MIDI ports in `treason.toml`. Still to
+come: MIDI clock, per-port latency and melodic parts written with pitch
+names. Until then, the `clock` and `latency_ms` settings have no effect. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
 stub.
 
@@ -34,6 +35,17 @@ each one. To connect Claude Code to a running `treason serve`:
 ```sh
 claude mcp add --transport http treason http://127.0.0.1:6434/mcp
 ```
+
+Each `[[ports]]` entry opens an output port. With `connect`, treason
+connects it to the first port whose name contains that text. Without it,
+the port is virtual and you connect it to your gear, with `aconnect` or a
+patchbay on Linux. To see what treason sends on its first port:
+
+```sh
+aseqdump -p treason:0
+```
+
+Ctrl-C or SIGTERM stops `treason serve`, and every sounding note ends first.
 
 ## Development
 

@@ -606,7 +606,8 @@ where
     C: Clock + Send + 'static,
 {
     /// Runs the engine on a new thread named `treason-engine`, at real-time
-    /// priority if the configuration asks for it and the OS allows it.
+    /// priority if the configuration asks for it and the OS allows it. If the
+    /// output fails, the engine logs why and stops.
     pub fn spawn(self) -> io::Result<EngineThread<O::Error>> {
         let thread = thread::Builder::new()
             .name("treason-engine".to_owned())
@@ -619,7 +620,12 @@ where
                         "no real-time priority for the engine thread; timing may suffer under load"
                     );
                 }
-                self.run()
+                let result = self.run();
+                if let Err(error) = &result {
+                    // Nothing is playing any more, so logging can't hold it up.
+                    tracing::error!(%error, "MIDI output failed; the engine has stopped");
+                }
+                result
             })?;
         Ok(EngineThread { thread })
     }
@@ -675,7 +681,9 @@ fn raise_priority() -> Result<(), thread_priority::Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
 
     use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, TrackId};
     use treason_core::playback::{Playback, PlaybackStatus};
@@ -1667,6 +1675,63 @@ mod tests {
                 assert_eq!(engine.rendered.capacity(), render_capacity);
                 assert!(engine.rendered.is_empty());
             }
+        }
+    }
+
+    /// Hands what the engine sends to the test, across threads.
+    struct ChannelOutput(mpsc::Sender<MidiMessage>);
+
+    impl MidiOutput for ChannelOutput {
+        type Error = Infallible;
+
+        fn delivery(&self) -> Delivery {
+            Delivery::Immediate
+        }
+
+        fn send(&mut self, message: &TimedMessage) -> Result<(), Infallible> {
+            // The test may have stopped listening.
+            let _ = self.0.send(message.message);
+            Ok(())
+        }
+
+        fn cancel_from(&mut self, _from: Instant) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_spawned_engine_ends_its_notes_and_returns_when_the_handle_is_dropped() {
+        // A note held the whole beat, every beat, so one is always sounding.
+        // The manual clock skips the waiting: the engine plays as fast as it
+        // can until it sees the handle go.
+        let held = track(1, 10, 960, &[(0, 60, 960)]);
+        let (mut handle, link) = link(project(vec![held]));
+        let (output, sent) = mpsc::channel();
+        let config = EngineConfig {
+            lookahead: ms(20),
+            ports: vec![PortSettings::default()],
+            realtime: false,
+        };
+        let engine = Engine::new(link, ChannelOutput(output), ManualClock::new(), config)
+            .spawn()
+            .unwrap();
+        handle.command(TransportCommand::Play).unwrap();
+        let first = sent.recv().unwrap();
+        drop(handle);
+        engine.join().unwrap();
+
+        // The engine thread has dropped the output, so this ends.
+        let messages: Vec<MidiMessage> = std::iter::once(first).chain(sent.iter()).collect();
+        // Every note-on is followed by its note-off, however far it got.
+        assert!(messages.len().is_multiple_of(2), "{messages:?}");
+        for pair in messages.chunks(2) {
+            assert!(
+                matches!(
+                    pair,
+                    [MidiMessage::NoteOn { .. }, MidiMessage::NoteOff { .. }]
+                ),
+                "{messages:?}"
+            );
         }
     }
 }
