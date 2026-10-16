@@ -75,8 +75,8 @@ seams between modules are fixed and compile-checked before the logic exists.
 | engine | `timebase` | `Timebase`: ticks to time and back | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
-| engine | `transport` | `Transport`: MIDI transport semantics | done |
-| engine | `render` | `render` (clip events in a window), `clock_pulses` | done |
+| engine | `transport` | `Transport`: MIDI transport semantics and the messages clock ports get | done |
+| engine | `render` | `render` (clip events and clock pulses in a window), `clock_pulses` | done |
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
@@ -152,6 +152,9 @@ and stops, and the transport tools report that it isn't running.
   from queued work so cancellation still ends every sounding note. It
   samples time again after cancellation and conservatively keeps note-ons
   that could have raced it; a cancelled note-off never proves a note ended.
+  Outputs report exactly which queued messages were withdrawn. The engine
+  retains each port's delivered clock position, including pulses delivered
+  during cancellation, so rebuilding future work never repeats those pulses.
   When submission crosses queued deadlines, it reconciles older deliveries
   before recording the newly submitted message as delivered.
   Its preallocated queue mirror holds a render batch plus a switch's note-offs;
@@ -182,9 +185,21 @@ and stops, and the transport tools report that it isn't running.
   with the program and controller values set on its tick. Within each
   group, events keep their order, by track and then as written in the
   clip, so RPN sequences and repeated controllers arrive as written.
-- treason is the clock master: a MIDI clock pulse every 40 ticks while
-  playing, plus Start, Stop, Continue and Song Position Pointer, on the ports
-  configured with `clock = true`. Following an external clock is planned.
+- treason is the clock master for the ports configured with
+  `clock = true`. While playing, they get a MIDI clock pulse every 40 ticks,
+  first among the messages on its tick. Play sends them Start. The engine
+  flushes Start or Continue and waits at least 1 ms before anchoring playback,
+  keeping the first pulse and clip events aligned while receivers prepare.
+  Continue and Locate send a Song Position Pointer and Continue: the receivers
+  resume at the pointer's 16th, the first at or after the position, on the
+  next pulse.
+  So pulses resume there too, and none come before it. Since receivers
+  ignore Song Position Pointer while playing, restarting or locating while
+  playing sends Stop first. Stop sends Stop after the note-offs, and so does
+  shutdown while playing. Locate while stopped sends only a Song Position
+  Pointer. Panic sends nothing, and the clock runs on. Song Position Pointer
+  counts 16ths in 14 bits, so it wraps after 1024 bars of 4/4. Following an
+  external clock is planned.
 
 ## Engine thread rules
 
@@ -318,9 +333,11 @@ gear plays it:
 The second milestone drives other gear:
 
 6. Clock master: MIDI clock, Start, Stop, Continue and Song Position
-   Pointer on the ports with `clock = true`, and per-port latency.
-7. Melodic parts: pitch names in `notation` and the `set_notes` tool.
-8. The ALSA sequencer queue backend, for kernel-timed delivery.
+   Pointer on the ports with `clock = true`. Done.
+7. Per-port latency: messages for slower devices go out earlier, so every
+   port sounds in time.
+8. Melodic parts: pitch names in `notation` and the `set_notes` tool.
+9. The ALSA sequencer queue backend, for kernel-timed delivery.
 
 Later: MIDI file export, following an external clock (which needs MIDI
 input), and probability, ratchets and conditions on events.

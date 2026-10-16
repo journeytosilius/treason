@@ -24,4 +24,4 @@ realtime = true
 name = "out"
 # connect = "TR-8S"  # connect to the first port whose name contains this
 # latency_ms = 2.5   # the device's delay; its messages go out this much earlier
-# clock = true       # send MIDI clock, Start, Stop and Continue
+# clock = true       # send MIDI clock, Start, Stop, Continue and Song Position Pointer

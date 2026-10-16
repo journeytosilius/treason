@@ -11,17 +11,21 @@ use thiserror::Error;
 use crate::model::Project;
 use crate::time::Ticks;
 
-/// Transport commands, with MIDI transport semantics.
+/// Transport commands, with MIDI transport semantics. The MIDI transport
+/// messages go to the ports that get MIDI clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportCommand {
-    /// Play from the beginning, even while playing. Sends MIDI Start.
+    /// Play from the beginning, even while playing. Sends MIDI Start,
+    /// after Stop while playing.
     Play,
-    /// Stop and keep the position. Sends MIDI Stop and ends sounding notes.
+    /// Stop and keep the position. Ends sounding notes, then sends MIDI
+    /// Stop.
     Stop,
-    /// Play from the current position. Sends MIDI Continue, or Start at the
-    /// beginning. Does nothing while playing.
+    /// Play from the current position. Sends Song Position Pointer and MIDI
+    /// Continue, or Start at the beginning. Does nothing while playing.
     Continue,
-    /// Move to a position. Sends Song Position Pointer.
+    /// Move to a position, and while playing, play on from there. Sends Song
+    /// Position Pointer, between Stop and Continue while playing.
     Locate(Ticks),
     /// Ends every sounding note on every port at once.
     Panic,

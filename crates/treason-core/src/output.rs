@@ -56,8 +56,17 @@ pub trait MidiOutput: Send {
 
     /// Cancels undelivered messages whose timestamp is at or after `from`,
     /// including messages already flushed to a scheduling queue. On return,
-    /// none of that work may be delivered. Immediate outputs do nothing.
-    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error>;
+    /// none of that work may be delivered. Calls `cancelled` once for every
+    /// message actually withdrawn, and never for a message already delivered,
+    /// including one delivered while cancellation was in progress. The engine
+    /// uses this distinction to avoid repeating clock pulses. The callback
+    /// runs synchronously and must not allocate or block. Immediate outputs
+    /// do nothing.
+    fn cancel_from(
+        &mut self,
+        from: Instant,
+        cancelled: &mut dyn FnMut(&TimedMessage),
+    ) -> Result<(), Self::Error>;
 
     /// Pushes out anything buffered. Called after each batch of messages.
     fn flush(&mut self) -> Result<(), Self::Error> {

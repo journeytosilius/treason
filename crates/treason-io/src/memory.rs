@@ -64,10 +64,59 @@ impl MidiOutput for RecordingOutput {
         Ok(())
     }
 
-    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
+    fn cancel_from(
+        &mut self,
+        from: Instant,
+        cancelled: &mut dyn FnMut(&TimedMessage),
+    ) -> Result<(), Self::Error> {
         if matches!(self.delivery, Delivery::Scheduled { .. }) {
-            self.messages.retain(|message| message.at < from);
+            self.messages.retain(|message| {
+                if message.at < from {
+                    true
+                } else {
+                    cancelled(message);
+                    false
+                }
+            });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use treason_core::{midi::MidiMessage, model::PortId, time::Ticks};
+
+    #[test]
+    fn cancellation_reports_only_messages_actually_withdrawn() {
+        for scheduled in [false, true] {
+            let mut output = if scheduled {
+                RecordingOutput::scheduled(Duration::from_millis(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let origin = Instant::now();
+            let messages = [0, 1, 2].map(|n| TimedMessage {
+                at: origin + Duration::from_millis(n),
+                tick: Ticks(n * 40),
+                port: PortId(0),
+                message: MidiMessage::TimingClock,
+            });
+            for message in &messages {
+                output.send(message).unwrap();
+            }
+            let mut withdrawn = Vec::new();
+            output
+                .cancel_from(messages[1].at, &mut |message| withdrawn.push(*message))
+                .unwrap();
+            if scheduled {
+                assert_eq!(withdrawn, messages[1..]);
+                assert_eq!(output.messages(), &messages[..1]);
+            } else {
+                assert!(withdrawn.is_empty());
+                assert_eq!(output.messages(), messages);
+            }
+        }
     }
 }
