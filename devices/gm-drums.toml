@@ -7,6 +7,7 @@ name = "General MIDI drums"
 manufacturer = "Generic"
 default_channel = 10
 
+# Names need a letter: tools read a bare number as a MIDI note.
 [voices]
 acoustic_kick = 35
 kick = 36

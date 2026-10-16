@@ -5,16 +5,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use treason_control::{Edit, Session};
+use treason_control::{ControlError, Edit, Session};
 use treason_core::midi::Channel;
 use treason_core::model::{Clip, OutputTarget, PortId, Track, TrackId};
 use treason_core::playback::{Playback, TransportCommand};
 use treason_core::time::{Bpm, Ticks, TimeSignature};
 
 use crate::dto::{
-    AddTrack, DeviceList, DeviceView, Play, PortList, ProjectView, SetMuted, SetNotes, SetSteps,
-    SetTempo, SetTimeSignature, StatusView, TrackRef, TrackView,
+    AddTrack, DeviceList, DeviceView, EditTrack, Play, PortList, ProjectView, SetMuted, SetNotes,
+    SetSteps, SetTempo, SetTimeSignature, StatusView, TrackRef, TrackView,
 };
+use crate::pattern;
 
 /// What placeholder tools answer.
 const NOT_IMPLEMENTED: &str = "not implemented yet in this build of treason";
@@ -50,15 +51,11 @@ impl TreasonServer {
     }
 
     fn apply(&self, edit: Edit) -> Result<(), String> {
-        self.session()
-            .apply(edit)
-            .map_err(|error| error.to_string())
+        self.session().apply(edit).map_err(describe)
     }
 
     fn command(&self, command: TransportCommand) -> Result<(), String> {
-        self.session()
-            .command(command)
-            .map_err(|error| error.to_string())
+        self.session().command(command).map_err(describe)
     }
 
     /// The port called `name`, or the first port.
@@ -78,12 +75,40 @@ impl TreasonServer {
     }
 }
 
+/// A rejected edit or command, worded so the agent can fix the call.
+fn describe(error: ControlError) -> String {
+    match error {
+        ControlError::UnknownTrack(id) => format!("there is no track {id}; see get_project"),
+        ControlError::UnknownDevice(id) => format!("there is no device `{id}`; see list_devices"),
+        other => other.to_string(),
+    }
+}
+
+/// A copy of the track with `id`, to edit.
+fn find_track(session: &Session<Box<dyn Playback + Send>>, id: u32) -> Result<Track, String> {
+    session
+        .project()
+        .track(TrackId(id))
+        .cloned()
+        .ok_or_else(|| describe(ControlError::UnknownTrack(TrackId(id))))
+}
+
+/// The channel numbered `number`, 1-16.
+fn parse_channel(number: u8) -> Result<Channel, String> {
+    Channel::from_number(number).ok_or_else(|| format!("MIDI channel must be 1-16, got {number}"))
+}
+
 #[tool_router]
 impl TreasonServer {
     /// Shows the project: tempo, time signature and every track.
     #[tool(annotations(read_only_hint = true))]
     fn get_project(&self) -> Json<ProjectView> {
-        Json(ProjectView::new(self.session().project(), &self.ports))
+        let session = self.session();
+        Json(ProjectView::new(
+            session.project(),
+            &self.ports,
+            session.devices(),
+        ))
     }
 
     /// Lists the device profiles. A track with a device names its notes by
@@ -165,8 +190,7 @@ impl TreasonServer {
             None => None,
         };
         let channel = match request.channel {
-            Some(number) => Channel::from_number(number)
-                .ok_or_else(|| format!("MIDI channel must be 1-16, got {number}"))?,
+            Some(number) => parse_channel(number)?,
             None => device_channel.unwrap_or_default(),
         };
         let bar = session.project().time_signature.bar_length();
@@ -178,10 +202,52 @@ impl TreasonServer {
             muted: false,
             clip: Clip::new(bar, Vec::new()).map_err(|error| error.to_string())?,
         };
-        let view = TrackView::new(&track, &self.ports);
+        let view = TrackView::new(&track, &self.ports, session.devices());
+        session.apply(Edit::AddTrack(track)).map_err(describe)?;
+        Ok(Json(view))
+    }
+
+    /// Renames a track or moves it to another port, channel or device, as
+    /// one edit. Its clip stays as it is. While playing, the change takes
+    /// effect at the next bar. Returns the track.
+    #[tool]
+    fn edit_track(
+        &self,
+        Parameters(request): Parameters<EditTrack>,
+    ) -> Result<Json<TrackView>, String> {
+        let EditTrack {
+            track,
+            name,
+            port,
+            channel,
+            device,
+        } = request;
+        if name.is_none() && port.is_none() && channel.is_none() && device.is_none() {
+            return Err("give at least one of name, port, channel or device to change".into());
+        }
+        let port = port
+            .as_deref()
+            .map(|port| self.port_id(Some(port)))
+            .transpose()?;
+        let channel = channel.map(parse_channel).transpose()?;
+        let mut session = self.session();
+        let mut edited = find_track(&session, track)?;
+        if let Some(name) = name {
+            edited.name = name;
+        }
+        if let Some(port) = port {
+            edited.target.port = port;
+        }
+        if let Some(channel) = channel {
+            edited.target.channel = channel;
+        }
+        if device.is_some() {
+            edited.device = device;
+        }
+        let view = TrackView::new(&edited, &self.ports, session.devices());
         session
-            .apply(Edit::AddTrack(track))
-            .map_err(|error| error.to_string())?;
+            .apply(Edit::ReplaceTrack(edited))
+            .map_err(describe)?;
         Ok(Json(view))
     }
 
@@ -212,10 +278,29 @@ impl TreasonServer {
 
     /// Replaces a track's clip with a step pattern: one step string per
     /// voice, the usual way to write drums. While playing, the new pattern
-    /// starts at the next bar.
+    /// starts at the next bar. Returns the track with its pattern as it will
+    /// play.
     #[tool]
-    fn set_steps(&self, Parameters(_): Parameters<SetSteps>) -> Result<String, String> {
-        Err(NOT_IMPLEMENTED.into())
+    fn set_steps(
+        &self,
+        Parameters(request): Parameters<SetSteps>,
+    ) -> Result<Json<TrackView>, String> {
+        let mut session = self.session();
+        let mut track = find_track(&session, request.track)?;
+        let device = track
+            .device
+            .as_deref()
+            .and_then(|id| session.devices().get(id));
+        track.clip = pattern::clip_from_steps(&request.steps, request.steps_per_beat, device)
+            .map_err(|error| error.to_string())?;
+        let view = TrackView::new(&track, &self.ports, session.devices());
+        session
+            .apply(Edit::SetClip {
+                track: track.id,
+                clip: track.clip,
+            })
+            .map_err(describe)?;
+        Ok(Json(view))
     }
 
     /// Replaces a track's clip with notes, for basslines, chords and melodies.
@@ -335,6 +420,7 @@ mod tests {
             names,
             [
                 "add_track",
+                "edit_track",
                 "get_project",
                 "list_devices",
                 "list_ports",
@@ -411,5 +497,183 @@ mod tests {
             .play(Parameters(Play { from_bar: Some(0) }))
             .unwrap_err();
         assert!(error.contains("from 1"), "{error}");
+    }
+
+    /// The error a tool call failed with.
+    fn rejected<T>(result: Result<T, String>) -> String {
+        match result {
+            Ok(_) => panic!("the call was accepted"),
+            Err(error) => error,
+        }
+    }
+
+    fn add(server: &TreasonServer, device: Option<&str>) -> u32 {
+        let request = AddTrack {
+            name: "drums".into(),
+            port: None,
+            device: device.map(str::to_owned),
+            channel: None,
+        };
+        server.add_track(Parameters(request)).unwrap().0.id
+    }
+
+    fn steps(track: u32, voices: &[(&str, &str)]) -> Parameters<SetSteps> {
+        Parameters(SetSteps {
+            track,
+            steps: voices
+                .iter()
+                .map(|(voice, steps)| ((*voice).to_owned(), (*steps).to_owned()))
+                .collect(),
+            steps_per_beat: None,
+        })
+    }
+
+    #[test]
+    fn step_patterns_replace_the_clip_and_read_back() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        let request = steps(
+            track,
+            &[
+                ("kick", "x...x...x...x..."),
+                ("sd", "....X.......X..."),
+                ("hh", "..x."),
+            ],
+        );
+        let Json(view) = server.set_steps(request).unwrap();
+        assert_eq!((view.loop_beats, view.events), (4.0, 10));
+        let pattern = view.pattern.clone().expect("a step pattern reads back");
+        assert_eq!(pattern.steps_per_beat, 4);
+        assert_eq!(pattern.steps["kick"], "x... x... x... x...");
+        assert_eq!(pattern.steps["snare"], ".... X... .... X...");
+        assert_eq!(pattern.steps["closed_hat"], "..x. ..x. ..x. ..x.");
+        assert_eq!(server.get_project().0.tracks, [view]);
+
+        server.undo();
+        let empty = &server.get_project().0.tracks[0];
+        assert_eq!((empty.events, empty.pattern.is_none()), (0, true));
+    }
+
+    #[test]
+    fn tracks_without_a_device_take_note_numbers() {
+        let server = server();
+        let track = add(&server, None);
+        let mut request = steps(track, &[("60", "x..x..x..x..")]);
+        request.0.steps_per_beat = Some(3);
+        let Json(view) = server.set_steps(request).unwrap();
+        assert_eq!(view.loop_beats, 4.0);
+        assert_eq!(view.pattern.unwrap().steps["60"], "x.. x.. x.. x..");
+
+        let error = rejected(server.set_steps(steps(track, &[("kick", "x...")])));
+        assert!(error.contains("edit_track"), "{error}");
+    }
+
+    #[test]
+    fn bad_step_patterns_say_how_to_fix_them() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        let cases = [
+            (steps(99, &[("kick", "x...")]), "see get_project"),
+            (steps(track, &[("kik", "x...")]), "has no voice `kik`"),
+            (steps(track, &[("kick", "x..o")]), "at step 4"),
+            (
+                steps(track, &[("kick", "x..."), ("bd", "x...")]),
+                "both note 36",
+            ),
+            (
+                steps(track, &[("kick", "x...x...x...x..."), ("snare", "x.....")]),
+                "doesn't divide the 16-step loop",
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.set_steps(request));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        let mut request = steps(track, &[("kick", "x...")]);
+        request.0.steps_per_beat = Some(7);
+        assert!(rejected(server.set_steps(request)).contains("steps_per_beat must be"));
+        assert_eq!(
+            server.get_project().0.tracks[0].events,
+            0,
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn tracks_move_and_rename_in_one_edit() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        let bar = steps(track, &[("kick", "x...x...x...x...")]);
+        server.set_steps(bar).unwrap();
+        let request = EditTrack {
+            track,
+            name: Some("909".into()),
+            port: Some("synth".into()),
+            channel: Some(11),
+            device: None,
+        };
+        let Json(view) = server.edit_track(Parameters(request)).unwrap();
+        assert_eq!(
+            (view.name.as_str(), view.port.as_str(), view.channel),
+            ("909", "synth", 11)
+        );
+        assert_eq!(view.events, 4, "the clip stays");
+        assert_eq!(server.get_project().0.tracks, [view]);
+
+        server.undo();
+        let view = &server.get_project().0.tracks[0];
+        assert_eq!(
+            (view.name.as_str(), view.port.as_str(), view.channel),
+            ("drums", "out", 10)
+        );
+    }
+
+    #[test]
+    fn bad_track_edits_say_how_to_fix_them() {
+        let server = server();
+        let track = add(&server, None);
+        let unchanged = |track| EditTrack {
+            track,
+            name: None,
+            port: None,
+            channel: None,
+            device: None,
+        };
+        let cases = [
+            (unchanged(track), "give at least one"),
+            (
+                EditTrack {
+                    name: Some("ghost".into()),
+                    ..unchanged(99)
+                },
+                "see get_project",
+            ),
+            (
+                EditTrack {
+                    port: Some("nowhere".into()),
+                    ..unchanged(track)
+                },
+                "see list_ports",
+            ),
+            (
+                EditTrack {
+                    channel: Some(17),
+                    ..unchanged(track)
+                },
+                "1-16",
+            ),
+            (
+                EditTrack {
+                    device: Some("nope".into()),
+                    ..unchanged(track)
+                },
+                "see list_devices",
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.edit_track(Parameters(request)));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        assert_eq!(server.get_project().0.tracks[0].name, "drums");
     }
 }

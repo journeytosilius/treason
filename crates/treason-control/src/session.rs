@@ -148,6 +148,15 @@ fn edited(
                 .ok_or(ControlError::UnknownTrack(id))?;
             next.tracks.remove(index);
         }
+        Edit::ReplaceTrack(track) => {
+            let slot = next
+                .tracks
+                .iter_mut()
+                .find(|old| old.id == track.id)
+                .ok_or(ControlError::UnknownTrack(track.id))?;
+            check_device(&track, devices)?;
+            *slot = Arc::new(track);
+        }
         Edit::SetClip { track, clip } => track_mut(&mut next, track)?.clip = clip,
         Edit::SetMuted { track, muted } => track_mut(&mut next, track)?.muted = muted,
     }
@@ -260,6 +269,27 @@ mod tests {
         assert!(Arc::ptr_eq(session.project(), &before));
         assert!(!session.undo());
         assert_eq!(session.playback().published.len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_track_keeps_its_place() {
+        let mut session = session(vec![track(1), track(2)]);
+        let mut moved = track(1);
+        moved.name = "drums".into();
+        moved.target.port = PortId(1);
+        session.apply(Edit::ReplaceTrack(moved.clone())).unwrap();
+        assert_eq!(*session.project().tracks[0], moved);
+        assert_eq!(session.project().tracks[1].id, TrackId(2));
+
+        let result = session.apply(Edit::ReplaceTrack(track(9)));
+        assert_eq!(result, Err(ControlError::UnknownTrack(TrackId(9))));
+        let mut unknown_device = track(2);
+        unknown_device.device = Some("nope".into());
+        let result = session.apply(Edit::ReplaceTrack(unknown_device));
+        assert_eq!(result, Err(ControlError::UnknownDevice("nope".into())));
+
+        assert!(session.undo());
+        assert_eq!(session.project().tracks[0].name, "track 1");
     }
 
     #[test]

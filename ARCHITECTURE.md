@@ -83,9 +83,10 @@ seams between modules are fixed and compile-checked before the logic exists.
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
 | io | `smf` (feature `smf`) | `write`: Standard MIDI Files | stub |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
-| mcp | `server` | `TreasonServer`: the tools | `set_steps`, `set_notes` are placeholders |
+| mcp | `server` | `TreasonServer`: the tools | `set_notes` is a placeholder |
 | mcp | `dto` | tool inputs and outputs | done |
-| mcp | `notation` | step strings and pitch names | stub |
+| mcp | `notation` | step strings and pitch names | pitch names are a stub |
+| mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
 | treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml` | `serve` doesn't start the engine yet |
 
@@ -139,8 +140,8 @@ sounding note and returns.
   messages early, and the kernel sends them on time.
 - Each port has a latency offset. Messages for a slower device are due
   earlier.
-- Tempo changes and transport commands apply at once. Clip changes wait for
-  the next bar.
+- Tempo changes and transport commands apply at once. Changes to a track's
+  clip, port or channel wait for the next bar.
 - At the same tick, note-offs go out before note-ons, so a retriggered note
   isn't cut short.
 - treason is the clock master: a MIDI clock pulse every 40 ticks while
@@ -177,7 +178,8 @@ sounding note and returns.
 
 TOML files in `devices/`. Each gives a device's default channel, its voices
 (a note per sound), aliases (`bd = "kick"`) and parameters (CC numbers; NRPN
-is planned). `devices/gm-drums.toml` covers the General MIDI drum map.
+is planned). Names need a letter, because tools read a bare number as a MIDI
+note. `devices/gm-drums.toml` covers the General MIDI drum map.
 Profiles for real gear can be generated from the MIDI Guide dataset
 (github.com/pencilresearch/midi, CC-BY-SA-4.0).
 
@@ -192,8 +194,8 @@ breaking the other.
 | Tools | |
 |---|---|
 | `get_project`, `status`, `list_devices`, `list_ports` | read only |
-| `add_track`, `remove_track`, `set_muted` | tracks |
-| `set_steps`, `set_notes` | clips (placeholders until `notation` is written) |
+| `add_track`, `edit_track`, `remove_track`, `set_muted` | tracks |
+| `set_steps`, `set_notes` | clips (`set_notes` is a placeholder until pitch names are written) |
 | `set_tempo`, `set_time_signature` | project |
 | `play`, `stop`, `panic` | transport |
 | `undo`, `redo` | history |
@@ -202,6 +204,10 @@ Tool descriptions and parameter schemas come from the Rust doc comments
 (through schemars), so the code documents the agent's interface. A rejected
 call comes back as a tool error whose message says how to fix it, such as
 "there is no port `x`; see list_ports", so the agent can correct itself.
+
+`get_project` shows a clip that fits a step grid as step strings, in the
+form `set_steps` takes, so the agent reads back patterns the way it wrote
+them.
 
 ## Configuration
 
@@ -262,7 +268,7 @@ gear plays it:
 2. Step patterns: step strings in `notation` and the `set_steps` tool,
    with `get_project` showing patterns as step strings. Also an
    `edit_track` tool, to rename a track or move it to another port,
-   channel or device without losing its clip.
+   channel or device without losing its clip. Done.
 3. Engine core: `Transport::apply` and `render`.
 4. Engine loop: `Engine::run`, tested with `ManualClock` and
    `RecordingOutput`.
