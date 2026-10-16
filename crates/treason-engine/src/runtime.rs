@@ -497,13 +497,18 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn emit(&mut self, message: TimedMessage) -> Result<(), O::Error> {
         self.output.send(&message)?;
         self.sounding[usize::from(message.port.0)].observe(message.message);
-        if matches!(self.output.delivery(), Delivery::Scheduled { .. })
-            && message.at > self.clock.now()
-        {
-            self.scheduled.push(message);
-        } else {
-            self.delivered[usize::from(message.port.0)].observe(message.message);
+        if matches!(self.output.delivery(), Delivery::Scheduled { .. }) {
+            let now = self.clock.now();
+            if message.at > now {
+                self.scheduled.push(message);
+                return Ok(());
+            }
+            // Submission can cross queued deadlines. Observe those older
+            // deliveries before this message, especially an off followed
+            // by a retrigger of the same note.
+            self.advance_delivery(now);
         }
+        self.delivered[usize::from(message.port.0)].observe(message.message);
         Ok(())
     }
 
@@ -1199,6 +1204,7 @@ mod tests {
         delivered: Vec<TimedMessage>,
         notes: ActiveNotes,
         cancel_advance: Option<(SharedClock, Instant, bool)>,
+        send_advance: Option<(SharedClock, Instant)>,
     }
 
     impl ScheduledOutput {
@@ -1208,6 +1214,7 @@ mod tests {
                 delivered: Vec::new(),
                 notes: ActiveNotes::new(),
                 cancel_advance: None,
+                send_advance: None,
             }
         }
 
@@ -1231,7 +1238,12 @@ mod tests {
         }
 
         fn send(&mut self, message: &TimedMessage) -> Result<(), Self::Error> {
-            self.queue.send(message)
+            self.queue.send(message)?;
+            if let Some((mut clock, until)) = self.send_advance.take() {
+                clock.sleep_until(until);
+                self.deliver_until(clock.now());
+            }
+            Ok(())
         }
 
         fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
@@ -1246,7 +1258,7 @@ mod tests {
         }
     }
 
-    /// Shared with the backend so time can pass inside cancellation.
+    /// Shared with the backend so time can pass inside output calls.
     #[derive(Clone)]
     struct SharedClock {
         origin: Instant,
@@ -1262,6 +1274,79 @@ mod tests {
             let nanos = deadline.saturating_duration_since(self.origin).as_nanos();
             self.nanos
                 .fetch_max(u64::try_from(nanos).unwrap(), Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn cleanup_ends_a_retrigger_delivered_while_submitting_it() {
+        for stop in [true, false] {
+            let initial = project(vec![track(1, 10, 1920, &[(0, 60, 216), (240, 60, 216)])]);
+            let (mut handle, link) = link(initial);
+            let origin = Instant::now();
+            let clock = SharedClock {
+                origin,
+                nanos: Arc::new(AtomicU64::new(0)),
+            };
+            let mut engine = Engine::new(
+                link,
+                ScheduledOutput::new(),
+                clock,
+                EngineConfig {
+                    ports: vec![PortSettings::default()],
+                    realtime: false,
+                    ..EngineConfig::default()
+                },
+            );
+            handle.command(TransportCommand::Play).unwrap();
+            while engine.clock.now() < origin + ms(105) {
+                assert!(engine.cycle().unwrap());
+            }
+            assert_eq!(engine.clock.now(), origin + ms(105));
+            assert_eq!(engine.scheduled.len(), 1);
+            assert_eq!(
+                engine.scheduled[0].at,
+                origin + Duration::from_micros(112_500)
+            );
+            // The next cycle submits the retrigger at 125 ms. Time passes
+            // inside send, delivering the older off and then the new on
+            // before the engine gets its post-submission clock sample.
+            engine.output.send_advance = Some((engine.clock.clone(), origin + ms(126)));
+            assert!(engine.cycle().unwrap());
+            assert_eq!(engine.clock.now(), origin + ms(126));
+            let delivered: Vec<_> = engine
+                .output
+                .delivered
+                .iter()
+                .map(|message| (message.at - origin, message.tick))
+                .collect();
+            assert_eq!(
+                delivered,
+                [
+                    (Duration::ZERO, Ticks::ZERO),
+                    (Duration::from_micros(112_500), Ticks(216)),
+                    (ms(125), Ticks(240)),
+                ]
+            );
+            assert!(
+                engine
+                    .output
+                    .notes
+                    .is_sounding(Channel::DRUMS, U7::saturating(60))
+            );
+            if stop {
+                handle.command(TransportCommand::Stop).unwrap();
+                assert!(engine.cycle().unwrap());
+            } else {
+                drop(handle);
+                assert!(!engine.cycle().unwrap());
+            }
+            // Neither cleanup path can rely on the natural off at 237.5 ms:
+            // it has not been submitted and playback has now ended.
+            engine.output.deliver_until(origin + ms(1000));
+            assert!(engine.output.notes.is_empty(), "Stop: {stop}");
+            let last = engine.output.delivered.last().unwrap();
+            assert_eq!(last.at, origin + ms(126));
+            assert!(matches!(last.message, MidiMessage::NoteOff { note, .. } if note.get() == 60));
         }
     }
 

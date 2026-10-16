@@ -145,6 +145,8 @@ sounding note and returns.
   from queued work so cancellation still ends every sounding note. It
   samples time again after cancellation and conservatively keeps note-ons
   that could have raced it; a cancelled note-off never proves a note ended.
+  When submission crosses queued deadlines, it reconciles older deliveries
+  before recording the newly submitted message as delivered.
   Its preallocated queue mirror holds a render batch plus a switch's note-offs;
   excess events stay in the render buffer until queue space becomes free.
 - Each port has a latency offset. Messages for a slower device are due
