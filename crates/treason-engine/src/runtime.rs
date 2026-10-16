@@ -1612,7 +1612,8 @@ mod tests {
             drop(handle);
             assert!(!engine.cycle().unwrap());
             let expected: &[&str] = if playing {
-                &["10ms off 60", "10ms Stop"]
+                // The 1 ms setup lead shifts the 5 ms polling deadlines.
+                &["11ms off 60", "11ms Stop"]
             } else {
                 &[]
             };
