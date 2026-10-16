@@ -21,6 +21,10 @@ treason-engine.workspace = true
 treason-io.workspace = true
 treason-mcp.workspace = true
 
+# The ALSA sequencer queue backend, which `engine.backend = "alsa-seq"` picks.
+[target.'cfg(target_os = "linux")'.dependencies]
+treason-io = { workspace = true, features = ["alsa-seq"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "test-util"] }
 

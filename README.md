@@ -9,7 +9,10 @@ Status: early. `treason serve` plays what an agent writes on the MIDI ports
 in `treason.toml`: drum parts as step patterns, and melodic parts as notes
 with pitch names such as `C4`. Ports with `clock = true` get MIDI clock and
 Start, Stop and Continue, so their gear plays along. A port's `latency_ms`
-makes up for its gear's delay, so everything sounds together. See
+makes up for its gear's delay, so everything sounds together. On Linux,
+`backend = "alsa-seq"` hands messages to the kernel's sequencer ahead of
+time, which keeps the timing within a millisecond even when the computer is
+busy. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
 stub.
 

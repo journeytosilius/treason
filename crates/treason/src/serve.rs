@@ -7,13 +7,17 @@ use std::time::Duration;
 use anyhow::Context;
 use treason_control::Session;
 use treason_core::model::Project;
+use treason_core::output::MidiOutput;
 use treason_core::playback::Playback;
+use treason_devices::DeviceRegistry;
 use treason_engine::{Engine, SystemClock};
+#[cfg(target_os = "linux")]
+use treason_io::AlsaSeqOutput;
 use treason_io::MidirOutput;
 use treason_mcp::TreasonServer;
 
 use crate::CLIENT_NAME;
-use crate::config::Config;
+use crate::config::{Backend, Config};
 
 /// How long shutting down waits for work that can't be cancelled, such as a
 /// pending read from stdin, before leaving it behind.
@@ -35,9 +39,32 @@ pub struct ServeArgs {
 /// engine, which ends every sounding note, and waits for it.
 pub fn run(config: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     let devices = config.load_devices()?;
+    let ports = config.port_specs();
+    match config.engine.backend {
+        Backend::Midir => {
+            let output = MidirOutput::open(CLIENT_NAME, &ports).context("opening MIDI ports")?;
+            serve(config, args, devices, output)
+        }
+        #[cfg(target_os = "linux")]
+        Backend::AlsaSeq => {
+            let lookahead = config.engine_config().lookahead;
+            let output = AlsaSeqOutput::open(CLIENT_NAME, &ports, lookahead)
+                .context("opening MIDI ports on the ALSA sequencer")?;
+            serve(config, args, devices, output)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Backend::AlsaSeq => anyhow::bail!("engine.backend = \"alsa-seq\" needs Linux"),
+    }
+}
+
+/// Plays through `output` and serves MCP until shutdown.
+fn serve<O: MidiOutput + 'static>(
+    config: &Config,
+    args: &ServeArgs,
+    devices: DeviceRegistry,
+    output: O,
+) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let output =
-        MidirOutput::open(CLIENT_NAME, &config.port_specs()).context("opening MIDI ports")?;
     let project = Arc::new(Project::default());
     let (playback, link) = treason_engine::link(Arc::clone(&project));
     let engine = Engine::new(link, output, SystemClock, config.engine_config())
