@@ -701,10 +701,14 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     fn rewind_from(&mut self, from: Instant) -> Result<(), O::Error> {
         self.cancel_scheduled(from)?;
         for stream in &mut self.streams {
-            let kept = self
-                .timebase
-                .tick_at(from + stream.latency - Duration::from_nanos(1));
-            let first = Ticks(kept.0 + 1).max(self.started);
+            let before = from + stream.latency - Duration::from_nanos(1);
+            let first = if before < self.timebase.time_of(self.started) {
+                // tick_at saturates at zero before playback starts. No tick
+                // has been sent yet, so the start tick must be rebuilt too.
+                self.started
+            } else {
+                Ticks(self.timebase.tick_at(before).0 + 1).max(self.started)
+            };
             stream.rewind(first);
             if self
                 .waiting
@@ -2248,6 +2252,76 @@ mod tests {
                 vec!["30ms on 36", "155ms off 36"],
             ]
         );
+    }
+
+    #[test]
+    fn a_panic_before_tick_zero_is_sent_preserves_initial_notes_and_pulses() {
+        for clock in [false, true] {
+            let notes = |id| track(id, 10, 960, &[(0, 36, 240)]);
+            let (mut handle, mut engine) = engine_with_ports(
+                project(vec![notes(1), on_port_1(notes(2))]),
+                RecordingOutput::scheduled(ms(50)),
+                [
+                    PortSettings {
+                        latency: ms(30),
+                        clock,
+                    },
+                    PortSettings {
+                        clock,
+                        ..PortSettings::default()
+                    },
+                ],
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(15));
+            assert!(engine.output.messages().iter().any(|message| {
+                message.port == PortId(1)
+                    && message.tick == Ticks::ZERO
+                    && matches!(message.message, MidiMessage::NoteOn { .. })
+                    && message.at > engine.clock.now()
+            }));
+            let panic_at = apply(&mut handle, &mut engine, TransportCommand::Panic) - origin;
+            run_until(&mut engine, origin + ms(200));
+            let sent = engine.output.messages();
+            for port in [PortId(0), PortId(1)] {
+                let on_port: Vec<_> = sent
+                    .iter()
+                    .filter(|message| message.port == port)
+                    .copied()
+                    .collect();
+                let notes: Vec<_> = on_port
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message.message,
+                            MidiMessage::NoteOn { .. } | MidiMessage::NoteOff { .. }
+                        )
+                    })
+                    .map(|message| (message.at - origin, message.tick, what(message)))
+                    .collect();
+                let setup = u64::from(clock);
+                let expected = if port == PortId(0) {
+                    vec![
+                        (ms(setup), Ticks::ZERO, "on 36".to_owned()),
+                        (panic_at, Ticks::ZERO, "off 36".to_owned()),
+                    ]
+                } else {
+                    vec![
+                        (ms(30 + setup), Ticks::ZERO, "on 36".to_owned()),
+                        (ms(155 + setup), Ticks(240), "off 36".to_owned()),
+                    ]
+                };
+                assert_eq!(notes, expected, "{port:?}, clock {clock}");
+                let ticks: Vec<_> = pulses(&on_port).iter().map(|pulse| pulse.0).collect();
+                if clock {
+                    assert!(!ticks.is_empty());
+                    let every_40: Vec<_> = (0..ticks.len() as u64).map(|n| n * 40).collect();
+                    assert_eq!(ticks, every_40, "{port:?}");
+                } else {
+                    assert!(ticks.is_empty());
+                }
+            }
+        }
     }
 
     #[test]

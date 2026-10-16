@@ -172,7 +172,8 @@ and stops, and the transport tools report that it isn't running.
   An edit that arrives while a port already plays that bar waits until every
   port does, and a tempo change waits until the previous one is heard. Panic
   ends the notes on every port at once, and each port carries on right
-  after the last tick it sent.
+  after the last tick it sent. Cancellation before a port's first send time
+  resumes from its start tick, including its first clock pulse.
 - Tempo changes and transport commands apply at once. Other edits, such
   as a new clip, a mute or a move to another port, wait for the next bar
   line. There the notes still sounding from tracks that changed end; a
