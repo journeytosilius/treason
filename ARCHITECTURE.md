@@ -80,7 +80,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, per-port latency, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
-| io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
+| io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: a kernel-scheduled queue that knows exactly what it sent | done |
 | io | `smf` (feature `smf`) | `write`: Standard MIDI Files | stub |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
 | mcp | `server` | `TreasonServer`: the tools | done |
@@ -89,7 +89,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `notes` | lists of notes in beats to clips | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
-| treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml` | done |
+| treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml`; picks the backend | done |
 
 ## Runtime
 
@@ -149,7 +149,13 @@ and stops, and the transport tools report that it isn't running.
 - `Delivery::Immediate` backends (midir) send when called, so the engine
   sleeps until each message is due, spinning for the last stretch.
   `Delivery::Scheduled` backends (an ALSA sequencer queue) take timestamped
-  messages early, and the kernel sends them on time. `MidiOutput::cancel_from`
+  messages early, and the kernel sends them on time: on the sequencer
+  timer's first tick at or after each message's time, so within a
+  millisecond. That is coarser than midir's on an idle machine, but it
+  holds when the engine thread can't run on time. The queue also sends each
+  message to a private port of the same client, so the backend sees exactly
+  which ones went out.
+  `MidiOutput::cancel_from`
   retracts undelivered work, including flushed events, on stop, restart,
   locate, panic and shutdown. The engine keeps delivered note state separate
   from queued work so cancellation still ends every sounding note. It
@@ -293,7 +299,10 @@ number instead, so writing the notes back preserves their pitches.
 
 `treason.toml`, read from the working directory or given with `--config`.
 Every setting has a default: the device directory, the MCP address, the
-engine's lookahead and real-time priority, and the output ports. Each port
+engine's lookahead and real-time priority, the backend, and the output
+ports. The backend is midir unless `engine.backend` names the ALSA
+sequencer queue (`alsa-seq`, Linux only), and the binary turns on
+`treason-io`'s `alsa-seq` feature on Linux. Each port
 has a name that tracks refer to and either connects to an existing port by
 name or is created as a virtual port. It can also set a latency offset and
 whether the port gets MIDI clock. The example in the repository root
@@ -362,7 +371,7 @@ The second milestone drives other gear:
    port sounds in time. Done.
 8. Melodic parts: pitch names in `notation` and the `set_notes` tool.
    Done.
-9. The ALSA sequencer queue backend, for kernel-timed delivery.
+9. The ALSA sequencer queue backend, for kernel-timed delivery. Done.
 
 Later: MIDI file export, following an external clock (which needs MIDI
 input), and probability, ratchets and conditions on events.

@@ -8,8 +8,8 @@
 //!   immediate delivery, including virtual ports on Linux and macOS. On Linux
 //!   it needs the ALSA development package (`libasound2-dev`).
 //! - `alsa-seq`: `AlsaSeqOutput`, an ALSA sequencer queue on Linux. Scheduled
-//!   delivery: the kernel sends each message at its time. Not implemented
-//!   yet.
+//!   delivery: the engine hands messages over up to the lookahead early, and
+//!   the kernel sends each at its time, within a millisecond.
 //! - `smf`: `smf::write`, Standard MIDI Files through `midly`. Not
 //!   implemented yet.
 //!

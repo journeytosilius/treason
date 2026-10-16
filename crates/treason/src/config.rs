@@ -44,6 +44,19 @@ pub struct EngineOptions {
     pub lookahead_ms: u64,
     /// Whether to ask for real-time scheduling.
     pub realtime: bool,
+    /// What sends the MIDI.
+    pub backend: Backend,
+}
+
+/// What sends the engine's MIDI, as `engine.backend` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Backend {
+    /// midir, which sends each message when it is due.
+    Midir,
+    /// An ALSA sequencer queue (Linux only), which takes messages up to the
+    /// lookahead early and sends each at its time.
+    AlsaSeq,
 }
 
 /// `[[ports]]`
@@ -178,6 +191,7 @@ impl Default for EngineOptions {
         Self {
             lookahead_ms: 20,
             realtime: true,
+            backend: Backend::Midir,
         }
     }
 }
@@ -193,6 +207,24 @@ mod tests {
         assert!(config.load_devices().unwrap().get("gm-drums").is_some());
         assert_eq!(config.port_names(), ["out"]);
         assert_eq!(config.engine_config().lookahead, Duration::from_millis(20));
+        assert_eq!(config.engine.backend, Backend::Midir);
+    }
+
+    #[test]
+    fn the_backend_is_midir_unless_the_alsa_queue_is_named() {
+        let backend =
+            |toml: &str| toml::from_str::<Config>(toml).map(|config| config.engine.backend);
+        assert_eq!(backend("").unwrap(), Backend::Midir);
+        assert_eq!(
+            backend("[engine]\nlookahead_ms = 30").unwrap(),
+            Backend::Midir
+        );
+        assert_eq!(
+            backend("[engine]\nbackend = \"alsa-seq\"").unwrap(),
+            Backend::AlsaSeq
+        );
+        let error = backend("[engine]\nbackend = \"jack\"").unwrap_err();
+        assert!(error.to_string().contains("alsa-seq"), "{error}");
     }
 
     #[test]

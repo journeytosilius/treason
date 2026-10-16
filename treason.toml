@@ -16,6 +16,13 @@ lookahead_ms = 20
 # Ask for real-time scheduling. On Linux this needs an rtprio limit, such as
 # membership of the `audio` group.
 realtime = true
+# What sends the MIDI. "midir" sends each message when it is due: the most
+# precise on an idle computer, but late whenever the engine thread can't run
+# on time. "alsa-seq" (Linux) hands messages to an ALSA sequencer queue up to
+# the lookahead early, and the kernel sends each on the sequencer timer's
+# next tick: within a millisecond, even while other programs keep the
+# processors busy.
+backend = "midir"
 
 # Output ports, in order. Tracks and agents refer to them by name; the first is
 # the default. A port without `connect` is virtual: other software connects
