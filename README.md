@@ -13,7 +13,8 @@ for the design and for what's still a stub.
 ## Requirements
 
 - Rust 1.95, pinned in `rust-toolchain.toml`. With
-  [rustup](https://rustup.rs) installed, `cargo` picks it up automatically.
+  [rustup](https://rustup.rs) installed and its `~/.cargo/bin` first on
+  your `PATH`, `cargo` picks it up automatically.
 - Linux for now, with the ALSA development package for MIDI output:
   `sudo apt install libasound2-dev`.
 
@@ -41,3 +42,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --check
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 ```
+
+CI runs the same checks on every pull request.
+[AGENTS.md](AGENTS.md) has the rules for contributing, for people and
+agents alike.
