@@ -1,0 +1,19 @@
+[package]
+name = "treason-engine"
+description = "Real-time playback engine for treason: turns project snapshots into timed MIDI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+rtrb.workspace = true
+spin_sleep.workspace = true
+thiserror.workspace = true
+thread-priority.workspace = true
+tracing.workspace = true
+treason-core.workspace = true
+
+[lints]
+workspace = true

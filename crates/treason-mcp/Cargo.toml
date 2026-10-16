@@ -1,0 +1,24 @@
+[package]
+name = "treason-mcp"
+description = "MCP server for treason: the tools an AI agent uses to drive the sequencer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+treason-control.workspace = true
+treason-core.workspace = true
+treason-devices.workspace = true
+
+[lints]
+workspace = true

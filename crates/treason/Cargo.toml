@@ -1,0 +1,25 @@
+[package]
+name = "treason"
+description = "A MIDI sequencer driven by an AI agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+treason-control.workspace = true
+treason-core.workspace = true
+treason-devices.workspace = true
+treason-engine.workspace = true
+treason-io.workspace = true
+treason-mcp.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "treason-io"
+description = "MIDI backends for treason: implementations of MidiOutput for ports and files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["midir"]
+# Portable real-time output. On Linux it needs the ALSA development package.
+midir = ["dep:midir"]
+# Kernel-scheduled output through an ALSA sequencer queue (Linux only).
+alsa-seq = ["dep:alsa"]
+# Standard MIDI File export.
+smf = ["dep:midly"]
+
+[dependencies]
+alsa = { workspace = true, optional = true }
+midir = { workspace = true, optional = true }
+midly = { workspace = true, optional = true }
+thiserror.workspace = true
+treason-core.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,80 @@
+# The General MIDI Level 1 percussion map, on channel 10.
+# Many drum machines can switch to this map. Copy this file as a starting
+# point for a profile of your own gear.
+
+id = "gm-drums"
+name = "General MIDI drums"
+manufacturer = "Generic"
+default_channel = 10
+
+[voices]
+acoustic_kick = 35
+kick = 36
+side_stick = 37
+snare = 38
+clap = 39
+electric_snare = 40
+low_floor_tom = 41
+closed_hat = 42
+high_floor_tom = 43
+pedal_hat = 44
+low_tom = 45
+open_hat = 46
+low_mid_tom = 47
+high_mid_tom = 48
+crash = 49
+high_tom = 50
+ride = 51
+china = 52
+ride_bell = 53
+tambourine = 54
+splash = 55
+cowbell = 56
+crash_2 = 57
+vibraslap = 58
+ride_2 = 59
+high_bongo = 60
+low_bongo = 61
+mute_high_conga = 62
+open_high_conga = 63
+low_conga = 64
+high_timbale = 65
+low_timbale = 66
+high_agogo = 67
+low_agogo = 68
+cabasa = 69
+maracas = 70
+short_whistle = 71
+long_whistle = 72
+short_guiro = 73
+long_guiro = 74
+claves = 75
+high_wood_block = 76
+low_wood_block = 77
+mute_cuica = 78
+open_cuica = 79
+mute_triangle = 80
+open_triangle = 81
+
+# Drum-machine shorthand, as on a TR-808 and in TidalCycles.
+[aliases]
+bd = "kick"
+sd = "snare"
+rs = "side_stick"
+rimshot = "side_stick"
+cp = "clap"
+hh = "closed_hat"
+ch = "closed_hat"
+oh = "open_hat"
+lt = "low_tom"
+mt = "low_mid_tom"
+ht = "high_tom"
+cy = "crash"
+rd = "ride"
+cb = "cowbell"
+
+[params]
+volume = { cc = 7 }
+pan = { cc = 10 }
+reverb = { cc = 91 }
+chorus = { cc = 93 }

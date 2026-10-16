@@ -1,0 +1,27 @@
+# treason configuration. Every setting is optional. Relative paths are
+# relative to this file. `treason serve` reads ./treason.toml, or the file
+# given with --config.
+
+# The device profile directory (*.toml).
+devices = "devices"
+
+[mcp]
+# Where to serve MCP over HTTP. Keep it on loopback: only local agents should
+# reach the sequencer.
+http = "127.0.0.1:6434"
+
+[engine]
+# How far ahead the engine renders, in milliseconds.
+lookahead_ms = 20
+# Ask for real-time scheduling. On Linux this needs an rtprio limit, such as
+# membership of the `audio` group.
+realtime = true
+
+# Output ports, in order. Tracks and agents refer to them by name; the first is
+# the default. A port without `connect` is virtual: other software connects
+# to it (`aconnect` or a patchbay on Linux).
+[[ports]]
+name = "out"
+# connect = "TR-8S"  # connect to the first port whose name contains this
+# latency_ms = 2.5   # the device's delay; its messages go out this much earlier
+# clock = true       # send MIDI clock, Start, Stop and Continue

@@ -1,0 +1,43 @@
+# treason
+
+A MIDI sequencer driven by an AI agent. You describe what you want (a drum
+pattern, a bassline, a change of feel) and the agent builds it with the
+sequencer's tools. treason plays it as MIDI to external gear: drum machines,
+synths and other sequencers. It makes no sound itself.
+
+Status: scaffolded. Every crate and module is in place. Device profiles, the
+control layer, the MIDI port backend and the MCP server work. The engine
+loop is next, so nothing plays yet. See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the design and for what's still a stub.
+
+## Requirements
+
+- Rust 1.95, pinned in `rust-toolchain.toml`. With
+  [rustup](https://rustup.rs) installed, `cargo` picks it up automatically.
+- Linux for now, with the ALSA development package for MIDI output:
+  `sudo apt install libasound2-dev`.
+
+## Usage
+
+```sh
+cargo run -- devices        # the device profiles in ./devices
+cargo run -- ports          # the MIDI output ports on this machine
+cargo run -- serve          # MCP over HTTP at http://127.0.0.1:6434/mcp
+cargo run -- serve --stdio  # MCP over stdin and stdout, for one agent
+```
+
+Settings live in `treason.toml`; the example in this directory explains
+each one. To connect Claude Code to a running `treason serve`:
+
+```sh
+claude mcp add --transport http treason http://127.0.0.1:6434/mcp
+```
+
+## Development
+
+```sh
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --check
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
+```
