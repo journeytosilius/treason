@@ -9,11 +9,12 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use treason_core::model::{PortId, Project, Track};
+use treason_core::model::{Clip, EventKind, PortId, Project, Track};
 use treason_core::playback::{PlaybackStatus, TransportState};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::{DeviceProfile, DeviceRegistry};
 
+use crate::notation;
 use crate::pattern::{self, StepPattern};
 
 /// The project.
@@ -65,6 +66,10 @@ pub struct TrackView {
     /// other clips, such as melodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<PatternView>,
+    /// The loop's notes in the form set_notes takes, by start. Shown for
+    /// clips that aren't step patterns, such as melodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Vec<NoteView>>,
     /// How many notes and other events the loop holds.
     pub events: usize,
 }
@@ -74,6 +79,11 @@ impl TrackView {
     /// voices in its pattern.
     pub fn new(track: &Track, ports: &[String], devices: &DeviceRegistry) -> Self {
         let device = track.device.as_deref().and_then(|id| devices.get(id));
+        let pattern = pattern::steps_from_clip(&track.clip, device).map(PatternView::from);
+        let notes = match pattern {
+            None => Some(NoteView::all(&track.clip, device)).filter(|notes| !notes.is_empty()),
+            Some(_) => None,
+        };
         Self {
             id: track.id.0,
             name: track.name.clone(),
@@ -82,9 +92,49 @@ impl TrackView {
             channel: track.target.channel.number(),
             muted: track.muted,
             loop_beats: beats(track.clip.length()),
-            pattern: pattern::steps_from_clip(&track.clip, device).map(PatternView::from),
+            pattern,
+            notes,
             events: track.clip.events().len(),
         }
+    }
+}
+
+/// One note of a loop.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct NoteView {
+    /// The device's voice for the note if it has one, otherwise its pitch,
+    /// such as "C4".
+    pub note: String,
+    /// When it starts, in beats from the start of the loop.
+    pub start: f64,
+    /// How long it lasts, in beats.
+    pub length: f64,
+    /// How hard, 1-127.
+    pub velocity: u8,
+}
+
+impl NoteView {
+    /// The notes `clip` plays, by start, named after `device`'s voices where
+    /// it has them.
+    fn all(clip: &Clip, device: Option<&DeviceProfile>) -> Vec<Self> {
+        clip.events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Note {
+                    note,
+                    velocity,
+                    length,
+                } => Some(Self {
+                    note: device
+                        .and_then(|device| device.voice_name(note))
+                        .map_or_else(|| notation::format_pitch(note), str::to_owned),
+                    start: beats(event.start),
+                    length: beats(length),
+                    velocity: velocity.get(),
+                }),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -286,10 +336,12 @@ pub struct SetSteps {
 pub struct SetNotes {
     /// The track's id.
     pub track: u32,
-    /// The notes, in any order.
+    /// The notes, in any order, at most 1024. Notes that start together
+    /// make a chord. Two notes of the same pitch can't overlap.
     pub notes: Vec<NoteSpec>,
-    /// The loop length in beats. Defaults to the end of the last note,
-    /// rounded up to a whole bar.
+    /// The loop length in beats, at most 1024. Defaults to the end of the
+    /// last note, rounded up to a whole bar. A note can run past the end of
+    /// the loop into the next pass.
     pub loop_beats: Option<f64>,
 }
 
@@ -299,9 +351,11 @@ pub struct SetNotes {
 pub struct NoteSpec {
     /// Which note.
     pub note: NoteRef,
-    /// When it starts, in beats from the start of the loop.
+    /// When it starts, in beats from the start of the loop: 0 is the first
+    /// beat, 1.5 the offbeat after the second. Rounds to 1/960 of a beat.
     pub start: f64,
-    /// How long it lasts, in beats.
+    /// How long it lasts, in beats: 1 is a quarter note in 4/4, 0.5 an
+    /// eighth.
     pub length: f64,
     /// How hard, 1-127. Defaults to 100.
     pub velocity: Option<u8>,
