@@ -144,9 +144,12 @@ sounding note and returns.
   clip, port or channel wait for the next bar.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
-- At the same tick, note-offs go out first, then program changes, control
-  changes and note-ons. A retriggered note isn't cut short, and a note
-  plays with the program and controller values set on its tick.
+- At the same tick, note-offs go out first, then bank selects, program
+  changes, other control changes and note-ons. A retriggered note isn't cut
+  short, a program change gets the bank selected with it, and a note plays
+  with the program and controller values set on its tick. Within each
+  group, events keep their order, by track and then as written in the
+  clip, so RPN sequences and repeated controllers arrive as written.
 - treason is the clock master: a MIDI clock pulse every 40 ticks while
   playing, plus Start, Stop, Continue and Song Position Pointer, on the ports
   configured with `clock = true`. Following an external clock is planned.

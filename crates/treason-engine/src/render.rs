@@ -6,6 +6,10 @@ use treason_core::midi::{MidiMessage, U7};
 use treason_core::model::{EventKind, PortId, Project, Track};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
+/// Bank select, the most and least significant bytes. A program change on
+/// the same tick uses them, so they go out before it.
+const BANK_SELECT: [u8; 2] = [0, 32];
+
 /// A message to send at a tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderedEvent {
@@ -15,6 +19,9 @@ pub struct RenderedEvent {
     pub port: PortId,
     /// What.
     pub message: MidiMessage,
+    /// The order it was rendered in: by track, then as written in the clip.
+    /// Breaks ties in the send order without a sort that allocates.
+    sequence: u32,
 }
 
 /// Appends to `out` everything `project` plays in `window`, in send order.
@@ -26,9 +33,13 @@ pub struct RenderedEvent {
 /// play nothing.
 ///
 /// Events are ordered by tick. At the same tick, note-offs come first, then
-/// program changes, control changes and note-ons, so a retriggered note isn't
-/// cut short and a note plays with the program and controller values set on
-/// its tick.
+/// bank selects (controllers 0 and 32), program changes, other control
+/// changes and note-ons. A retriggered note isn't cut short, a program
+/// change gets the bank selected with it, and a note plays with the program
+/// and controller values set on its tick. Within each of those groups,
+/// events keep their order, by track and then as written in the clip, so a
+/// sequence such as an RPN's parameter selection and data entry arrives as
+/// written.
 ///
 /// `out` is reused from window to window: with its capacity reserved up
 /// front, rendering doesn't allocate.
@@ -63,10 +74,12 @@ fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent
     let port = track.target.port;
     let channel = track.target.channel;
     let mut emit = |tick, message| {
+        let sequence = u32::try_from(out.len()).unwrap_or(u32::MAX);
         out.push(RenderedEvent {
             tick: Ticks(tick),
             port,
             message,
+            sequence,
         });
     };
     // A note that ends in the window started at most the longest note
@@ -121,19 +134,23 @@ fn render_track(track: &Track, window: Range<Ticks>, out: &mut Vec<RenderedEvent
     }
 }
 
-/// Where an event goes in the send order: by tick, then note-offs, program
-/// changes, control changes and note-ons, then by port and message. Events
-/// that tie are identical, so the order is the same on every run.
-fn send_order(event: &RenderedEvent) -> (Ticks, u8, PortId, [u8; 3]) {
+/// Where an event goes in the send order: by tick, then note-offs, bank
+/// selects, program changes, other control changes and note-ons, then in the
+/// order they were rendered. No two events tie, so an unstable sort keeps
+/// that order.
+fn send_order(event: &RenderedEvent) -> (Ticks, u8, u32) {
     let rank = match event.message {
         MidiMessage::NoteOff { .. } => 0,
-        MidiMessage::ProgramChange { .. } => 1,
-        MidiMessage::ControlChange { .. } => 2,
-        _ => 3,
+        MidiMessage::ControlChange { controller, .. }
+            if BANK_SELECT.contains(&controller.get()) =>
+        {
+            1
+        }
+        MidiMessage::ProgramChange { .. } => 2,
+        MidiMessage::ControlChange { .. } => 3,
+        _ => 4,
     };
-    let mut bytes = [0; 3];
-    event.message.encode(&mut bytes);
-    (event.tick, rank, event.port, bytes)
+    (event.tick, rank, event.sequence)
 }
 
 #[cfg(test)]
@@ -152,6 +169,25 @@ mod tests {
                 note: U7::new(note).unwrap(),
                 velocity: U7::MAX,
                 length: Ticks(length),
+            },
+        }
+    }
+
+    fn control(start: u64, controller: u8, value: u8) -> ClipEvent {
+        ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Control {
+                controller: U7::new(controller).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        }
+    }
+
+    fn program(start: u64, program: u8) -> ClipEvent {
+        ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Program {
+                program: U7::new(program).unwrap(),
             },
         }
     }
@@ -286,19 +322,8 @@ mod tests {
     fn programs_and_controls_come_before_notes_on_their_tick() {
         let controls = vec![
             note(240, 40, 240),
-            ClipEvent {
-                start: Ticks(240),
-                kind: EventKind::Control {
-                    controller: U7::new(74).unwrap(),
-                    value: U7::new(20).unwrap(),
-                },
-            },
-            ClipEvent {
-                start: Ticks(240),
-                kind: EventKind::Program {
-                    program: U7::new(5).unwrap(),
-                },
-            },
+            control(240, 74, 20),
+            program(240, 5),
             note(0, 40, 240),
         ];
         let project = project(vec![track(1, 960, controls)]);
@@ -314,6 +339,51 @@ mod tests {
         );
         // Controls before the window aren't sent again.
         assert_eq!(play(&project, 241..480), Vec::<String>::new());
+    }
+
+    #[test]
+    fn bank_selects_come_before_their_program_change() {
+        // Written with the volume first: it still goes out after the program
+        // change, which may reset it.
+        let events = vec![
+            control(0, 7, 90),
+            control(0, 0, 1),
+            control(0, 32, 2),
+            program(0, 5),
+            note(0, 60, 240),
+        ];
+        let project = project(vec![track(1, 960, events)]);
+        assert_eq!(
+            play(&project, 0..1),
+            ["0 cc 0=1", "0 cc 32=2", "0 pc 5", "0 cc 7=90", "0 on 60"]
+        );
+    }
+
+    #[test]
+    fn controls_on_one_tick_keep_their_order() {
+        // An RPN (pitch bend range) is selected before its data entry, and
+        // the last of two volumes wins.
+        let rpn = vec![
+            control(0, 101, 0),
+            control(0, 100, 0),
+            control(0, 6, 12),
+            control(0, 7, 100),
+            control(0, 7, 20),
+        ];
+        // Another track on the same channel follows in track order.
+        let later = vec![control(0, 7, 64)];
+        let project = project(vec![track(1, 960, rpn), track(2, 960, later)]);
+        assert_eq!(
+            play(&project, 0..1),
+            [
+                "0 cc 101=0",
+                "0 cc 100=0",
+                "0 cc 6=12",
+                "0 cc 7=100",
+                "0 cc 7=20",
+                "0 cc 7=64",
+            ]
+        );
     }
 
     #[test]
@@ -369,6 +439,7 @@ mod tests {
             tick: Ticks(5000),
             port: PortId(0),
             message: MidiMessage::Stop,
+            sequence: 0,
         };
         out.push(earlier);
         let buffer = out.as_ptr();
