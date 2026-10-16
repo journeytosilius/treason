@@ -17,11 +17,11 @@ use treason_core::time::Ticks;
 use crate::clock::Clock;
 use crate::link::EngineLink;
 use crate::notes::ActiveNotes;
-use crate::render::{RenderedEvent, render};
+use crate::render::{RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{Transport, TransportEffect};
 
-/// How many events one window can hold before rendering has to allocate.
+/// How many rendered events can wait for submission, without allocating.
 const RENDER_CAPACITY: usize = 4096;
 
 /// The longest the engine sleeps before checking for commands and new
@@ -99,6 +99,8 @@ pub struct Engine<O, C> {
     timebase: Timebase,
     /// The next tick to render.
     cursor: Ticks,
+    /// The last event rendered when a full buffer splits a tick.
+    render_after: Option<RenderedEvent>,
     /// The snapshot playing.
     project: Arc<Project>,
     /// A newer snapshot, waiting for the next bar line.
@@ -123,6 +125,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             rendered: Vec::with_capacity(RENDER_CAPACITY),
             timebase,
             cursor: Ticks::ZERO,
+            render_after: None,
             project,
             waiting: None,
             config,
@@ -158,8 +161,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             // Finish work due under the previous snapshot and tempo before
             // applying changes. A submitted switch remains replaceable until
             // playback actually reaches its boundary.
-            self.render_until(Ticks(self.timebase.tick_at(now).0 + 1));
-            self.send_until(now)?;
+            self.render_and_send_until(Ticks(self.timebase.tick_at(now).0 + 1), now)?;
             self.complete_switch(now);
         }
         // The snapshot comes first, so a pattern published just before Play
@@ -171,12 +173,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         if self.playing() {
             let ahead = self.ahead();
             let horizon = Ticks(self.timebase.tick_at(now + ahead).0 + 1);
-            self.render_until(horizon);
             let limit = match self.output.delivery() {
                 Delivery::Immediate => now,
                 Delivery::Scheduled { .. } => now + ahead,
             };
-            self.send_until(limit)?;
+            self.render_and_send_until(horizon, limit)?;
             self.complete_switch(now);
             self.transport.advance_to(self.timebase.tick_at(now));
         }
@@ -221,6 +222,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.cancel_scheduled(now + Duration::from_nanos(1))?;
             self.rendered.clear();
             self.cursor = Ticks(position.0 + 1);
+            self.render_after = None;
             self.timebase = Timebase::new(now, position, latest.tempo);
             if let Some(waiting) = &mut self.waiting {
                 waiting.submitted = false;
@@ -232,7 +234,10 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         // both buffers there before staging the latest edit (or undo).
         self.cancel_scheduled(self.timebase.time_of(line))?;
         self.rendered.retain(|event| event.tick < line);
-        self.cursor = self.cursor.min(line);
+        if self.cursor >= line {
+            self.cursor = line;
+            self.render_after = None;
+        }
         if let Some(superseded) = self.waiting.take() {
             self.link.retire(superseded.project);
         }
@@ -294,6 +299,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// Drops the events not sent yet and moves to the newest snapshot at once.
     fn settle(&mut self) {
         self.rendered.clear();
+        self.render_after = None;
         if let Some(newer) = self.waiting.take() {
             self.adopt(newer.project);
         }
@@ -326,6 +332,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         // its note-offs, after ending the notes that really sounded.
         self.rendered.clear();
         self.cursor = Ticks(tick.0 + 1);
+        self.render_after = None;
         if let Some(waiting) = &mut self.waiting {
             waiting.submitted = false;
         }
@@ -348,27 +355,42 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Renders both sides of a staged playback boundary without adopting
-    /// the new snapshot before playback reaches it.
+    /// Drains oversized windows in bounded batches. Scheduled backpressure
+    /// or events not due yet leave the rest for a later cycle.
+    fn render_and_send_until(&mut self, horizon: Ticks, limit: Instant) -> Result<(), O::Error> {
+        loop {
+            self.render_until(horizon);
+            self.send_until(limit)?;
+            if self.cursor >= horizon
+                || !self.rendered.is_empty()
+                || self.scheduled.len() >= RENDER_CAPACITY
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Renders only what fits, preserving a continuation within a tick.
+    /// Both sides of a staged bar use their own snapshot.
     fn render_until(&mut self, horizon: Ticks) {
-        if self.cursor >= horizon {
-            return;
-        }
-        if let Some(waiting) = &self.waiting {
-            render(
-                &self.project,
-                self.cursor..horizon.min(waiting.line),
+        while self.cursor < horizon && self.rendered.len() < self.rendered.capacity() {
+            let (project, end) = match &self.waiting {
+                Some(waiting) if self.cursor >= waiting.line => (&waiting.project, horizon),
+                Some(waiting) => (&self.project, horizon.min(waiting.line)),
+                None => (&self.project, horizon),
+            };
+            self.render_after = render_bounded(
+                project,
+                self.cursor..end,
+                self.render_after,
                 &mut self.rendered,
             );
-            render(
-                &waiting.project,
-                self.cursor.max(waiting.line)..horizon,
-                &mut self.rendered,
-            );
-        } else {
-            render(&self.project, self.cursor..horizon, &mut self.rendered);
+            if let Some(last) = self.render_after {
+                self.cursor = last.tick;
+                return;
+            }
+            self.cursor = end;
         }
-        self.cursor = horizon;
     }
 
     /// Sends the rendered events due by `limit`. On reaching a switch's bar
@@ -385,7 +407,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             let next = self.rendered.get(sent).copied();
             if let Some(waiting) = &self.waiting
                 && !waiting.submitted
-                && next.is_none_or(|event| event.tick >= waiting.line)
+                && next.map_or(self.cursor >= waiting.line, |event| {
+                    event.tick >= waiting.line
+                })
                 && self.timebase.time_of(waiting.line) <= limit
             {
                 self.finish_switch()?;
@@ -1363,36 +1387,59 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_tracking_is_bounded_and_a_dense_window_is_not_lost() {
-        let count = RENDER_CAPACITY + 10;
-        let dense = Arc::new(Track {
-            clip: Clip::new(
-                Ticks(1920),
-                (0..count)
-                    .map(|index| ClipEvent {
-                        // Two batches fill the scheduled mirror across
-                        // cycles without growing the render buffer itself.
-                        start: Ticks(if index < count / 2 { 240 } else { 249 }),
-                        kind: EventKind::Control {
-                            controller: U7::saturating(7),
-                            value: U7::MAX,
-                        },
-                    })
-                    .collect(),
-            )
-            .unwrap(),
-            ..(*track(1, 10, 1920, &[])).clone()
-        });
-        let (mut handle, mut engine) = engine(project(vec![dense]), ScheduledOutput::new());
-        let capacity = engine.scheduled.capacity();
-        let render_capacity = engine.rendered.capacity();
-        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
-        run_until(&mut engine, origin + ms(115));
-        assert_eq!(engine.scheduled.len(), RENDER_CAPACITY);
-        run_until(&mut engine, origin + ms(150));
-        engine.output.deliver_until(origin + ms(150));
-        assert_eq!(engine.output.delivered.len(), count);
-        assert_eq!(engine.scheduled.capacity(), capacity);
-        assert_eq!(engine.rendered.capacity(), render_capacity);
+    fn oversized_and_retained_render_batches_are_bounded_without_losing_events() {
+        for scheduled in [false, true] {
+            for (first, second) in [
+                (RENDER_CAPACITY + 1, 0),                       // One oversized tick.
+                (RENDER_CAPACITY - 1, RENDER_CAPACITY + 11),    // Retained + another batch.
+                (RENDER_CAPACITY * 2 + 5, RENDER_CAPACITY + 5), // Queue backpressure.
+            ] {
+                let count = first + second;
+                let dense = Arc::new(Track {
+                    clip: Clip::new(
+                        Ticks(1920),
+                        (0..count)
+                            .map(|index| ClipEvent {
+                                start: Ticks(if index < first { 240 } else { 249 }),
+                                kind: EventKind::Control {
+                                    controller: U7::saturating(7),
+                                    value: U7::saturating((index % 128) as u8),
+                                },
+                            })
+                            .collect(),
+                    )
+                    .unwrap(),
+                    ..(*track(1, 10, 1920, &[])).clone()
+                });
+                let output = if scheduled {
+                    RecordingOutput::scheduled(ms(50))
+                } else {
+                    RecordingOutput::new()
+                };
+                let (mut handle, mut engine) = engine(project(vec![dense]), output);
+                let capacity = engine.scheduled.capacity();
+                let render_capacity = engine.rendered.capacity();
+                let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                run_until(&mut engine, origin + ms(115));
+                if scheduled {
+                    assert_eq!(engine.scheduled.len(), RENDER_CAPACITY);
+                } else {
+                    assert_eq!(engine.rendered.len(), RENDER_CAPACITY);
+                }
+                run_until(&mut engine, origin + ms(150));
+                let messages = engine.output.messages();
+                assert_eq!(messages.len(), count);
+                for (index, message) in messages.iter().enumerate() {
+                    assert_eq!(message.tick, Ticks(if index < first { 240 } else { 249 }));
+                    assert!(matches!(message.message,
+                        MidiMessage::ControlChange { value, .. }
+                            if value.get() == (index % 128) as u8
+                    ));
+                }
+                assert_eq!(engine.scheduled.capacity(), capacity);
+                assert_eq!(engine.rendered.capacity(), render_capacity);
+                assert!(engine.rendered.is_empty());
+            }
+        }
     }
 }

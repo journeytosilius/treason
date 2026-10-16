@@ -133,7 +133,9 @@ sounding note and returns.
   nanoseconds with tempo in thousandths of a BPM, so ticks and times
   round-trip exactly.
 - The engine renders a short lookahead window, on the order of 10 to 50 ms,
-  tuned per backend.
+  tuned per backend. Rendering fills at most the preallocated 4096-event
+  buffer, including any retained events. Oversized windows resume in send
+  order, even within a tick, without losing events or growing the buffer.
 - `Delivery::Immediate` backends (midir) send when called, so the engine
   sleeps until each message is due, spinning for the last stretch.
   `Delivery::Scheduled` backends (an ALSA sequencer queue) take timestamped
