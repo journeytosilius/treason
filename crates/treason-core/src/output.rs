@@ -54,6 +54,11 @@ pub trait MidiOutput: Send {
     /// Delivers one message.
     fn send(&mut self, message: &TimedMessage) -> Result<(), Self::Error>;
 
+    /// Cancels undelivered messages whose timestamp is at or after `from`,
+    /// including messages already flushed to a scheduling queue. On return,
+    /// none of that work may be delivered. Immediate outputs do nothing.
+    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error>;
+
     /// Pushes out anything buffered. Called after each batch of messages.
     fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())

@@ -137,7 +137,12 @@ sounding note and returns.
 - `Delivery::Immediate` backends (midir) send when called, so the engine
   sleeps until each message is due, spinning for the last stretch.
   `Delivery::Scheduled` backends (an ALSA sequencer queue) take timestamped
-  messages early, and the kernel sends them on time.
+  messages early, and the kernel sends them on time. `MidiOutput::cancel_from`
+  retracts undelivered work, including flushed events, on stop, restart,
+  locate, panic and shutdown. The engine keeps delivered note state separate
+  from queued work so cancellation still ends every sounding note. Its
+  preallocated queue mirror holds a render batch plus a switch's note-offs;
+  excess events stay in the render buffer until queue space becomes free.
 - Each port has a latency offset. Messages for a slower device are due
   earlier.
 - Tempo changes and transport commands apply at once. Other edits, such

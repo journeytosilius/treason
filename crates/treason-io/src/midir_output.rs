@@ -1,6 +1,8 @@
 //! Real-time output through `midir`: ALSA on Linux, CoreMIDI on macOS and
 //! WinMM on Windows.
 
+use std::time::Instant;
+
 use thiserror::Error;
 use treason_core::model::PortId;
 use treason_core::output::{Delivery, MidiOutput, TimedMessage};
@@ -51,6 +53,10 @@ impl MidiOutput for MidirOutput {
             .ok_or(MidirError::UnknownPort(message.port))?;
         let mut bytes = [0; 3];
         connection.send(message.message.encode(&mut bytes))?;
+        Ok(())
+    }
+
+    fn cancel_from(&mut self, _from: Instant) -> Result<(), Self::Error> {
         Ok(())
     }
 }

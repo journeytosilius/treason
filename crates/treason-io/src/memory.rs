@@ -1,7 +1,7 @@
 //! An in-memory output.
 
 use std::convert::Infallible;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use treason_core::output::{Delivery, MidiOutput, TimedMessage};
 
@@ -61,6 +61,13 @@ impl MidiOutput for RecordingOutput {
 
     fn send(&mut self, message: &TimedMessage) -> Result<(), Self::Error> {
         self.messages.push(*message);
+        Ok(())
+    }
+
+    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
+        if matches!(self.delivery, Delivery::Scheduled { .. }) {
+            self.messages.retain(|message| message.at < from);
+        }
         Ok(())
     }
 }
