@@ -1,0 +1,146 @@
+name: Telegram Notifications
+
+on:
+  # pull_request_target still runs when a PR has merge conflicts. This workflow
+  # never checks out or executes PR code; it only reads the event payload and
+  # sends an escaped notification using base-repository secrets.
+  pull_request_target:
+    types: [opened, synchronize, closed]
+  issues:
+    types: [opened, reopened, closed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  notify:
+    name: Notify Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Send Telegram notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from html import escape
+
+          bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+          if not bot_token or not chat_id:
+              print("Telegram notification skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured.")
+              sys.exit(0)
+
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          event_path = os.environ["GITHUB_EVENT_PATH"]
+          repository = os.environ.get("GITHUB_REPOSITORY", "unknown/repository")
+          actor = os.environ.get("GITHUB_ACTOR", "unknown")
+
+          with open(event_path, "r", encoding="utf-8") as event_file:
+              payload = json.load(event_file)
+
+          def text(value):
+              return escape(str(value), quote=False)
+
+          def attr(value):
+              return escape(str(value), quote=True)
+
+          def bold(value):
+              return f"<b>{text(value)}</b>"
+
+          def code(value):
+              return f"<code>{text(value)}</code>"
+
+          def link(label, url):
+              return f'<a href="{attr(url)}">{text(label)}</a>'
+
+          if event_name in {"pull_request", "pull_request_target"}:
+              pull = payload["pull_request"]
+              action = payload["action"]
+              if action == "opened":
+                  label = "New pull request"
+                  actor_label = "Author"
+                  actor_name = pull["user"]["login"]
+              elif action == "synchronize":
+                  label = "Pull request updated"
+                  actor_label = "Updated by"
+                  actor_name = actor
+              elif action == "closed" and pull.get("merged"):
+                  label = "🔀 Pull request merged"
+                  actor_label = "Merged by"
+                  actor_name = (pull.get("merged_by") or {}).get("login") or actor
+              else:
+                  print(f"Telegram notification skipped: unsupported pull_request action {action}.")
+                  sys.exit(0)
+
+              branch = f"{pull['head']['ref']} -> {pull['base']['ref']}"
+              lines = [
+                  bold(label),
+                  f"#{pull['number']} - {link(pull['title'], pull['html_url'])}",
+                  f"Repository: {code(repository)}",
+                  f"{actor_label}: {code(actor_name)}",
+                  f"Branch: {code(branch)}",
+                  f"Head: {code(pull['head']['sha'][:7])}",
+              ]
+              if action == "closed":
+                  merge_sha = pull.get("merge_commit_sha")
+                  if merge_sha:
+                      lines.append(f"Merge: {code(merge_sha[:7])}")
+              text = "\n".join(lines)
+          elif event_name == "issues":
+              issue = payload["issue"]
+              action = payload["action"]
+              label = {
+                  "opened": "Issue opened",
+                  "reopened": "Issue reopened",
+                  "closed": "Issue closed",
+              }.get(action, f"Issue {action}")
+              text = "\n".join(
+                  [
+                      bold(label),
+                      f"#{issue['number']} - {link(issue['title'], issue['html_url'])}",
+                      f"Repository: {code(repository)}",
+                      f"By: {code(actor)}",
+                  ]
+              )
+          else:
+              print(f"Telegram notification skipped: unsupported event {event_name}.")
+              sys.exit(0)
+
+          body = {
+              "chat_id": chat_id,
+              "text": text,
+              "parse_mode": "HTML",
+              "disable_web_page_preview": True,
+          }
+          thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "").strip()
+          if thread_id:
+              body["message_thread_id"] = thread_id
+
+          request = urllib.request.Request(
+              f"https://api.telegram.org/bot{bot_token}/sendMessage",
+              data=json.dumps(body).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=15) as response:
+                  response.read()
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")
+              print(f"Telegram notification failed: HTTP {exc.code}: {detail}")
+              sys.exit(1)
+          except urllib.error.URLError as exc:
+              print(f"Telegram notification failed: {exc.reason}")
+              sys.exit(1)
+          PY
