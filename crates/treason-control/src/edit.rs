@@ -18,6 +18,9 @@ pub enum Edit {
     AddTrack(Track),
     /// Removes a track.
     RemoveTrack(TrackId),
+    /// Replaces the track that has this track's id, keeping its place. Changes
+    /// several of a track's settings, such as its name and port, as one edit.
+    ReplaceTrack(Track),
     /// Replaces a track's clip. Takes effect at the next bar.
     SetClip { track: TrackId, clip: Clip },
     /// Mutes or unmutes a track.

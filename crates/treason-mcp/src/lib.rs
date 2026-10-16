@@ -8,16 +8,17 @@
 //! Tool inputs and outputs ([`dto`]) are separate types designed for the
 //! model: voice names, step strings such as `"x...x...x..x.x.."`
 //! ([`notation`]), channels 1-16. They are converted to and from the core
-//! model here. Then the agent's interface can stay stable while the internal
-//! model changes, and the other way round.
+//! model here; [`pattern`] turns step patterns into clips and back. Then the
+//! agent's interface can stay stable while the internal model changes, and
+//! the other way round.
 //!
-//! The tools that need the notation, `set_steps` and `set_notes`, are
-//! placeholders for now.
+//! `set_notes` is a placeholder until pitch names are written.
 //!
 //! [`Session`]: treason_control::Session
 
 pub mod dto;
 pub mod notation;
+pub mod pattern;
 mod serve;
 pub mod server;
 

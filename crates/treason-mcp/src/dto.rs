@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use treason_core::model::{PortId, Project, Track};
 use treason_core::playback::{PlaybackStatus, TransportState};
 use treason_core::time::{PPQN, Ticks};
-use treason_devices::DeviceProfile;
+use treason_devices::{DeviceProfile, DeviceRegistry};
+
+use crate::pattern::{self, StepPattern};
 
 /// The project.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -26,15 +28,16 @@ pub struct ProjectView {
 }
 
 impl ProjectView {
-    /// Describes `project`. `ports` names the output ports.
-    pub fn new(project: &Project, ports: &[String]) -> Self {
+    /// Describes `project`. `ports` names the output ports, and `devices`
+    /// the voices in its patterns.
+    pub fn new(project: &Project, ports: &[String], devices: &DeviceRegistry) -> Self {
         Self {
             tempo: project.tempo.get(),
             time_signature: project.time_signature.to_string(),
             tracks: project
                 .tracks
                 .iter()
-                .map(|track| TrackView::new(track, ports))
+                .map(|track| TrackView::new(track, ports, devices))
                 .collect(),
         }
     }
@@ -57,13 +60,20 @@ pub struct TrackView {
     pub muted: bool,
     /// The length of the track's loop, in beats.
     pub loop_beats: f64,
+    /// The loop as step strings, in the form set_steps takes. Shown when
+    /// every note sits on a step grid at set_steps' velocities; missing for
+    /// other clips, such as melodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<PatternView>,
     /// How many notes and other events the loop holds.
     pub events: usize,
 }
 
 impl TrackView {
-    /// Describes `track`. `ports` names the output ports.
-    pub fn new(track: &Track, ports: &[String]) -> Self {
+    /// Describes `track`. `ports` names the output ports, and `devices` the
+    /// voices in its pattern.
+    pub fn new(track: &Track, ports: &[String], devices: &DeviceRegistry) -> Self {
+        let device = track.device.as_deref().and_then(|id| devices.get(id));
         Self {
             id: track.id.0,
             name: track.name.clone(),
@@ -72,7 +82,27 @@ impl TrackView {
             channel: track.target.channel.number(),
             muted: track.muted,
             loop_beats: beats(track.clip.length()),
+            pattern: pattern::steps_from_clip(&track.clip, device).map(PatternView::from),
             events: track.clip.events().len(),
+        }
+    }
+}
+
+/// A loop written as step strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct PatternView {
+    /// Steps per beat, as in set_steps.
+    pub steps_per_beat: u32,
+    /// One step string per voice, with a space between beats: "x" a hit,
+    /// "X" an accent, "." a rest.
+    pub steps: BTreeMap<String, String>,
+}
+
+impl From<StepPattern> for PatternView {
+    fn from(pattern: StepPattern) -> Self {
+        Self {
+            steps_per_beat: pattern.steps_per_beat,
+            steps: pattern.steps,
         }
     }
 }
@@ -211,19 +241,42 @@ pub struct SetMuted {
     pub muted: bool,
 }
 
+/// Input for edit_track.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditTrack {
+    /// The track's id.
+    pub track: u32,
+    /// A new name.
+    pub name: Option<String>,
+    /// Another output port, from list_ports.
+    pub port: Option<String>,
+    /// Another MIDI channel, 1-16. Without it the channel stays, even when
+    /// the device changes.
+    pub channel: Option<u8>,
+    /// Another device profile id, from list_devices. Later set_steps calls
+    /// use its voice names; the notes already in the clip stay as they are.
+    pub device: Option<String>,
+}
+
 /// Input for set_steps.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SetSteps {
     /// The track's id.
     pub track: u32,
-    /// One step string per voice, keyed by voice name or MIDI note number.
-    /// Each character is a step: "x" a hit, "X" an accent, "." a rest. Spaces
-    /// and "|" are ignored. Example: {"kick": "x...x...x...x...",
+    /// One step string per voice, keyed by the device's voice names (or
+    /// their aliases) or by MIDI note number. Each character is a step: "x"
+    /// a hit, "X" an accent, "." or "-" a rest. Spaces and "|" are ignored.
+    /// Example: {"kick": "x...x...x...x...", "snare": "....x.......x...",
     /// "closed_hat": "..x...x...x...x."}. The loop is as long as the longest
-    /// string.
+    /// string. A shorter one repeats to fill it, so {"closed_hat": "..x."}
+    /// plays an off-beat hat in every beat; its length must divide the
+    /// loop's.
     pub steps: BTreeMap<String, String>,
-    /// Steps per beat. Defaults to 4, so each step is a sixteenth note.
+    /// Steps per beat (a quarter note): 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32.
+    /// Defaults to 4, so each step is a sixteenth note; 3 gives eighth-note
+    /// triplets.
     pub steps_per_beat: Option<u32>,
 }
 

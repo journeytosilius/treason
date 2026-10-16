@@ -49,11 +49,19 @@ pub enum ProfileError {
     /// A name is both a voice and an alias.
     #[error("`{0}` is both a voice and an alias")]
     AliasShadowsVoice(String),
+    /// A voice or alias named with digits alone.
+    #[error("`{0}` is a number, which tools read as a MIDI note: give it a name with a letter")]
+    NumericName(String),
 }
 
 impl DeviceProfile {
-    /// Checks that every alias points to a voice and that no alias hides one.
+    /// Checks that every alias points to a voice, that no alias hides one,
+    /// and that no name is a number, since tools read numbers as MIDI notes.
     pub fn validate(&self) -> Result<(), ProfileError> {
+        let numeric = |name: &&String| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+        if let Some(name) = self.voices.keys().chain(self.aliases.keys()).find(numeric) {
+            return Err(ProfileError::NumericName(name.clone()));
+        }
         for (alias, voice) in &self.aliases {
             if self.voices.contains_key(alias) {
                 return Err(ProfileError::AliasShadowsVoice(alias.clone()));
@@ -110,6 +118,19 @@ mod tests {
                 voice: "snare".into(),
             })
         );
+    }
+
+    #[test]
+    fn rejects_names_that_are_numbers() {
+        for (extra, name) in [("16 = 40", "16"), ("[aliases]\n1 = \"kick\"", "1")] {
+            let profile: DeviceProfile = toml::from_str(&format!("{MINIMAL}\n{extra}")).unwrap();
+            assert_eq!(
+                profile.validate(),
+                Err(ProfileError::NumericName(name.into()))
+            );
+        }
+        let named: DeviceProfile = toml::from_str(&format!("{MINIMAL}\nkick2 = 40")).unwrap();
+        assert_eq!(named.validate(), Ok(()));
     }
 
     #[test]
