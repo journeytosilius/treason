@@ -72,12 +72,12 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | devices | `profile`, `registry` | `DeviceProfile`, `DeviceRegistry` | done |
 | engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
-| engine | `timebase` | `Timebase`: ticks to time and back | done |
+| engine | `timebase` | `Timebase`: ticks to when they're heard and back, across tempo changes | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics and the messages clock ports get | done |
 | engine | `render` | `render` (clip events and clock pulses in a window), `clock_pulses` | done |
-| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, real-time priority | done |
+| engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, per-port latency, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: kernel-scheduled queue | stub |
@@ -134,15 +134,17 @@ and stops, and the transport tools report that it isn't running.
 
 - Positions are whole ticks at 960 PPQN: 40 ticks per MIDI clock pulse, 240
   per 16th note (the Song Position Pointer unit), and exact triplets.
-- The time of tick *n* is computed from an anchor, the last start, locate or
-  tempo change: `anchor_time + (n − anchor_tick) × 60 s / (bpm × 960)`.
-  Nothing accumulates, so there is no drift. `Timebase` does this in integer
+- The time tick *n* is heard is computed from an anchor, the last start,
+  locate or tempo change: `anchor_time + (n − anchor_tick) × 60 s / (bpm × 960)`.
+  The ticks up to a tempo change keep the anchor before it. Nothing
+  accumulates, so there is no drift. `Timebase` does this in integer
   nanoseconds with tempo in thousandths of a BPM, so ticks and times
   round-trip exactly.
 - The engine renders a short lookahead window, on the order of 10 to 50 ms,
-  tuned per backend. Rendering fills at most the preallocated 4096-event
-  buffer, including any retained events. Oversized windows resume in send
-  order, even within a tick, without losing events or growing the buffer.
+  tuned per backend. Each port renders into its own preallocated 4096-event
+  buffer, which also holds any retained events. Oversized windows resume in
+  send order, even within a tick, without losing events or growing the
+  buffer.
 - `Delivery::Immediate` backends (midir) send when called, so the engine
   sleeps until each message is due, spinning for the last stretch.
   `Delivery::Scheduled` backends (an ALSA sequencer queue) take timestamped
@@ -159,8 +161,19 @@ and stops, and the transport tools report that it isn't running.
   before recording the newly submitted message as delivered.
   Its preallocated queue mirror holds a render batch plus a switch's note-offs;
   excess events stay in the render buffer until queue space becomes free.
-- Each port has a latency offset. Messages for a slower device are due
-  earlier.
+- Each port has a latency: how long its device takes to respond. The
+  timebase says when each tick is heard, and each port sends its messages
+  that much earlier, so all the gear sounds together. Each port renders and
+  sends at its own pace. Playback starts once the port with the most latency
+  can send the first tick, so starting takes that long. Changes take effect
+  after the last tick that port may have sent, and the ports with less
+  latency still send the ticks before it as they were. Each port ends the
+  changed tracks' notes and starts the new bar when it reaches the bar line.
+  An edit that arrives while a port already plays that bar waits until every
+  port does, and a tempo change waits until the previous one is heard. Panic
+  ends the notes on every port at once, and each port carries on right
+  after the last tick it sent. Cancellation before a port's first send time
+  resumes from its start tick, including its first clock pulse.
 - Tempo changes and transport commands apply at once. Other edits, such
   as a new clip, a mute or a move to another port, wait for the next bar
   line. There the notes still sounding from tracks that changed end; a
@@ -169,14 +182,18 @@ and stops, and the transport tools report that it isn't running.
   already rendered or submitted that bar. Future work there is replaced,
   and the previous snapshot stays available until delivery, so another edit
   or undo can still replace the same upcoming bar.
+  A switch completes only after every port has reached its send boundary;
+  submitting every port's cleanup early does not retire the old snapshot.
   Rendered events and scheduled submissions retain their track IDs. A fixed
   ownership table per port selects only the changed tracks' notes, preserving
   held notes from other tracks sharing the channel. When tracks retrigger
   the same MIDI key, the most recent note-on owns it; an older track's
   note-off cannot end that retrigger.
-- A tempo change anchors the current whole-tick position at the current
-  time. Due events keep their old times; future rendered and submitted
-  events are rebuilt using the new tempo, including any pending bar switch.
+- A tempo change applies after the last whole tick any port may have sent,
+  which lasts until the current time plus the most latency. Earlier ticks
+  keep their times, so ports with less latency still send them on time;
+  later rendered and submitted events are rebuilt using the new tempo,
+  including any pending bar switch.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
 - At the same tick, note-offs go out first, then bank selects, program
@@ -188,8 +205,9 @@ and stops, and the transport tools report that it isn't running.
 - treason is the clock master for the ports configured with
   `clock = true`. While playing, they get a MIDI clock pulse every 40 ticks,
   first among the messages on its tick. Play sends them Start. The engine
-  flushes Start or Continue and waits at least 1 ms before anchoring playback,
-  keeping the first pulse and clip events aligned while receivers prepare.
+  flushes Start or Continue and sends each clock port its first pulse at
+  least 1 ms later, so the receivers can prepare. The clip events start with
+  the pulses, on every port.
   Continue and Locate send a Song Position Pointer and Continue: the receivers
   resume at the pointer's 16th, the first at or after the position, on the
   next pulse.
@@ -335,7 +353,7 @@ The second milestone drives other gear:
 6. Clock master: MIDI clock, Start, Stop, Continue and Song Position
    Pointer on the ports with `clock = true`. Done.
 7. Per-port latency: messages for slower devices go out earlier, so every
-   port sounds in time.
+   port sounds in time. Done.
 8. Melodic parts: pitch names in `notation` and the `set_notes` tool.
 9. The ALSA sequencer queue backend, for kernel-timed delivery.
 
