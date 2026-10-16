@@ -990,7 +990,7 @@ mod tests {
         assert!(engine.waiting.as_ref().unwrap().submitted);
         engine
             .clock
-            .sleep_until(origin + Duration::from_micros(1987_500));
+            .sleep_until(origin + Duration::from_micros(1_987_500));
         handle.publish(Arc::new(Project {
             tempo: Bpm::new(60.0).unwrap(),
             ..(*edited).clone()
@@ -1003,11 +1003,11 @@ mod tests {
             .map(|message| (message.at - origin, message.message))
             .collect();
         assert_eq!(actual.len(), 4);
-        assert_eq!(actual[1].0, Duration::from_micros(2012_500));
+        assert_eq!(actual[1].0, Duration::from_micros(2_012_500));
         assert!(matches!(actual[1].1, MidiMessage::NoteOff { note, .. } if note.get() == 60));
-        assert_eq!(actual[2].0, Duration::from_micros(2012_500));
+        assert_eq!(actual[2].0, Duration::from_micros(2_012_500));
         assert!(matches!(actual[2].1, MidiMessage::NoteOn { note, .. } if note.get() == 38));
-        assert_eq!(actual[3].0, Duration::from_micros(2262_500));
+        assert_eq!(actual[3].0, Duration::from_micros(2_262_500));
     }
 
     #[test]
