@@ -149,7 +149,13 @@ sounding note and returns.
   as a new clip, a mute or a move to another port, wait for the next bar
   line. There the notes still sounding from tracks that changed end; a
   track that only got a new name or device plays on. While stopped, edits
-  apply at once.
+  apply at once. The boundary comes from the playhead, even if lookahead has
+  already rendered or submitted that bar. Future work there is replaced,
+  and the previous snapshot stays available until delivery, so another edit
+  or undo can still replace the same upcoming bar.
+- A tempo change anchors the current whole-tick position at the current
+  time. Due events keep their old times; future rendered and submitted
+  events are rebuilt using the new tempo, including any pending bar switch.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
 - At the same tick, note-offs go out first, then bank selects, program

@@ -31,6 +31,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// All Notes Off, which panic sends on every channel.
 const ALL_NOTES_OFF: U7 = U7::saturating(123);
 
+/// A snapshot staged for a playback bar, including any early submission.
+struct SnapshotSwitch {
+    line: Ticks,
+    project: Arc<Project>,
+    submitted: bool,
+}
+
 /// The engine thread's `SCHED_FIFO` priority on Unix, from 1 to 99.
 #[cfg(unix)]
 const REALTIME_PRIORITY: u8 = 70;
@@ -88,17 +95,14 @@ pub struct Engine<O, C> {
     scheduled: Vec<TimedMessage>,
     /// Rendered events not sent yet, in send order.
     rendered: Vec<RenderedEvent>,
-    /// Ticks to time, anchored where playback last started.
+    /// Ticks to time, anchored at the last start, locate or tempo change.
     timebase: Timebase,
     /// The next tick to render.
     cursor: Ticks,
     /// The snapshot playing.
     project: Arc<Project>,
     /// A newer snapshot, waiting for the next bar line.
-    waiting: Option<Arc<Project>>,
-    /// The bar line where the playing snapshot takes over, and the snapshot
-    /// it replaces, until playback reaches that line.
-    switch: Option<(Ticks, Arc<Project>)>,
+    waiting: Option<SnapshotSwitch>,
 }
 
 impl<O: MidiOutput, C: Clock> Engine<O, C> {
@@ -121,7 +125,6 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             cursor: Ticks::ZERO,
             project,
             waiting: None,
-            switch: None,
             config,
         }
     }
@@ -151,9 +154,17 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.output.flush()?;
             return Ok(false);
         }
+        if self.playing() {
+            // Finish work due under the previous snapshot and tempo before
+            // applying changes. A submitted switch remains replaceable until
+            // playback actually reaches its boundary.
+            self.render_until(Ticks(self.timebase.tick_at(now).0 + 1));
+            self.send_until(now)?;
+            self.complete_switch(now);
+        }
         // The snapshot comes first, so a pattern published just before Play
         // plays from the top.
-        self.check_snapshot();
+        self.check_snapshot(now)?;
         while let Some(command) = self.link.next_command() {
             self.command(command, now)?;
         }
@@ -166,6 +177,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 Delivery::Scheduled { .. } => now + ahead,
             };
             self.send_until(limit)?;
+            self.complete_switch(now);
             self.transport.advance_to(self.timebase.tick_at(now));
         }
         self.output.flush()?;
@@ -190,29 +202,51 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// Picks up a newly published snapshot. While playing, its tempo applies
     /// at once and the rest waits for the next bar line. While stopped, all
     /// of it applies at once.
-    fn check_snapshot(&mut self) {
+    fn check_snapshot(&mut self, now: Instant) -> Result<(), O::Error> {
         let latest = self.link.project();
-        let newest = self.waiting.as_ref().unwrap_or(&self.project);
+        let newest = self.waiting.as_ref().map_or(&self.project, |s| &s.project);
         if Arc::ptr_eq(&*latest, newest) {
-            return;
+            return Ok(());
         }
         let latest = Guard::into_inner(latest);
-        if let Some(superseded) = self.waiting.take() {
-            self.link.retire(superseded);
-        }
         if !self.playing() {
             self.adopt(latest);
-            return;
+            return Ok(());
         }
+        let position = self.timebase.tick_at(now);
         if latest.tempo != self.timebase.tempo() {
-            self.timebase.retempo(self.cursor, latest.tempo);
+            // All due work was sent using the old mapping. Rebuild future
+            // work, including backend submissions, from the current position
+            // and time, rather than from the future render boundary.
+            self.cancel_scheduled(now + Duration::from_nanos(1))?;
+            self.rendered.clear();
+            self.cursor = Ticks(position.0 + 1);
+            self.timebase = Timebase::new(now, position, latest.tempo);
+            if let Some(waiting) = &mut self.waiting {
+                waiting.submitted = false;
+            }
+        }
+        let bar = self.project.time_signature.bar_length().0;
+        let line = Ticks((position.0 / bar + 1) * bar);
+        // The next playback bar may already be rendered or submitted. Trim
+        // both buffers there before staging the latest edit (or undo).
+        self.cancel_scheduled(self.timebase.time_of(line))?;
+        self.rendered.retain(|event| event.tick < line);
+        self.cursor = self.cursor.min(line);
+        if let Some(superseded) = self.waiting.take() {
+            self.link.retire(superseded.project);
         }
         // Publishing the playing snapshot again, as undo can, ends the wait.
         // `latest` is then a second reference to it, so dropping it frees
         // nothing.
         if !Arc::ptr_eq(&latest, &self.project) {
-            self.waiting = Some(latest);
+            self.waiting = Some(SnapshotSwitch {
+                line,
+                project: latest,
+                submitted: false,
+            });
         }
+        Ok(())
     }
 
     /// Plays `newer` from now on, handing back the snapshot it replaces.
@@ -260,11 +294,8 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// Drops the events not sent yet and moves to the newest snapshot at once.
     fn settle(&mut self) {
         self.rendered.clear();
-        if let Some((_, old)) = self.switch.take() {
-            self.link.retire(old);
-        }
         if let Some(newer) = self.waiting.take() {
-            self.adopt(newer);
+            self.adopt(newer.project);
         }
     }
 
@@ -295,6 +326,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         // its note-offs, after ending the notes that really sounded.
         self.rendered.clear();
         self.cursor = Ticks(tick.0 + 1);
+        if let Some(waiting) = &mut self.waiting {
+            waiting.submitted = false;
+        }
         self.end_notes(at, tick)?;
         for port in (0..).map(PortId).take(self.sounding.len()) {
             for channel in (0..16).filter_map(Channel::from_index) {
@@ -314,25 +348,26 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Renders up to `horizon`. A waiting snapshot takes over at the first
-    /// bar line on the way, once playback has reached the previous switch.
+    /// Renders both sides of a staged playback boundary without adopting
+    /// the new snapshot before playback reaches it.
     fn render_until(&mut self, horizon: Ticks) {
         if self.cursor >= horizon {
             return;
         }
-        if self.switch.is_none() {
-            let bar = self.project.time_signature.bar_length().0;
-            let line = Ticks(self.cursor.0.div_ceil(bar) * bar);
-            if line < horizon
-                && let Some(newer) = self.waiting.take()
-            {
-                render(&self.project, self.cursor..line, &mut self.rendered);
-                let old = mem::replace(&mut self.project, newer);
-                self.switch = Some((line, old));
-                self.cursor = line;
-            }
+        if let Some(waiting) = &self.waiting {
+            render(
+                &self.project,
+                self.cursor..horizon.min(waiting.line),
+                &mut self.rendered,
+            );
+            render(
+                &waiting.project,
+                self.cursor.max(waiting.line)..horizon,
+                &mut self.rendered,
+            );
+        } else {
+            render(&self.project, self.cursor..horizon, &mut self.rendered);
         }
-        render(&self.project, self.cursor..horizon, &mut self.rendered);
         self.cursor = horizon;
     }
 
@@ -348,9 +383,10 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 break;
             }
             let next = self.rendered.get(sent).copied();
-            if let Some((line, _)) = self.switch
-                && next.is_none_or(|event| event.tick >= line)
-                && self.timebase.time_of(line) <= limit
+            if let Some(waiting) = &self.waiting
+                && !waiting.submitted
+                && next.is_none_or(|event| event.tick >= waiting.line)
+                && self.timebase.time_of(waiting.line) <= limit
             {
                 self.finish_switch()?;
                 continue;
@@ -367,17 +403,18 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Playback has reached the bar line where the playing snapshot took
-    /// over. Ends the notes of tracks that changed or went away, and hands
-    /// back the snapshot they came from.
+    /// Submits the forced note-offs before any new events at the boundary.
+    /// Keeps the snapshot pending until actual playback reaches that line.
     fn finish_switch(&mut self) -> Result<(), O::Error> {
-        let Some((line, old)) = self.switch.take() else {
+        let Some(waiting) = &self.waiting else {
             return Ok(());
         };
+        let line = waiting.line;
         let at = self.timebase.time_of(line);
-        for track in &old.tracks {
+        for index in 0..self.project.tracks.len() {
+            let track = &self.project.tracks[index];
             // A muted track has no notes of its own to end.
-            if track.muted || carries_on(track, &self.project) {
+            if track.muted || carries_on(track, &self.waiting.as_ref().unwrap().project) {
                 continue;
             }
             let port = track.target.port;
@@ -395,8 +432,20 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 self.emit(message)?;
             }
         }
-        self.link.retire(old);
+        self.waiting.as_mut().unwrap().submitted = true;
         Ok(())
+    }
+
+    /// Only delivery, not early submission, makes a switch irreversible.
+    fn complete_switch(&mut self, now: Instant) {
+        if self
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.submitted && self.timebase.time_of(waiting.line) <= now)
+        {
+            let waiting = self.waiting.take().unwrap();
+            self.adopt(waiting.project);
+        }
     }
 
     /// Sends one rendered event and keeps track of the notes it starts and
@@ -470,8 +519,8 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             if let Some(event) = self.rendered.first() {
                 wake = wake.min(self.timebase.time_of(event.tick));
             }
-            if let Some((line, _)) = &self.switch {
-                wake = wake.min(self.timebase.time_of(*line));
+            if let Some(waiting) = &self.waiting {
+                wake = wake.min(self.timebase.time_of(waiting.line));
             }
         }
         wake
@@ -776,6 +825,192 @@ mod tests {
     }
 
     #[test]
+    fn tempo_changes_preserve_position_and_retime_the_lookahead_in_both_directions() {
+        for scheduled in [false, true] {
+            for (tempo, first, second) in [
+                (
+                    240.0,
+                    Duration::from_micros(106_250),
+                    Duration::from_micros(112_500),
+                ),
+                (60.0, ms(125), ms(150)),
+            ] {
+                // Both the old off and new on at 112.5 ms are already
+                // rendered (and, in scheduled mode, already submitted).
+                let part = track(1, 10, 1920, &[(0, 36, 216), (216, 38, 24)]);
+                let initial = project(vec![part]);
+                let output = if scheduled {
+                    RecordingOutput::scheduled(ms(50))
+                } else {
+                    RecordingOutput::new()
+                };
+                let (mut handle, mut engine) = engine(initial.clone(), output);
+                let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                run_until(&mut engine, origin + ms(100));
+                let at = engine.clock.now();
+                let position = engine.timebase.tick_at(at);
+                assert_eq!(position, Ticks(192));
+                handle.publish(Arc::new(Project {
+                    tempo: Bpm::new(tempo).unwrap(),
+                    ..(*initial).clone()
+                }));
+                assert!(engine.cycle().unwrap());
+                assert_eq!(engine.timebase.tick_at(at), position);
+                assert_eq!(handle.status().position, position);
+                run_until(&mut engine, origin + ms(200));
+                let actual: Vec<_> = engine
+                    .output
+                    .take()
+                    .iter()
+                    .map(|message| (message.at - origin, message.tick))
+                    .collect();
+                assert_eq!(
+                    actual,
+                    [
+                        (Duration::ZERO, Ticks::ZERO),
+                        (first, Ticks(216)),
+                        (first, Ticks(216)),
+                        (second, Ticks(240)),
+                    ],
+                    "tempo {tempo}, scheduled {scheduled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tempo_change_and_stop_in_one_cycle_keep_the_actual_position() {
+        for tempo in [60.0, 240.0, 400.0] {
+            let initial = project(vec![track(1, 10, 1920, &[(0, 60, 240)])]);
+            let (mut handle, mut engine) = engine(initial.clone(), ScheduledOutput::new());
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(110));
+            let position = engine.timebase.tick_at(engine.clock.now());
+            assert_eq!(position, Ticks(211));
+            handle.publish(Arc::new(Project {
+                tempo: Bpm::new(tempo).unwrap(),
+                ..(*initial).clone()
+            }));
+            apply(&mut handle, &mut engine, TransportCommand::Stop);
+            assert_eq!(
+                handle.status(),
+                PlaybackStatus {
+                    state: TransportState::Stopped,
+                    position,
+                }
+            );
+            engine.output.deliver_until(origin + ms(1000));
+            assert!(engine.output.notes.is_empty());
+        }
+    }
+
+    #[test]
+    fn edits_inside_the_lookahead_replace_the_next_playback_bar() {
+        for scheduled in [false, true] {
+            let beat = track(1, 1, 3840, &[(0, 36, 240)]);
+            let held = track(2, 2, 7680, &[(3000, 60, 1680)]);
+            let unchanged = track(3, 3, 7680, &[(3000, 62, 1680)]);
+            let output = if scheduled {
+                RecordingOutput::scheduled(ms(50))
+            } else {
+                RecordingOutput::new()
+            };
+            let (mut handle, mut engine) =
+                engine(project(vec![beat, held.clone(), unchanged.clone()]), output);
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1985));
+            engine.clock.sleep_until(origin + ms(1990));
+            assert_eq!(engine.clock.now(), origin + ms(1990));
+            assert!(
+                engine.cursor > Ticks(3840),
+                "the next bar is already rendered"
+            );
+            let mut muted = (*held).clone();
+            muted.muted = true;
+            handle.publish(project(vec![
+                track(1, 1, 3840, &[(0, 38, 240)]),
+                Arc::new(muted),
+                unchanged,
+            ]));
+            run_until(&mut engine, origin + ms(2500));
+            let future: Vec<_> = sent(&mut engine, origin)
+                .into_iter()
+                .filter(|line| line.starts_with('2'))
+                .collect();
+            assert_eq!(
+                future,
+                ["2s off 60", "2s on 38", "2.125s off 38", "2.4375s off 62"],
+                "scheduled {scheduled}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_or_undo_can_replace_a_switch_already_submitted_for_the_next_bar() {
+        for undo in [false, true] {
+            let initial = project(vec![track(1, 10, 3840, &[(0, 36, 240)])]);
+            let (mut handle, mut engine) =
+                engine(initial.clone(), RecordingOutput::scheduled(ms(50)));
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1985));
+            handle.publish(project(vec![track(1, 10, 3840, &[(0, 38, 240)])]));
+            assert!(engine.cycle().unwrap());
+            assert!(engine.waiting.as_ref().unwrap().submitted);
+            // The original snapshot must survive until delivery, so a later
+            // edit or undo still targets the same upcoming bar.
+            assert!(Arc::ptr_eq(&engine.project, &initial));
+            handle.publish(if undo {
+                initial
+            } else {
+                project(vec![track(1, 10, 3840, &[(0, 40, 240)])])
+            });
+            run_until(&mut engine, origin + ms(2200));
+            let future: Vec<_> = sent(&mut engine, origin)
+                .into_iter()
+                .filter(|line| line.starts_with('2'))
+                .collect();
+            let expected = if undo {
+                ["2s on 36", "2.125s off 36"]
+            } else {
+                ["2s on 40", "2.125s off 40"]
+            };
+            assert_eq!(future, expected);
+        }
+    }
+
+    #[test]
+    fn tempo_changes_retime_a_pending_bar_switch_and_its_forced_note_offs() {
+        let initial = project(vec![track(1, 10, 7680, &[(3000, 60, 1680)])]);
+        let (mut handle, mut engine) = engine(initial, RecordingOutput::scheduled(ms(50)));
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(1980));
+        let edited = project(vec![track(1, 10, 3840, &[(0, 38, 240)])]);
+        handle.publish(edited.clone());
+        assert!(engine.cycle().unwrap());
+        assert!(engine.waiting.as_ref().unwrap().submitted);
+        engine
+            .clock
+            .sleep_until(origin + Duration::from_micros(1987_500));
+        handle.publish(Arc::new(Project {
+            tempo: Bpm::new(60.0).unwrap(),
+            ..(*edited).clone()
+        }));
+        run_until(&mut engine, origin + ms(2400));
+        let actual: Vec<_> = engine
+            .output
+            .take()
+            .iter()
+            .map(|message| (message.at - origin, message.message))
+            .collect();
+        assert_eq!(actual.len(), 4);
+        assert_eq!(actual[1].0, Duration::from_micros(2012_500));
+        assert!(matches!(actual[1].1, MidiMessage::NoteOff { note, .. } if note.get() == 60));
+        assert_eq!(actual[2].0, Duration::from_micros(2012_500));
+        assert!(matches!(actual[2].1, MidiMessage::NoteOn { note, .. } if note.get() == 38));
+        assert_eq!(actual[3].0, Duration::from_micros(2262_500));
+    }
+
+    #[test]
     fn new_snapshots_take_over_at_the_next_bar_line() {
         let kicks = project(vec![track(1, 10, 960, &[(0, 36, 240)])]);
         let first = Arc::downgrade(&kicks);
@@ -1009,33 +1244,36 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_tracking_is_bounded_and_a_dense_tick_is_not_lost() {
+    fn scheduled_tracking_is_bounded_and_a_dense_window_is_not_lost() {
         let count = RENDER_CAPACITY + 10;
         let dense = Arc::new(Track {
             clip: Clip::new(
                 Ticks(1920),
-                vec![
-                    ClipEvent {
-                        start: Ticks(240),
+                (0..count)
+                    .map(|index| ClipEvent {
+                        // Two batches fill the scheduled mirror across
+                        // cycles without growing the render buffer itself.
+                        start: Ticks(if index < count / 2 { 240 } else { 249 }),
                         kind: EventKind::Control {
                             controller: U7::saturating(7),
-                            value: U7::MAX
+                            value: U7::MAX,
                         },
-                    };
-                    count
-                ],
+                    })
+                    .collect(),
             )
             .unwrap(),
             ..(*track(1, 10, 1920, &[])).clone()
         });
         let (mut handle, mut engine) = engine(project(vec![dense]), ScheduledOutput::new());
         let capacity = engine.scheduled.capacity();
+        let render_capacity = engine.rendered.capacity();
         let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
-        run_until(&mut engine, origin + ms(110));
+        run_until(&mut engine, origin + ms(115));
         assert_eq!(engine.scheduled.len(), RENDER_CAPACITY);
         run_until(&mut engine, origin + ms(150));
         engine.output.deliver_until(origin + ms(150));
         assert_eq!(engine.output.delivered.len(), count);
         assert_eq!(engine.scheduled.capacity(), capacity);
+        assert_eq!(engine.rendered.capacity(), render_capacity);
     }
 }
