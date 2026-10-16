@@ -46,6 +46,7 @@ struct SnapshotSwitch {
 struct SubmittedEvent {
     timed: TimedMessage,
     track: Option<TrackId>,
+    cancelled: bool,
 }
 
 /// The engine thread's `SCHED_FIFO` priority on Unix, from 1 to 99.
@@ -101,7 +102,9 @@ pub struct Engine<O, C> {
     sounding: Vec<OwnedNotes>,
     /// Delivered notes, conservatively including note-ons racing cancellation.
     delivered: Vec<OwnedNotes>,
-    /// A bounded mirror of scheduled work, for restoring note state on cancel.
+    /// The last delivered pulse on each port, retained across cancellation.
+    delivered_pulses: Vec<Option<Ticks>>,
+    /// A bounded mirror of scheduled work, for restoring state on cancel.
     scheduled: Vec<SubmittedEvent>,
     /// Rendered events not sent yet, in send order.
     rendered: Vec<RenderedEvent>,
@@ -134,6 +137,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             transport: Transport::new(),
             sounding: vec![OwnedNotes::new(); config.ports.len()],
             delivered: vec![OwnedNotes::new(); config.ports.len()],
+            delivered_pulses: vec![None; config.ports.len()],
             // A full render batch plus one switch's note-offs on every port.
             scheduled: Vec::with_capacity(RENDER_CAPACITY + config.ports.len() * 16 * 128),
             rendered: Vec::with_capacity(RENDER_CAPACITY),
@@ -296,6 +300,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             TransportEffect::Start { at, .. } => {
                 self.restart(at, now, position)?;
                 self.pulses_from = transport::first_pulse(at);
+                self.delivered_pulses.fill(None);
             }
             TransportEffect::Stop => {
                 self.cancel_scheduled(now + Duration::from_nanos(1))?;
@@ -539,6 +544,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         let Some(notes) = self.sounding.get(usize::from(event.port.0)) else {
             return Ok(());
         };
+        if event.message == MidiMessage::TimingClock
+            && self.delivered_pulses[usize::from(event.port.0)]
+                .is_some_and(|tick| event.tick <= tick)
+        {
+            return Ok(());
+        }
         if let MidiMessage::NoteOff { channel, note, .. } = event.message
             && !event
                 .track
@@ -567,6 +578,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 self.scheduled.push(SubmittedEvent {
                     timed: message,
                     track,
+                    cancelled: false,
                 });
                 return Ok(());
             }
@@ -576,15 +588,17 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             self.advance_delivery(now);
         }
         self.delivered[usize::from(message.port.0)].observe(message.message, track);
+        remember_pulse(&mut self.delivered_pulses, &message);
         Ok(())
     }
 
-    /// Advances actual note state as the backend's timestamps elapse.
+    /// Advances delivered notes and clock positions as timestamps elapse.
     fn advance_delivery(&mut self, now: Instant) {
         self.scheduled.retain(|event| {
             let message = &event.timed;
             if message.at <= now {
                 self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
+                remember_pulse(&mut self.delivered_pulses, message);
                 false
             } else {
                 true
@@ -597,7 +611,16 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     /// then might have sounded. Keep those notes until an off ends them;
     /// never assume a removed note-off was delivered.
     fn cancel_scheduled(&mut self, from: Instant) -> Result<(), O::Error> {
-        self.output.cancel_from(from)?;
+        let scheduled = &mut self.scheduled;
+        self.output.cancel_from(from, &mut |message| {
+            // Only clocks need exact delivery accounting. Notes retain the
+            // conservative cleanup below, including racing note-ons.
+            if message.message == MidiMessage::TimingClock
+                && let Some(event) = scheduled.iter_mut().find(|event| event.timed == *message)
+            {
+                event.cancelled = true;
+            }
+        })?;
         let now = self.clock.now();
         self.scheduled.retain(|event| {
             let message = &event.timed;
@@ -606,6 +629,12 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                     return true;
                 }
                 self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
+                remember_pulse(&mut self.delivered_pulses, message);
+            } else if message.message == MidiMessage::TimingClock && !event.cancelled {
+                // The backend withdrew every undelivered pulse and reported
+                // each one. This pulse therefore reached the receiver, even
+                // if it raced cancellation. Do not render it a second time.
+                remember_pulse(&mut self.delivered_pulses, message);
             } else if message.at <= now
                 && matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
             {
@@ -638,6 +667,14 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             }
         }
         wake
+    }
+}
+
+/// Retains a port's clock position without allocating on the engine thread.
+fn remember_pulse(pulses: &mut [Option<Ticks>], message: &TimedMessage) {
+    if message.message == MidiMessage::TimingClock {
+        let last = &mut pulses[usize::from(message.port.0)];
+        *last = Some(last.map_or(message.tick, |tick| tick.max(message.tick)));
     }
 }
 
@@ -1616,6 +1653,106 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_clock_counts_survive_both_cancellation_orderings() {
+        for cancel_first in [false, true] {
+            for change in ["panic", "tempo", "bar edit"] {
+                let (mut handle, link) = link(project(vec![]));
+                let origin = Instant::now();
+                let clock = SharedClock {
+                    origin,
+                    nanos: Arc::new(AtomicU64::new(0)),
+                };
+                let mut engine = Engine::new(
+                    link,
+                    ScheduledOutput::new(),
+                    clock,
+                    EngineConfig {
+                        ports: vec![
+                            PortSettings {
+                                clock: true,
+                                ..PortSettings::default()
+                            };
+                            2
+                        ],
+                        realtime: false,
+                        ..EngineConfig::default()
+                    },
+                );
+                handle.command(TransportCommand::Play).unwrap();
+                assert!(engine.cycle().unwrap());
+                // Panic/tempo crosses tick 240; the bar edit crosses tick
+                // 3840. Each pulse is queued but not yet due at cancellation.
+                let (before, after, racing_tick) = if change == "bar edit" {
+                    (1999, 2003, 3840)
+                } else {
+                    (124, 128, 240)
+                };
+                while engine.clock.now() < origin + ms(before - 10) {
+                    assert!(engine.cycle().unwrap());
+                }
+                engine.clock.sleep_until(origin + ms(before));
+                engine.output.deliver_until(engine.clock.now());
+                assert!(
+                    engine
+                        .scheduled
+                        .iter()
+                        .any(|event| event.timed.tick == Ticks(racing_tick))
+                );
+                engine.output.cancel_advance =
+                    Some((engine.clock.clone(), origin + ms(after), cancel_first));
+                match change {
+                    "panic" => handle.command(TransportCommand::Panic).unwrap(),
+                    "tempo" => handle.publish(Arc::new(Project {
+                        tempo: Bpm::new(240.0).unwrap(),
+                        ..Project::default()
+                    })),
+                    "bar edit" => handle.publish(project(vec![track(1, 10, 960, &[(0, 36, 120)])])),
+                    _ => unreachable!(),
+                }
+                assert!(engine.cycle().unwrap());
+                assert!(
+                    engine.output.cancel_advance.is_none(),
+                    "the race must occur"
+                );
+                while engine.clock.now() < origin + ms(after + 100) {
+                    assert!(engine.cycle().unwrap());
+                }
+                engine.output.deliver_until(engine.clock.now());
+                for port in [PortId(0), PortId(1)] {
+                    let delivered: Vec<_> = engine
+                        .output
+                        .delivered
+                        .iter()
+                        .filter(|message| message.port == port)
+                        .copied()
+                        .collect();
+                    let ticks: Vec<_> = pulses(&delivered).iter().map(|pulse| pulse.0).collect();
+                    assert!(ticks.contains(&racing_tick), "the racing pulse must arrive");
+                    assert_eq!(
+                        ticks,
+                        (0..ticks.len() as u64).map(|n| n * 40).collect::<Vec<_>>(),
+                        "{change}, cancellation first: {cancel_first}, {port:?}"
+                    );
+                    assert_eq!(
+                        delivered
+                            .iter()
+                            .filter(|message| matches!(
+                                message.message,
+                                MidiMessage::Start
+                                    | MidiMessage::Stop
+                                    | MidiMessage::Continue
+                                    | MidiMessage::SongPosition(_)
+                            ))
+                            .count(),
+                        1,
+                        "only the initial Start"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn stopping_withdraws_pulses_queued_on_a_scheduled_output() {
         let (mut handle, mut engine) = clocked(project(vec![]), RecordingOutput::scheduled(ms(50)));
         let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
@@ -1733,15 +1870,19 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
+        fn cancel_from(
+            &mut self,
+            from: Instant,
+            cancelled: &mut dyn FnMut(&TimedMessage),
+        ) -> Result<(), Self::Error> {
             if let Some((mut clock, until, cancel_first)) = self.cancel_advance.take() {
                 if cancel_first {
-                    self.queue.cancel_from(from)?;
+                    self.queue.cancel_from(from, cancelled)?;
                 }
                 clock.sleep_until(until);
                 self.deliver_until(clock.now());
             }
-            self.queue.cancel_from(from)
+            self.queue.cancel_from(from, cancelled)
         }
     }
 
@@ -2031,7 +2172,11 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_from(&mut self, _from: Instant) -> Result<(), Infallible> {
+        fn cancel_from(
+            &mut self,
+            _from: Instant,
+            _cancelled: &mut dyn FnMut(&TimedMessage),
+        ) -> Result<(), Infallible> {
             Ok(())
         }
     }

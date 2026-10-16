@@ -160,7 +160,11 @@ mod tests {
             Ok(())
         }
 
-        fn cancel_from(&mut self, _from: Instant) -> Result<(), Infallible> {
+        fn cancel_from(
+            &mut self,
+            _from: Instant,
+            _cancelled: &mut dyn FnMut(&TimedMessage),
+        ) -> Result<(), Infallible> {
             Ok(())
         }
     }

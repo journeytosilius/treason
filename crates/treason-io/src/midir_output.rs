@@ -56,7 +56,11 @@ impl MidiOutput for MidirOutput {
         Ok(())
     }
 
-    fn cancel_from(&mut self, _from: Instant) -> Result<(), Self::Error> {
+    fn cancel_from(
+        &mut self,
+        _from: Instant,
+        _cancelled: &mut dyn FnMut(&TimedMessage),
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }

@@ -53,8 +53,12 @@ impl MidiOutput for AlsaSeqOutput {
     }
 
     #[expect(unused_variables, reason = "not implemented yet")]
-    fn cancel_from(&mut self, from: Instant) -> Result<(), Self::Error> {
-        todo!("remove queued messages at or after from, including flushed events")
+    fn cancel_from(
+        &mut self,
+        from: Instant,
+        cancelled: &mut dyn FnMut(&TimedMessage),
+    ) -> Result<(), Self::Error> {
+        todo!("remove and report queued messages at or after from, including flushed events")
     }
 }
 

@@ -152,6 +152,9 @@ and stops, and the transport tools report that it isn't running.
   from queued work so cancellation still ends every sounding note. It
   samples time again after cancellation and conservatively keeps note-ons
   that could have raced it; a cancelled note-off never proves a note ended.
+  Outputs report exactly which queued messages were withdrawn. The engine
+  retains each port's delivered clock position, including pulses delivered
+  during cancellation, so rebuilding future work never repeats those pulses.
   When submission crosses queued deadlines, it reconciles older deliveries
   before recording the newly submitted message as delivered.
   Its preallocated queue mirror holds a render batch plus a switch's note-offs;
@@ -187,9 +190,9 @@ and stops, and the transport tools report that it isn't running.
   first among the messages on its tick. Play sends them Start. The engine
   flushes Start or Continue and waits at least 1 ms before anchoring playback,
   keeping the first pulse and clip events aligned while receivers prepare.
-  Continue and
-  Locate send a Song Position Pointer and Continue: the receivers resume at
-  the pointer's 16th, the first at or after the position, on the next pulse.
+  Continue and Locate send a Song Position Pointer and Continue: the receivers
+  resume at the pointer's 16th, the first at or after the position, on the
+  next pulse.
   So pulses resume there too, and none come before it. Since receivers
   ignore Song Position Pointer while playing, restarting or locating while
   playing sends Stop first. Stop sends Stop after the note-offs, and so does
