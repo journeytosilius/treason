@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use treason_control::{ExportStore, ProjectName};
 use treason_core::export::{self, ExportError, MAX_EVENTS, MidiExport};
-use treason_core::model::Project;
+use treason_core::midi::MidiMessage;
+use treason_core::model::{OutputTarget, Project};
 use treason_core::time::Ticks;
 use treason_engine::render::render_song;
 use treason_io::smf::{self, Song, SongTrack};
@@ -28,14 +29,38 @@ impl MidiExport for SmfExport {
 
         // A file track for each track that plays, in the project's order.
         let playing: Vec<_> = project.tracks.iter().filter(|track| !track.muted).collect();
-        let position: HashMap<_, _> = playing
-            .iter()
-            .enumerate()
-            .map(|(index, track)| (track.id, index))
-            .collect();
+        let mut position = HashMap::new();
+        let mut first_on_target = HashMap::new();
+        for (index, track) in playing.iter().enumerate() {
+            position.insert(track.id, index);
+            first_on_target.entry(track.target).or_insert(index);
+        }
         let mut messages = vec![Vec::new(); playing.len()];
         for event in events {
-            if let Some(&index) = event.track.and_then(|id| position.get(&id)) {
+            // Keep startup channel setup ahead of every track's notes when
+            // a player merges file tracks in order. This also carries muted
+            // tracks' programs to the first unmuted track on their target.
+            let startup_channel = match event.message {
+                MidiMessage::ProgramChange { channel, .. } if event.tick == Ticks::ZERO => {
+                    Some(channel)
+                }
+                MidiMessage::ControlChange {
+                    channel,
+                    controller,
+                    ..
+                } if event.tick == Ticks::ZERO && matches!(controller.get(), 0 | 32) => {
+                    Some(channel)
+                }
+                _ => None,
+            };
+            let index = match startup_channel {
+                Some(channel) => first_on_target.get(&OutputTarget {
+                    port: event.port,
+                    channel,
+                }),
+                None => event.track.and_then(|id| position.get(&id)),
+            };
+            if let Some(&index) = index {
                 messages[index].push((event.tick, event.message));
             }
         }
@@ -109,7 +134,9 @@ mod tests {
     use midly::num::u15;
     use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
     use treason_core::midi::{Channel, U7};
-    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
+    use treason_core::model::{
+        Clip, ClipEvent, EventKind, OutputTarget, PortId, Program, Track, TrackId,
+    };
     use treason_core::time::Bpm;
 
     use super::*;
@@ -135,7 +162,146 @@ mod tests {
                 channel: Channel::from_number(channel).unwrap(),
             },
             muted: false,
+            program: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
+        }
+    }
+
+    #[test]
+    fn programs_go_first_on_the_tracks_that_play_on_their_channel() {
+        let program = |number| Some(Program::new(U7::new(number).unwrap()));
+        let with = |program, muted, track: Track| Track {
+            program,
+            muted,
+            ..track
+        };
+        let project = Project {
+            tracks: [
+                with(
+                    program(25),
+                    false,
+                    track(1, "drums", 10, 3840, &[(0, 36, 240)]),
+                ),
+                // Muted, so not in the file, but its program sets channel 2
+                // for the sub, which leaves the program to it.
+                with(
+                    program(38),
+                    true,
+                    track(2, "bass", 2, 3840, &[(0, 33, 240)]),
+                ),
+                with(None, false, track(3, "sub", 2, 3840, &[(0, 21, 240)])),
+                // Nothing plays on channel 3 in the file.
+                with(
+                    program(80),
+                    true,
+                    track(4, "lead", 3, 3840, &[(0, 60, 240)]),
+                ),
+            ]
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+            ..Project::default()
+        };
+        let file = SmfExport.export(&project, "jam", 1).unwrap();
+        assert_eq!(
+            tracks(&file)[1..],
+            [
+                vec![
+                    "0 name drums",
+                    "0 pc 25 ch10",
+                    "0 on 36 ch10",
+                    "240 off 36 ch10",
+                    "3840 end"
+                ],
+                vec![
+                    "0 name sub",
+                    "0 pc 38 ch2",
+                    "0 on 21 ch2",
+                    "240 off 21 ch2",
+                    "3840 end"
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn later_unmuted_setters_put_startup_programs_before_shared_channel_notes() {
+        for (msb, lsb) in [
+            (None, None),
+            (Some(1), None),
+            (None, Some(2)),
+            (Some(1), Some(2)),
+        ] {
+            for populated in [false, true] {
+                let mut other_port = track(1, "other port", 2, 3840, &[(0, 48, 240)]);
+                other_port.target.port = PortId(1);
+                let first = track(2, "first", 2, 3840, &[(0, 21, 240)]);
+                let notes = if populated { &[(0, 33, 240)][..] } else { &[] };
+                let mut setter = track(3, "setter", 2, 3840, notes);
+                setter.program = Some(Program {
+                    number: U7::new(33).unwrap(),
+                    bank_msb: msb.map(|value| U7::new(value).unwrap()),
+                    bank_lsb: lsb.map(|value| U7::new(value).unwrap()),
+                });
+                if populated {
+                    let mut events = setter.clip.events().to_vec();
+                    events.extend([
+                        ClipEvent {
+                            start: Ticks::ZERO,
+                            kind: EventKind::Control {
+                                controller: U7::new(1).unwrap(),
+                                value: U7::new(64).unwrap(),
+                            },
+                        },
+                        ClipEvent {
+                            start: Ticks(960),
+                            kind: EventKind::Program {
+                                program: U7::new(34).unwrap(),
+                            },
+                        },
+                    ]);
+                    setter.clip = Clip::new(Ticks(3840), events).unwrap();
+                }
+                let project = Project {
+                    tracks: [other_port, first, setter].map(Arc::new).into(),
+                    ..Project::default()
+                };
+                let file = SmfExport.export(&project, "shared", 1).unwrap();
+                let mut first = vec!["0 name first"];
+                if msb.is_some() {
+                    first.push("0 cc0 1 ch2");
+                }
+                if lsb.is_some() {
+                    first.push("0 cc32 2 ch2");
+                }
+                first.extend(["0 pc 33 ch2", "0 on 21 ch2", "240 off 21 ch2", "3840 end"]);
+                let setter = if populated {
+                    vec![
+                        "0 name setter",
+                        "0 cc1 64 ch2",
+                        "0 on 33 ch2",
+                        "240 off 33 ch2",
+                        "960 pc 34 ch2",
+                        "3840 end",
+                    ]
+                } else {
+                    vec!["0 name setter", "3840 end"]
+                };
+                assert_eq!(
+                    tracks(&file)[1..],
+                    [
+                        vec![
+                            "0 name other port",
+                            "0 on 48 ch2",
+                            "240 off 48 ch2",
+                            "3840 end",
+                        ],
+                        first,
+                        setter,
+                    ],
+                    "banks {msb:?}/{lsb:?}, populated {populated}",
+                );
+            }
         }
     }
 
@@ -184,6 +350,10 @@ mod tests {
                                 channel,
                                 message: MidiMessage::Controller { controller, value },
                             } => format!("cc{controller} {value} ch{}", channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::ProgramChange { program },
+                            } => format!("pc {program} ch{}", channel.as_int() + 1),
                             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                                 format!("name {}", String::from_utf8_lossy(name))
                             }

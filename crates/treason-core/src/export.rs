@@ -124,6 +124,7 @@ mod tests {
                 channel: Channel::from_number(1).unwrap(),
             },
             muted,
+            program: None,
             clip: Clip::new(length, events).unwrap(),
         })
     }

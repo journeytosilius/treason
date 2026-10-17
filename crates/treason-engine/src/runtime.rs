@@ -17,7 +17,7 @@ use treason_core::time::Ticks;
 use crate::clock::Clock;
 use crate::link::EngineLink;
 use crate::notes::{HOLD_PEDALS, OwnedNotes};
-use crate::render::{ClockPulses, RenderedEvent, render_bounded};
+use crate::render::{ClockPulses, Programs, RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{self, Transport, TransportEffect};
 
@@ -555,15 +555,32 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Renders only what fits, preserving a continuation within a tick.
-    /// Both sides of a staged bar use their own snapshot.
+    /// Both sides of a staged bar use their own snapshot. Programs go out
+    /// where playback started, and where the staged snapshot changes them.
     fn render_until(&mut self, index: usize, horizon: Ticks) {
         let port = PortId(index as u16);
         let stream = &mut self.streams[index];
         while stream.cursor < horizon && stream.rendered.len() < stream.rendered.capacity() {
-            let (project, end) = match &self.waiting {
-                Some(waiting) if stream.cursor >= waiting.line => (&waiting.project, horizon),
-                Some(waiting) => (&self.project, horizon.min(waiting.line)),
-                None => (&self.project, horizon),
+            let started = Programs {
+                at: self.started,
+                since: None,
+            };
+            let (project, end, programs) = match &self.waiting {
+                Some(waiting) if stream.cursor >= waiting.line => {
+                    // A switch staged before the first tick was heard
+                    // replaces the snapshot that would have started, so
+                    // all its programs go out where playback starts.
+                    let programs = match waiting.line > self.started {
+                        true => Programs {
+                            at: waiting.line,
+                            since: Some(&self.project),
+                        },
+                        false => started,
+                    };
+                    (&waiting.project, horizon, programs)
+                }
+                Some(waiting) => (&self.project, horizon.min(waiting.line), started),
+                None => (&self.project, horizon, started),
             };
             let clock = ClockPulses {
                 ports: &self.clock_ports,
@@ -572,6 +589,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             stream.render_after = render_bounded(
                 project,
                 clock,
+                Some(programs),
                 port,
                 stream.cursor..end,
                 stream.render_after,
@@ -846,7 +864,7 @@ fn remember_pulse(pulses: &mut [Option<Ticks>], message: &TimedMessage) {
 }
 
 /// Whether `track` carries on in `project` as it was, so its sounding notes
-/// can end as written. A new name or device doesn't matter here.
+/// can end as written. A new name, device or program doesn't matter here.
 fn carries_on(track: &Arc<Track>, project: &Project) -> bool {
     project.tracks.iter().any(|new| {
         Arc::ptr_eq(new, track)
@@ -942,7 +960,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
 
-    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, TrackId};
+    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, Program, TrackId};
     use treason_core::playback::{Playback, PlaybackStatus};
     use treason_core::time::Bpm;
     use treason_io::RecordingOutput;
@@ -984,6 +1002,7 @@ mod tests {
                 channel: Channel::from_number(channel).unwrap(),
             },
             muted: false,
+            program: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
         })
     }
@@ -1118,6 +1137,12 @@ mod tests {
                 channel.number(),
                 controller.get(),
                 value.get()
+            ),
+            MidiMessage::ProgramChange { channel, program } => format!(
+                "port {} channel {} pc {}",
+                sent.port.0,
+                channel.number(),
+                program.get()
             ),
             MidiMessage::TimingClock => "clock".to_owned(),
             MidiMessage::SongPosition(beats) => format!("SPP {}", beats.get()),
@@ -1401,6 +1426,101 @@ mod tests {
         assert_eq!(actual[2].0, Duration::from_micros(2_012_500));
         assert!(matches!(actual[2].1, MidiMessage::NoteOn { note, .. } if note.get() == 38));
         assert_eq!(actual[3].0, Duration::from_micros(2_262_500));
+    }
+
+    #[test]
+    fn programs_go_out_on_play_where_an_edit_changes_them_and_after_a_jump() {
+        let with = |track: &Arc<Track>, number| {
+            Arc::new(Track {
+                program: Some(Program::new(U7::new(number).unwrap())),
+                ..(**track).clone()
+            })
+        };
+        let lead = with(&track(1, 1, 960, &[(0, 60, 240)]), 5);
+        let bass = with(&track(2, 2, 960, &[(480, 36, 240)]), 33);
+        let (mut handle, mut engine) = engine(
+            project(vec![lead.clone(), bass.clone()]),
+            RecordingOutput::new(),
+        );
+        let shown = |lines: Vec<String>| -> Vec<String> {
+            let shown = |line: &String| line.contains(" pc ") || line.ends_with("on 60");
+            lines.into_iter().filter(shown).collect()
+        };
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(600));
+        // The bass changes its sound; the lead keeps its own.
+        handle.publish(project(vec![lead, with(&bass, 34)]));
+        run_until(&mut engine, origin + ms(2100));
+        assert_eq!(
+            shown(sent(&mut engine, origin)),
+            [
+                "0ns port 0 channel 1 pc 5",
+                "0ns port 0 channel 2 pc 33",
+                "0ns on 60",
+                "500ms on 60",
+                "1s on 60",
+                "1.5s on 60",
+                "2s port 0 channel 2 pc 34",
+                "2s on 60",
+            ]
+        );
+        // A jump sets every program again where playback goes on.
+        let jumped = apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(960)),
+        );
+        run_until(&mut engine, jumped + ms(100));
+        assert_eq!(
+            shown(sent(&mut engine, jumped)),
+            [
+                "0ns port 0 channel 1 pc 5",
+                "0ns port 0 channel 2 pc 34",
+                "0ns on 60",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_before_the_first_tick_still_sends_every_program_there() {
+        let with = |track: Arc<Track>, number| {
+            Arc::new(Track {
+                program: Some(Program::new(U7::new(number).unwrap())),
+                ..(*track).clone()
+            })
+        };
+        let lead = with(track(1, 1, 960, &[(0, 60, 240)]), 5);
+        let bass = with(track(2, 2, 960, &[(480, 36, 240)]), 33);
+        // Clock receivers get a moment to prepare, so playback starts a
+        // little after the command, on a bar line here.
+        let (mut handle, mut engine) = clocked(
+            project(vec![lead.clone(), bass.clone()]),
+            RecordingOutput::new(),
+        );
+        apply(
+            &mut handle,
+            &mut engine,
+            TransportCommand::Locate(Ticks(3840)),
+        );
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Continue);
+        // An edit the engine sees while they prepare takes effect at the
+        // next bar line after the ticks heard so far: where playback starts.
+        handle.publish(project(vec![lead, with(bass, 34)]));
+        engine.check_snapshot(origin).unwrap();
+        assert_eq!(
+            engine.waiting.as_ref().map(|waiting| waiting.line),
+            Some(Ticks(3840))
+        );
+        run_until(&mut engine, origin + ms(100));
+        let programs: Vec<String> = sent(&mut engine, origin)
+            .into_iter()
+            .filter(|line| line.contains(" pc "))
+            .map(|line| line.split_once(' ').unwrap().1.to_owned())
+            .collect();
+        assert_eq!(
+            programs,
+            ["port 0 channel 1 pc 5", "port 0 channel 2 pc 34"]
+        );
     }
 
     #[test]
@@ -3130,6 +3250,7 @@ mod tests {
             ] {
                 let count = first + second;
                 let dense = Arc::new(Track {
+                    program: None,
                     clip: Clip::new(
                         Ticks(1920),
                         (0..count)

@@ -7,8 +7,9 @@ synths and other sequencers. It makes no sound itself.
 
 Status: early. `treason serve` plays what an agent writes on the MIDI ports
 in `treason.toml`: drum parts as step patterns, melodic parts as notes with
-pitch names such as `C4`, and controls such as a synth's mod wheel or
-filter cutoff as values that jump or ramp. Ports with `clock = true` get
+pitch names such as `C4`, controls such as a synth's mod wheel or filter
+cutoff as values that jump or ramp, and each track's sound as a program,
+such as `electric_bass_finger` from the General MIDI set. Ports with `clock = true` get
 MIDI clock and Start, Stop and Continue, so their gear plays along. A
 port's `latency_ms` makes up for its gear's delay, so everything sounds
 together. On Linux, `backend = "alsa-seq"` hands messages to the kernel's
@@ -69,7 +70,8 @@ Ctrl-C or SIGTERM stops `treason serve`, and every sounding note ends first.
 The project lives in memory until an agent saves it, so ask for a save
 before you stop: `save_project` writes it to `projects/<name>.toml`, and
 `load_project` or `serve --project` brings it back with its tempo, time
-signature and tracks, each with its clip, port, channel, device and mute.
+signature and tracks, each with its clip, port, channel, device, program
+and mute.
 `status` says whether there are unsaved changes.
 
 A track can also move its gear's controls (MIDI CC) with `set_controls`,

@@ -826,6 +826,7 @@ mod tests {
             default_channel: Channel::from_number(1).unwrap(),
             voices: BTreeMap::new(),
             aliases: BTreeMap::new(),
+            programs: BTreeMap::new(),
             params: BTreeMap::from([
                 ("filter".into(), param(74)),
                 ("wheel".into(), param(1)),

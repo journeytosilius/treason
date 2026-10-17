@@ -74,6 +74,19 @@ cy = "crash"
 rd = "ride"
 cb = "cowbell"
 
+# Drum kits, by program, in the General MIDI 2 and Roland GS sound sets.
+# A General MIDI Level 1 device has one kit and ignores them.
+[programs]
+standard_kit = 0
+room_kit = 8
+power_kit = 16
+electronic_kit = 24
+tr_808_kit = 25
+jazz_kit = 32
+brush_kit = 40
+orchestra_kit = 48
+sfx_kit = 56
+
 # Parameters name controllers (CC). On this device's tracks they come first,
 # and the standard names, such as modulation (1) or cutoff (74), work too.
 [params]

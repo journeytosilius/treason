@@ -254,6 +254,7 @@ mod tests {
                     channel: Channel::DRUMS,
                 },
                 muted: false,
+                program: None,
                 clip: Clip::new(
                     Ticks::quarters(1),
                     vec![ClipEvent {

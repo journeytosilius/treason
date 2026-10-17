@@ -2,14 +2,15 @@
 //!
 //! Designed for the model rather than mirroring the core types: channels
 //! count from 1, positions are bars and beats, notes go by voice or pitch
-//! name, patterns are step strings, and controls go by name. The doc
-//! comments become the descriptions in the tools' JSON schemas, so they are
-//! written for the agent.
+//! name, patterns are step strings, and controls and programs go by name.
+//! The doc comments become the descriptions in the tools' JSON schemas, so
+//! they are written for the agent.
 
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use treason_core::midi::U7;
 use treason_core::model::{Clip, EventKind, PortId, Project, Track};
 use treason_core::playback::{PlaybackStatus, TransportState};
 use treason_core::time::{PPQN, Ticks};
@@ -18,6 +19,7 @@ use treason_devices::{DeviceProfile, DeviceRegistry};
 use crate::controls;
 use crate::notation;
 use crate::pattern::{self, StepPattern};
+use crate::programs;
 
 /// The project.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
@@ -59,6 +61,16 @@ pub struct TrackView {
     pub port: String,
     /// The MIDI channel, 1-16.
     pub channel: u8,
+    /// The sound its channel is set to: the device's name for the program,
+    /// or its number. Missing when the track sets none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<ProgramRef>,
+    /// Bank select MSB, sent before a program shown by number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_msb: Option<u8>,
+    /// Bank select LSB, sent before a program shown by number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_lsb: Option<u8>,
     /// A muted track plays nothing.
     pub muted: bool,
     /// The length of the track's loop, in beats.
@@ -91,12 +103,22 @@ impl TrackView {
             Some(_) => None,
         };
         let controls = Some(ControlView::all(&track.clip, device)).filter(|all| !all.is_empty());
+        let (program, bank_msb, bank_lsb) = match track.program {
+            Some(program) => {
+                let (program, bank_msb, bank_lsb) = programs::view(program, device);
+                (Some(program), bank_msb, bank_lsb)
+            }
+            None => (None, None, None),
+        };
         Self {
             id: track.id.0,
             name: track.name.clone(),
             device: track.device.clone(),
             port: port_name(ports, track.target.port),
             channel: track.target.channel.number(),
+            program,
+            bank_msb,
+            bank_lsb,
             muted: track.muted,
             loop_beats: beats(track.clip.length()),
             pattern,
@@ -245,8 +267,24 @@ pub struct DeviceView {
     pub voices: BTreeMap<String, u8>,
     /// Other names for voices, such as "bd" for "kick".
     pub aliases: BTreeMap<String, String>,
+    /// Program names, for add_track and edit_track, and the program each
+    /// selects.
+    pub programs: BTreeMap<String, ProgramView>,
     /// Parameter names and their MIDI CC numbers.
     pub params: BTreeMap<String, u8>,
+}
+
+/// A device's program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ProgramView {
+    /// The program number, 0-127.
+    pub program: u8,
+    /// Bank select MSB, sent first, for a program in a bank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_msb: Option<u8>,
+    /// Bank select LSB, sent next, for a program in a bank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bank_lsb: Option<u8>,
 }
 
 impl From<&DeviceProfile> for DeviceView {
@@ -262,6 +300,18 @@ impl From<&DeviceProfile> for DeviceView {
                 .map(|(name, note)| (name.clone(), note.get()))
                 .collect(),
             aliases: profile.aliases.clone(),
+            programs: profile
+                .programs
+                .iter()
+                .map(|(name, program)| {
+                    let view = ProgramView {
+                        program: program.number.get(),
+                        bank_msb: program.bank_msb.map(U7::get),
+                        bank_lsb: program.bank_lsb.map(U7::get),
+                    };
+                    (name.clone(), view)
+                })
+                .collect(),
             params: profile
                 .params
                 .iter()
@@ -361,6 +411,31 @@ pub struct AddTrack {
     pub device: Option<String>,
     /// The MIDI channel, 1-16. Defaults to the device's channel, or 1.
     pub channel: Option<u8>,
+    /// The sound to select on the track's channel: a program number, 0-127,
+    /// or one of the device's programs from list_devices, such as
+    /// "electric_bass_finger" on device "gm". Sent when playback starts,
+    /// after a jump, and at the bar where it changes. Tracks on the same
+    /// port and channel share one program. Without it, the device keeps
+    /// the sound it has.
+    pub program: Option<ProgramRef>,
+    /// Bank select MSB (controller 0), 0-127, sent before a program given
+    /// by number, on gear with banks.
+    pub bank_msb: Option<u8>,
+    /// Bank select LSB (controller 32), 0-127, sent before a program given
+    /// by number, on gear with banks.
+    pub bank_lsb: Option<u8>,
+}
+
+/// A program: its number, or a name from the track's device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ProgramRef {
+    /// A program number, 0-127, as sent. A manual that numbers programs
+    /// from 1 means one more than this.
+    Number(u8),
+    /// One of the device's programs, from list_devices, such as
+    /// "electric_bass_finger".
+    Name(String),
 }
 
 /// Names a track.
@@ -397,6 +472,26 @@ pub struct EditTrack {
     /// Another device profile id, from list_devices. Later set_steps calls
     /// use its voice names; the notes already in the clip stay as they are.
     pub device: Option<String>,
+    /// Another program, as in add_track, or null to stop sending one. Its
+    /// bank comes with it: give bank_msb and bank_lsb again if it needs
+    /// them.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schemars(with = "Option<ProgramRef>")]
+    pub program: Option<Option<ProgramRef>>,
+    /// Bank select MSB (controller 0), 0-127, for the program.
+    pub bank_msb: Option<u8>,
+    /// Bank select LSB (controller 32), 0-127, for the program.
+    pub bank_lsb: Option<u8>,
+}
+
+/// A field that can be null: `None` when it is missing, `Some(None)` when
+/// it is null.
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer).map(Some)
 }
 
 /// Input for set_steps.

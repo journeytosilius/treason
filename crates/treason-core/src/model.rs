@@ -5,6 +5,7 @@
 //! makes publishing a change to the engine a pointer swap, and undo history
 //! costs only the tracks that changed.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
@@ -71,6 +72,23 @@ impl Project {
         let highest = self.tracks.iter().map(|track| track.id.0).max();
         TrackId(highest.map_or(1, |id| id.saturating_add(1)))
     }
+
+    /// Two tracks that set different programs on the same port and channel,
+    /// in project order, if any. A channel plays one program at a time, so
+    /// tracks that share one must agree on it, or leave it to the others.
+    pub fn program_clash(&self) -> Option<(TrackId, TrackId)> {
+        let mut programs = HashMap::new();
+        for track in &self.tracks {
+            let Some(program) = track.program else {
+                continue;
+            };
+            let (first, set) = *programs.entry(track.target).or_insert((track.id, program));
+            if set != program {
+                return Some((first, track.id));
+            }
+        }
+        None
+    }
 }
 
 /// One stream of MIDI to one channel of one device.
@@ -87,8 +105,37 @@ pub struct Track {
     pub target: OutputTarget,
     /// Muted tracks play nothing.
     pub muted: bool,
+    /// The sound its channel plays: sent when playback starts, after a
+    /// jump, and at the bar line where it changes, muted or not. `None`
+    /// leaves the device's sound as it is.
+    pub program: Option<Program>,
     /// What the track loops.
     pub clip: Clip,
+}
+
+/// A sound to select: a program change, after a bank select if the device
+/// has banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Program {
+    /// The program change's value, 0-127, as sent.
+    pub number: U7,
+    /// Bank select's most significant byte, controller 0, sent first if
+    /// set.
+    pub bank_msb: Option<U7>,
+    /// Bank select's least significant byte, controller 32, sent next if
+    /// set.
+    pub bank_lsb: Option<U7>,
+}
+
+impl Program {
+    /// A program with no bank.
+    pub const fn new(number: U7) -> Self {
+        Self {
+            number,
+            bank_msb: None,
+            bank_lsb: None,
+        }
+    }
 }
 
 /// A loop of events.
@@ -324,6 +371,7 @@ mod tests {
                     channel: Channel::DRUMS,
                 },
                 muted: false,
+                program: None,
                 clip: Clip::default(),
             })
         };
@@ -331,5 +379,75 @@ mod tests {
         assert_eq!(project.next_track_id(), TrackId(1));
         project.tracks = vec![track(5), track(2)];
         assert_eq!(project.next_track_id(), TrackId(6));
+    }
+
+    #[test]
+    fn tracks_on_one_channel_agree_on_its_program() {
+        let program = |number| {
+            Some(Program {
+                number: U7::new(number).unwrap(),
+                bank_msb: None,
+                bank_lsb: None,
+            })
+        };
+        let banked = Some(Program {
+            bank_msb: U7::new(1),
+            ..program(5).unwrap()
+        });
+        let track = |id, port, channel, program| {
+            Arc::new(Track {
+                id: TrackId(id),
+                name: format!("track {id}"),
+                device: None,
+                target: OutputTarget {
+                    port: PortId(port),
+                    channel: Channel::from_number(channel).unwrap(),
+                },
+                muted: false,
+                program,
+                clip: Clip::default(),
+            })
+        };
+        for (tracks, clash) in [
+            (vec![], None),
+            (
+                vec![track(1, 0, 1, program(5)), track(2, 0, 1, program(5))],
+                None,
+            ),
+            (vec![track(1, 0, 1, program(5)), track(2, 0, 1, None)], None),
+            (
+                vec![track(1, 0, 1, program(5)), track(2, 0, 2, program(6))],
+                None,
+            ),
+            (
+                vec![track(1, 0, 1, program(5)), track(2, 1, 1, program(6))],
+                None,
+            ),
+            (
+                vec![track(1, 0, 1, program(5)), track(2, 0, 1, program(6))],
+                Some((TrackId(1), TrackId(2))),
+            ),
+            // The bank is part of the sound.
+            (
+                vec![track(1, 0, 1, program(5)), track(2, 0, 1, banked)],
+                Some((TrackId(1), TrackId(2))),
+            ),
+            // Named by the first track to set the channel's program.
+            (
+                vec![
+                    track(3, 0, 1, None),
+                    track(1, 0, 1, program(5)),
+                    track(2, 0, 1, program(5)),
+                    track(4, 0, 1, program(7)),
+                ],
+                Some((TrackId(1), TrackId(4))),
+            ),
+        ] {
+            let project = Project {
+                tracks,
+                ..Project::default()
+            };
+            assert_eq!(project.program_clash(), clash);
+        }
     }
 }

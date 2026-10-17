@@ -27,6 +27,10 @@ pub enum ControlError {
     /// No device profile has this id.
     #[error("there is no device profile `{0}`")]
     UnknownDevice(String),
+    /// Two tracks would set different programs on the same port and
+    /// channel, which plays one program at a time.
+    #[error("tracks {0} and {1} would set different programs on the same port and channel")]
+    ProgramClash(TrackId, TrackId),
     /// Playback refused the request.
     #[error(transparent)]
     Playback(#[from] PlaybackError),
@@ -236,6 +240,10 @@ fn edited(
         Edit::SetClip { track, clip } => track_mut(&mut next, track)?.clip = clip,
         Edit::SetMuted { track, muted } => track_mut(&mut next, track)?.muted = muted,
     }
+    // Edits keep this true, so a clash involves the edited track.
+    if let Some((first, second)) = next.program_clash() {
+        return Err(ControlError::ProgramClash(first, second));
+    }
     Ok(next)
 }
 
@@ -258,8 +266,8 @@ fn track_mut(project: &mut Project, id: TrackId) -> Result<&mut Track, ControlEr
 
 #[cfg(test)]
 mod tests {
-    use treason_core::midi::Channel;
-    use treason_core::model::{Clip, OutputTarget, PortId};
+    use treason_core::midi::{Channel, U7};
+    use treason_core::model::{Clip, OutputTarget, PortId, Program};
     use treason_core::time::Bpm;
 
     use super::*;
@@ -294,6 +302,7 @@ mod tests {
                 channel: Channel::DRUMS,
             },
             muted: false,
+            program: None,
             clip: Clip::default(),
         }
     }
@@ -367,6 +376,32 @@ mod tests {
 
         assert!(session.undo());
         assert_eq!(session.project().tracks[0].name, "track 1");
+    }
+
+    #[test]
+    fn tracks_on_one_channel_cannot_set_different_programs() {
+        let with_program = |id, number| Track {
+            program: Some(Program::new(U7::new(number).unwrap())),
+            ..track(id)
+        };
+        let mut session = session(vec![with_program(1, 5), track(2)]);
+        let clash = Err(ControlError::ProgramClash(TrackId(1), TrackId(3)));
+        assert_eq!(session.apply(Edit::AddTrack(with_program(3, 6))), clash);
+        let clash = Err(ControlError::ProgramClash(TrackId(1), TrackId(2)));
+        assert_eq!(session.apply(Edit::ReplaceTrack(with_program(2, 6))), clash);
+        assert_eq!(session.project().tracks.len(), 2);
+
+        // The same program, or moving to another channel, is fine.
+        session.apply(Edit::AddTrack(with_program(3, 5))).unwrap();
+        let mut moved = with_program(2, 6);
+        moved.target.channel = Channel::from_number(2).unwrap();
+        session.apply(Edit::ReplaceTrack(moved)).unwrap();
+        // A track alone with its program on a channel can change it.
+        session.apply(Edit::RemoveTrack(TrackId(3))).unwrap();
+        session
+            .apply(Edit::ReplaceTrack(with_program(1, 7)))
+            .unwrap();
+        assert_eq!(session.project().program_clash(), None);
     }
 
     #[test]
