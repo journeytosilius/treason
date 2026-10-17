@@ -7,7 +7,8 @@
 
 use thiserror::Error;
 
-use crate::model::Project;
+use crate::midi::U7;
+use crate::model::{EventKind, Project};
 
 /// The most bars an export may span.
 pub const MAX_BARS: u32 = 1000;
@@ -69,7 +70,12 @@ fn cycle_bars(project: &Project) -> Option<u32> {
     let limit = bar * u64::from(MAX_BARS);
     let mut cycle = bar;
     let playing = project.tracks.iter().filter(|track| !track.muted);
-    for track in playing.filter(|track| !track.clip.events().is_empty()) {
+    for track in playing.filter(|track| {
+        track.clip.events().iter().any(|event| match event.kind {
+            EventKind::Note { velocity, .. } => velocity != U7::MIN,
+            EventKind::Control { .. } | EventKind::Program { .. } => true,
+        })
+    }) {
         let length = track.clip.length().0;
         cycle = (cycle / gcd(cycle, length)).checked_mul(length)?;
         if cycle > limit {
@@ -217,5 +223,80 @@ mod tests {
             vec![track(1, Ticks(u64::MAX / 2), false, false)],
         );
         assert_eq!(bars(&huge, None), Err(ExportError::NoCycle));
+    }
+
+    #[test]
+    fn silent_clips_do_not_extend_the_default_cycle() {
+        // This clip would need 3,839 bars to meet a 4/4 bar line, but its
+        // velocity-zero note emits no messages.
+        let mut silent = track(2, Ticks(3839), false, true);
+        Arc::make_mut(&mut silent).clip = Clip::new(
+            Ticks(3839),
+            vec![ClipEvent {
+                start: Ticks::ZERO,
+                kind: EventKind::Note {
+                    note: U7::new(60).unwrap(),
+                    velocity: U7::MIN,
+                    length: Ticks(1),
+                },
+            }],
+        )
+        .unwrap();
+        let cases = [
+            (
+                "silent track beside a one-bar part",
+                vec![track(1, Ticks::quarters(4), false, false), silent.clone()],
+                1,
+            ),
+            (
+                "silent track beside a three-bar part",
+                vec![silent.clone(), track(1, Ticks::quarters(12), false, false)],
+                3,
+            ),
+            ("wholly silent project", vec![silent], 1),
+        ];
+        for (case, tracks, expected) in cases {
+            assert_eq!(
+                bars(&project(TimeSignature::COMMON, tracks), None),
+                Ok(expected),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_and_program_changes_still_extend_the_default_cycle() {
+        for kind in [
+            EventKind::Control {
+                controller: U7::MIN,
+                value: U7::MIN,
+            },
+            EventKind::Program { program: U7::MIN },
+        ] {
+            let mut messages = track(1, Ticks::quarters(5), false, true);
+            Arc::make_mut(&mut messages).clip = Clip::new(
+                Ticks::quarters(5),
+                vec![
+                    ClipEvent {
+                        start: Ticks::ZERO,
+                        kind: EventKind::Note {
+                            note: U7::new(60).unwrap(),
+                            velocity: U7::MIN,
+                            length: Ticks(1),
+                        },
+                    },
+                    ClipEvent {
+                        start: Ticks(1),
+                        kind,
+                    },
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                bars(&project(TimeSignature::COMMON, vec![messages]), None),
+                Ok(5),
+                "{kind:?}"
+            );
+        }
     }
 }

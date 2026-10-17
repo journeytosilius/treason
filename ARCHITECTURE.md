@@ -353,8 +353,9 @@ saved project. A DAW opens it with each part on its own track.
 - The file plays from bar 1 for a number of bars: by default until every
   loop that plays something ends on the same bar line, so each pattern is
   complete. A one-bar drum loop with a three-bar bass line exports three
-  bars. Loops that take more than 1000 bars to line up need a length, and
-  no export runs longer.
+  bars. Muted tracks, empty clips and clips containing only velocity-zero
+  notes don't extend the cycle. Loops that take more than 1000 bars to
+  line up need a length, and no export runs longer.
 - The engine's `render_song` renders the song with the same code that
   plays it, so the file holds what `play` would send. Notes still sounding
   at the end stop there, and a note started again before it ended gets a
