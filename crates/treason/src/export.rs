@@ -27,11 +27,20 @@ impl MidiExport for SmfExport {
             .map_err(|too_large| ExportError::TooManyEvents(too_large.events))?;
 
         // A file track for each track that plays, in the project's order.
+        // Only programs come from muted tracks: a muted track's program sets
+        // its channel for the tracks that play there too, so it goes to the
+        // first of them, if any.
         let playing: Vec<_> = project.tracks.iter().filter(|track| !track.muted).collect();
-        let position: HashMap<_, _> = playing
+        let position: HashMap<_, _> = project
+            .tracks
             .iter()
-            .enumerate()
-            .map(|(index, track)| (track.id, index))
+            .filter_map(|track| {
+                let home = playing.iter().position(|playing| match track.muted {
+                    true => playing.target == track.target,
+                    false => playing.id == track.id,
+                })?;
+                Some((track.id, home))
+            })
             .collect();
         let mut messages = vec![Vec::new(); playing.len()];
         for event in events {
@@ -109,7 +118,9 @@ mod tests {
     use midly::num::u15;
     use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
     use treason_core::midi::{Channel, U7};
-    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
+    use treason_core::model::{
+        Clip, ClipEvent, EventKind, OutputTarget, PortId, Program, Track, TrackId,
+    };
     use treason_core::time::Bpm;
 
     use super::*;
@@ -135,8 +146,66 @@ mod tests {
                 channel: Channel::from_number(channel).unwrap(),
             },
             muted: false,
+            program: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
         }
+    }
+
+    #[test]
+    fn programs_go_first_on_the_tracks_that_play_on_their_channel() {
+        let program = |number| Some(Program::new(U7::new(number).unwrap()));
+        let with = |program, muted, track: Track| Track {
+            program,
+            muted,
+            ..track
+        };
+        let project = Project {
+            tracks: [
+                with(
+                    program(25),
+                    false,
+                    track(1, "drums", 10, 3840, &[(0, 36, 240)]),
+                ),
+                // Muted, so not in the file, but its program sets channel 2
+                // for the sub, which leaves the program to it.
+                with(
+                    program(38),
+                    true,
+                    track(2, "bass", 2, 3840, &[(0, 33, 240)]),
+                ),
+                with(None, false, track(3, "sub", 2, 3840, &[(0, 21, 240)])),
+                // Nothing plays on channel 3 in the file.
+                with(
+                    program(80),
+                    true,
+                    track(4, "lead", 3, 3840, &[(0, 60, 240)]),
+                ),
+            ]
+            .into_iter()
+            .map(Arc::new)
+            .collect(),
+            ..Project::default()
+        };
+        let file = SmfExport.export(&project, "jam", 1).unwrap();
+        assert_eq!(
+            tracks(&file)[1..],
+            [
+                vec![
+                    "0 name drums",
+                    "0 pc 25 ch10",
+                    "0 on 36 ch10",
+                    "240 off 36 ch10",
+                    "3840 end"
+                ],
+                vec![
+                    "0 name sub",
+                    "0 pc 38 ch2",
+                    "0 on 21 ch2",
+                    "240 off 21 ch2",
+                    "3840 end"
+                ],
+            ]
+        );
     }
 
     /// A kick every beat, a muted bass, and a lead note held over the bar
@@ -184,6 +253,10 @@ mod tests {
                                 channel,
                                 message: MidiMessage::Controller { controller, value },
                             } => format!("cc{controller} {value} ch{}", channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::ProgramChange { program },
+                            } => format!("pc {program} ch{}", channel.as_int() + 1),
                             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                                 format!("name {}", String::from_utf8_lossy(name))
                             }

@@ -20,7 +20,7 @@ use crate::dto::{
     ProjectList, ProjectView, SaveProject, SetControls, SetMuted, SetNotes, SetSteps, SetTempo,
     SetTimeSignature, StatusView, TrackRef, TrackView,
 };
-use crate::{controls, notes, pattern};
+use crate::{controls, notes, pattern, programs};
 
 /// The guide for agents, `docs/guide.md`, which `get_guide` returns.
 const GUIDE: &str = include_str!("../../../docs/guide.md");
@@ -185,8 +185,27 @@ fn describe(error: ControlError) -> String {
     match error {
         ControlError::UnknownTrack(id) => format!("there is no track {id}; see get_project"),
         ControlError::UnknownDevice(id) => format!("there is no device `{id}`; see list_devices"),
+        ControlError::ProgramClash(first, second) => format!(
+            "tracks {first} and {second} play on the same port and channel, which has one \
+             program: give them the same one, leave it out of one (program null in edit_track \
+             clears it), or move one to another channel"
+        ),
         other => other.to_string(),
     }
+}
+
+/// The profile of the device with `id`, if any.
+fn find_device<'a>(
+    session: &'a Session<Box<dyn Playback + Send>>,
+    id: Option<&str>,
+) -> Result<Option<&'a DeviceProfile>, String> {
+    id.map(|id| {
+        session
+            .devices()
+            .get(id)
+            .ok_or_else(|| describe(ControlError::UnknownDevice(id.to_owned())))
+    })
+    .transpose()
 }
 
 /// A copy of the track with `id`, to edit.
@@ -228,8 +247,9 @@ impl TreasonServer {
     }
 
     /// Lists the device profiles. A track with a device names its notes by
-    /// voice, such as "kick" or "closed_hat", and its controls by parameter,
-    /// such as "cutoff".
+    /// voice, such as "kick" or "closed_hat", its controls by parameter,
+    /// such as "cutoff", and its sound by program, such as
+    /// "electric_bass_finger" on "gm", the General MIDI sounds.
     #[tool(annotations(read_only_hint = true))]
     fn list_devices(&self) -> Json<DeviceList> {
         let devices = self
@@ -417,8 +437,9 @@ impl TreasonServer {
         Ok(format!("The time signature is {time_signature}."))
     }
 
-    /// Adds a track that loops one empty bar. Returns the track: pass its id
-    /// to the other tools.
+    /// Adds a track that loops one empty bar, with a program to set the
+    /// sound of its channel if you like. Returns the track: pass its id to
+    /// the other tools.
     #[tool]
     fn add_track(
         &self,
@@ -426,20 +447,20 @@ impl TreasonServer {
     ) -> Result<Json<TrackView>, String> {
         let port = self.port_id(request.port.as_deref())?;
         let mut session = self.session();
-        let device_channel = match request.device.as_deref() {
-            Some(id) => {
-                let device = session
-                    .devices()
-                    .get(id)
-                    .ok_or_else(|| format!("there is no device `{id}`; see list_devices"))?;
-                Some(device.default_channel)
-            }
-            None => None,
-        };
+        let device = find_device(&session, request.device.as_deref())?;
         let channel = match request.channel {
             Some(number) => parse_channel(number)?,
-            None => device_channel.unwrap_or_default(),
+            None => device
+                .map(|device| device.default_channel)
+                .unwrap_or_default(),
         };
+        let program = programs::requested(
+            request.program.as_ref(),
+            request.bank_msb,
+            request.bank_lsb,
+            device,
+        )
+        .map_err(|error| error.to_string())?;
         let bar = session.project().time_signature.bar_length();
         let track = Track {
             id: session.project().next_track_id(),
@@ -447,6 +468,7 @@ impl TreasonServer {
             device: request.device,
             target: OutputTarget { port, channel },
             muted: false,
+            program,
             clip: Clip::new(bar, Vec::new()).map_err(|error| error.to_string())?,
         };
         let view = TrackView::new(&track, &self.ports, session.devices());
@@ -454,9 +476,9 @@ impl TreasonServer {
         Ok(Json(view))
     }
 
-    /// Renames a track or moves it to another port, channel or device, as
-    /// one edit. Its clip stays as it is. While playing, the change takes
-    /// effect at the next bar. Returns the track.
+    /// Renames a track, moves it to another port, channel or device, or
+    /// changes its program, as one edit. Its clip stays as it is. While
+    /// playing, the change takes effect at the next bar. Returns the track.
     #[tool]
     fn edit_track(
         &self,
@@ -468,9 +490,21 @@ impl TreasonServer {
             port,
             channel,
             device,
+            program,
+            bank_msb,
+            bank_lsb,
         } = request;
-        if name.is_none() && port.is_none() && channel.is_none() && device.is_none() {
-            return Err("give at least one of name, port, channel or device to change".into());
+        let banked = bank_msb.is_some() || bank_lsb.is_some();
+        let unchanged = [
+            name.is_none(),
+            port.is_none(),
+            channel.is_none(),
+            device.is_none(),
+        ];
+        if unchanged.into_iter().all(|unchanged| unchanged) && program.is_none() && !banked {
+            return Err(
+                "give at least one of name, port, channel, device or program to change".into(),
+            );
         }
         let port = port
             .as_deref()
@@ -490,6 +524,19 @@ impl TreasonServer {
         }
         if device.is_some() {
             edited.device = device;
+        }
+        // Names are the track's device's, the new one if it changes.
+        let profile = find_device(&session, edited.device.as_deref())?;
+        let requested = programs::requested(
+            program.as_ref().and_then(Option::as_ref),
+            bank_msb,
+            bank_lsb,
+            profile,
+        )
+        .map_err(|error| error.to_string())?;
+        // Missing keeps the program; null clears it.
+        if program.is_some() {
+            edited.program = requested;
         }
         let view = TrackView::new(&edited, &self.ports, session.devices());
         session
@@ -655,9 +702,9 @@ impl TreasonServer {
 makes no sound itself. Call get_guide once before you start: it explains how everything works, \
 with examples of every call. A project has a tempo, a time signature and tracks. Each track \
 loops its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
-Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
-set_notes for melodic parts, set_controls for modulation and other controls (MIDI CC), then \
-play. Edits apply while playing: tempo at once, everything else at the next bar. undo reverts an \
+Typical flow: list_devices and list_ports, add_track with a device and a program for its \
+sound, set_steps for drums or set_notes for melodic parts, set_controls for modulation and \
+other controls (MIDI CC), then play. Edits apply while playing: tempo at once, everything else at the next bar. undo reverts an \
 edit. save_project keeps the work under a name, and load_project brings it back; status says \
 whether there are unsaved changes. export_midi writes a MIDI file that a DAW can open."
 )]
@@ -678,7 +725,7 @@ mod tests {
     use treason_devices::DeviceRegistry;
 
     use super::*;
-    use crate::dto::{NoteRef, NoteSpec, Ramp};
+    use crate::dto::{NoteRef, NoteSpec, ProgramRef, ProgramView, Ramp};
 
     /// Accepts everything and plays nothing.
     struct Silent;
@@ -942,6 +989,9 @@ mod tests {
             port: None,
             device: Some("gm-drums".into()),
             channel: None,
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
         };
         let Json(track) = server.add_track(Parameters(request)).unwrap();
         assert_eq!(
@@ -969,6 +1019,9 @@ mod tests {
             port: Some("nowhere".into()),
             device: None,
             channel: None,
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
         };
         let Err(error) = server.add_track(Parameters(request)) else {
             panic!("added a track on a port that doesn't exist");
@@ -995,6 +1048,9 @@ mod tests {
             port: None,
             device: device.map(str::to_owned),
             channel: None,
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
         };
         server.add_track(Parameters(request)).unwrap().0.id
     }
@@ -1174,6 +1230,7 @@ mod tests {
                 default_channel: Channel::from_number(1).unwrap(),
                 voices: BTreeMap::from([(voice.into(), U7::new(40).unwrap())]),
                 aliases,
+                programs: BTreeMap::new(),
                 params: BTreeMap::new(),
             };
             device.validate().unwrap();
@@ -1494,6 +1551,9 @@ mod tests {
             port: Some("synth".into()),
             channel: Some(11),
             device: None,
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
         };
         let Json(view) = server.edit_track(Parameters(request)).unwrap();
         assert_eq!(
@@ -1521,6 +1581,9 @@ mod tests {
             port: None,
             channel: None,
             device: None,
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
         };
         let cases = [
             (unchanged(track), "give at least one"),
@@ -1560,6 +1623,237 @@ mod tests {
         assert_eq!(server.get_project().0.tracks[0].name, "drums");
     }
 
+    /// A track called `name` on `channel` of device `gm`, with `program`.
+    fn add_sound(server: &TreasonServer, name: &str, channel: u8, program: ProgramRef) -> u32 {
+        let request = AddTrack {
+            name: name.into(),
+            port: None,
+            device: Some("gm".into()),
+            channel: Some(channel),
+            program: Some(program),
+            bank_msb: None,
+            bank_lsb: None,
+        };
+        server.add_track(Parameters(request)).unwrap().0.id
+    }
+
+    /// An edit of `track`'s program, and nothing else.
+    fn reprogram(
+        track: u32,
+        program: Option<Option<ProgramRef>>,
+        bank_msb: Option<u8>,
+    ) -> EditTrack {
+        EditTrack {
+            track,
+            name: None,
+            port: None,
+            channel: None,
+            device: None,
+            program,
+            bank_msb,
+            bank_lsb: None,
+        }
+    }
+
+    #[test]
+    fn tracks_pick_their_sound_by_program_name_or_number() {
+        let server = server();
+        let name = |name: &str| ProgramRef::Name(name.into());
+        let bass = add_sound(&server, "bass", 2, name("electric_bass_finger"));
+        let shown = |server: &TreasonServer| {
+            let track = server.get_project().0.tracks[0].clone();
+            (track.program, track.bank_msb, track.bank_lsb)
+        };
+        assert_eq!(
+            shown(&server),
+            (Some(name("electric_bass_finger")), None, None)
+        );
+
+        let cases = [
+            // A number reads back by the device's name for it.
+            (
+                reprogram(bass, Some(Some(ProgramRef::Number(34))), None),
+                (Some(name("electric_bass_pick")), None, None),
+            ),
+            // In a bank, it's another sound, so it stays a number.
+            (
+                reprogram(bass, Some(Some(ProgramRef::Number(34))), Some(3)),
+                (Some(ProgramRef::Number(34)), Some(3), None),
+            ),
+            // Leaving the program out keeps it.
+            (
+                EditTrack {
+                    name: Some("low end".into()),
+                    ..reprogram(bass, None, None)
+                },
+                (Some(ProgramRef::Number(34)), Some(3), None),
+            ),
+            (reprogram(bass, Some(None), None), (None, None, None)),
+        ];
+        for (request, expected) in cases {
+            let Json(view) = server.edit_track(Parameters(request)).unwrap();
+            assert_eq!((view.program, view.bank_msb, view.bank_lsb), expected);
+            assert_eq!(shown(&server), expected);
+        }
+        server.undo();
+        assert_eq!(
+            shown(&server),
+            (Some(ProgramRef::Number(34)), Some(3), None)
+        );
+
+        // A track on the same channel can leave the program to the first.
+        let double = AddTrack {
+            name: "double".into(),
+            port: None,
+            device: None,
+            channel: Some(2),
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
+        };
+        assert!(server.add_track(Parameters(double)).is_ok());
+
+        let Json(devices) = server.list_devices();
+        let gm = devices
+            .devices
+            .iter()
+            .find(|device| device.id == "gm")
+            .unwrap();
+        let program = |program| ProgramView {
+            program,
+            bank_msb: None,
+            bank_lsb: None,
+        };
+        assert_eq!(gm.programs.len(), 128);
+        assert_eq!(gm.programs["electric_bass_finger"], program(33));
+        assert_eq!(gm.programs["gunshot"], program(127));
+    }
+
+    #[test]
+    fn bad_programs_say_how_to_fix_the_call() {
+        let server = server();
+        let lead = add_sound(&server, "lead", 1, ProgramRef::Name("lead_1_square".into()));
+        let drums = add(&server, None);
+        let named = |name: &str| Some(Some(ProgramRef::Name(name.into())));
+        let cases = [
+            // The same channel can have only one program.
+            (
+                AddTrack {
+                    name: "other".into(),
+                    port: None,
+                    device: Some("gm".into()),
+                    channel: Some(1),
+                    program: Some(ProgramRef::Number(81)),
+                    bank_msb: None,
+                    bank_lsb: None,
+                },
+                "tracks 1 and 3 play on the same port and channel",
+            ),
+            (
+                AddTrack {
+                    name: "other".into(),
+                    port: None,
+                    device: Some("gm".into()),
+                    channel: Some(3),
+                    program: Some(ProgramRef::Name("electric_bass".into())),
+                    bank_msb: None,
+                    bank_lsb: None,
+                },
+                "gm has no program `electric_bass`; similar ones are",
+            ),
+            (
+                AddTrack {
+                    name: "other".into(),
+                    port: None,
+                    device: None,
+                    channel: Some(3),
+                    program: None,
+                    bank_msb: Some(1),
+                    bank_lsb: None,
+                },
+                "give the program too",
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.add_track(Parameters(request)));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        let cases = [
+            (reprogram(lead, None, Some(1)), "give the program too"),
+            (reprogram(lead, Some(None), Some(1)), "give the program too"),
+            (
+                reprogram(lead, Some(Some(ProgramRef::Number(128))), None),
+                "a manual that numbers programs 1-128",
+            ),
+            (
+                reprogram(lead, named("lead_2_sawtooth"), Some(1)),
+                "brings its own bank",
+            ),
+            (
+                reprogram(drums, named("lead_2_sawtooth"), None),
+                "the track has no device to name programs",
+            ),
+            // Names go by the device the edit gives the track.
+            (
+                EditTrack {
+                    device: Some("gm-drums".into()),
+                    ..reprogram(lead, named("lead_2_sawtooth"), None)
+                },
+                "gm-drums has no program `lead_2_sawtooth`",
+            ),
+            (
+                EditTrack {
+                    device: Some("nope".into()),
+                    ..reprogram(lead, named("lead_2_sawtooth"), None)
+                },
+                "there is no device `nope`",
+            ),
+            (
+                EditTrack {
+                    channel: Some(1),
+                    ..reprogram(drums, Some(Some(ProgramRef::Number(81))), None)
+                },
+                "tracks 1 and 2 play on the same port and channel",
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.edit_track(Parameters(request)));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        let Json(project) = server.get_project();
+        let programs: Vec<_> = project
+            .tracks
+            .iter()
+            .map(|track| track.program.clone())
+            .collect();
+        assert_eq!(
+            programs,
+            [Some(ProgramRef::Name("lead_1_square".into())), None],
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn edit_track_tells_a_null_program_from_a_missing_one() {
+        let edit = |json: &str| serde_json::from_str::<EditTrack>(json).unwrap().program;
+        assert_eq!(edit(r#"{"track": 1}"#), None);
+        assert_eq!(edit(r#"{"track": 1, "program": null}"#), Some(None));
+        assert_eq!(
+            edit(r#"{"track": 1, "program": 5}"#),
+            Some(Some(ProgramRef::Number(5)))
+        );
+        assert_eq!(
+            edit(r#"{"track": 1, "program": "pad_2_warm"}"#),
+            Some(Some(ProgramRef::Name("pad_2_warm".into())))
+        );
+        let schema = serde_json::to_value(schemars::schema_for!(EditTrack)).unwrap();
+        let program = schema["properties"]["program"].to_string();
+        assert!(
+            program.contains("null"),
+            "agents must see that null is allowed: {program}"
+        );
+    }
+
     fn save(name: Option<&str>, overwrite: bool) -> Parameters<SaveProject> {
         Parameters(SaveProject {
             name: name.map(str::to_owned),
@@ -1590,6 +1884,9 @@ mod tests {
             port: Some("synth".into()),
             device: None,
             channel: Some(2),
+            program: Some(ProgramRef::Number(38)),
+            bank_msb: Some(121),
+            bank_lsb: Some(1),
         };
         let bass = server.add_track(Parameters(request)).unwrap().0.id;
         server

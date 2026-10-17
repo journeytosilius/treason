@@ -27,7 +27,7 @@ set_steps {"track": 1, "steps": {
   "snare":      "....x.......x...",
   "closed_hat": "..x...x...x...x."
 }}
-add_track {"name": "bass", "channel": 2}
+add_track {"name": "bass", "device": "gm", "channel": 2, "program": "electric_bass_finger"}
 set_notes {"track": 2, "notes": [
   {"note": "C2", "start": 0, "length": 0.5},
   {"note": "C2", "start": 1.5, "length": 0.25},
@@ -41,9 +41,10 @@ save_project {"name": "first groove"}
 
 `add_track` returns the new track with its `id`, which the other tools
 take; ids count from 1. The drum track takes its device's channel, 10, and
-both tracks play on the first port, since neither names one. Each step
-string is one bar of sixteenths, and the bass notes end in the first bar,
-so both loops last one bar. Nothing sounds unless the port is connected to
+both tracks play on the first port, since neither names one. The bass picks
+its sound, a fingered electric bass, from the General MIDI programs of
+device `gm`. Each step string is one bar of sixteenths, and the bass notes
+end in the first bar, so both loops last one bar. Nothing sounds unless the port is connected to
 gear: see [Ports and gear](#ports-and-gear).
 
 ## How a project works
@@ -53,8 +54,9 @@ gear: see [Ports and gear](#ports-and-gear).
   same treason shares it, so call `get_project` before you change a track
   you didn't just write.
 - **A track** plays one loop on one MIDI port and channel (1-16). It may
-  name a device profile, so its notes and controls can go by the device's
-  names, and it can be muted.
+  name a device profile, so its notes, controls and programs can go by the
+  device's names, and set a program: the sound its channel plays. It can
+  be muted.
 - **A loop** holds notes and control changes (MIDI CC), and repeats until
   `stop`. Each track's loop has its own length, `loop_beats`. Loops count
   from the start of bar 1, so a two-bar loop plays its first bar on bars 1,
@@ -75,12 +77,13 @@ gear: see [Ports and gear](#ports-and-gear).
 - **Every edit can be undone**, up to 256 of them. Playing, stopping,
   saving and exporting aren't edits.
 
-## Names for notes and controls
+## Names for notes, controls and sounds
 
 `list_devices` shows each device profile: the `id` that `add_track` takes,
 the channel the device listens on, its voices (a MIDI note each, such as
-`kick` = 36), their aliases (`bd` for `kick`) and its params (a CC number
-each, such as `cutoff` = 74).
+`kick` = 36), their aliases (`bd` for `kick`), its programs (a sound each,
+such as `electric_bass_finger` = 33) and its params (a CC number each, such
+as `cutoff` = 74).
 
 treason comes with `gm-drums`, the General MIDI drum map, on channel 10. Its
 voices include `kick`, `acoustic_kick`, `snare`, `electric_snare`, `clap`,
@@ -90,8 +93,13 @@ voices include `kick`, `acoustic_kick`, `snare`, `electric_snare`, `clap`,
 `tambourine`, `cowbell`, `maracas`, `cabasa`, `claves`, bongos, congas,
 timbales, agogos, wood blocks, cuicas and triangles, with the aliases `bd`,
 `sd`, `rs`, `rimshot`, `cp`, `hh`, `ch`, `oh`, `lt`, `mt`, `ht`, `cy`, `rd`
-and `cb`. A profile for other gear is a small file: see
-[Device profiles](#device-profiles).
+and `cb`. Its programs are the drum kits of GM2 and GS gear, such as
+`tr_808_kit`. `gm` names the 128 General MIDI sounds, the programs of GM
+synths and sound fonts: their GM names in lowercase with underscores, such
+as `acoustic_grand_piano`, `electric_piano_1`, `electric_bass_finger`,
+`synth_bass_1`, `string_ensemble_1`, `choir_aahs`, `lead_1_square`,
+`lead_2_sawtooth` and `pad_2_warm`. A profile for other gear is a small
+file: see [Device profiles](#device-profiles).
 
 A note goes by, in this order:
 
@@ -286,6 +294,36 @@ Sustain (64) and sostenuto (66) hold notes on until they are released.
 export release them. Pedals act on the whole channel, so tracks on the
 same channel share them.
 
+## Sounds: programs
+
+A track's `program` picks the sound its channel plays. `add_track` and
+`edit_track` take it as a name from the track's device, such as
+`electric_bass_finger` on `gm`, or as a number, 0-127.
+
+- A number is the one sent. Manuals often count programs from 1, so their
+  program 34 is 33 here.
+- On gear with banks, `bank_msb` and `bank_lsb` (controllers 0 and 32) go
+  with a number; the manual says which the gear reads. A name brings its
+  own bank.
+- treason sends the program, after its bank, where playback starts, after
+  a jump, and at the bar line where an edit changes it, ahead of the notes
+  there. Muted tracks send theirs too, ready for when they play. A track
+  without a program leaves the gear's sound as it is.
+- Tracks on the same port and channel play one sound, so they share one
+  program: set it on one of them, or the same on each.
+- `"program": null` in `edit_track` stops sending one. A new program
+  replaces the bank too.
+
+A pad by name, then a variation of it on GM2 gear, which reads bank 121
+and then the variation; then no program, and an 808 kit for the drums:
+
+```mcp
+add_track {"name": "pad", "device": "gm", "channel": 4, "program": "pad_2_warm"}
+edit_track {"track": 6, "program": 89, "bank_msb": 121, "bank_lsb": 1}
+edit_track {"track": 6, "program": null}
+edit_track {"track": 1, "program": "tr_808_kit"}
+```
+
 ## Tracks
 
 ```mcp
@@ -297,10 +335,11 @@ undo {}
 ```
 
 - `add_track` takes a `name`, and optionally a `device`, a `port` (the
-  first by default) and a `channel` (the device's, else 1). The new track
-  loops one empty bar.
-- `edit_track` renames a track or moves it to another port, channel or
-  device, keeping its loop. A new device renames nothing already written.
+  first by default), a `channel` (the device's, else 1) and a `program`.
+  The new track loops one empty bar.
+- `edit_track` renames a track, moves it to another port, channel or
+  device, or changes its program, keeping its loop. A new device renames
+  nothing already written.
 - `set_muted` silences a track and keeps its loop.
 - `remove_track` deletes it. `undo` brings it back.
 
@@ -351,9 +390,11 @@ get_project {}
 ```
 
 `get_project` shows the tempo, the time signature and every track: its
-id, name, port, channel, device, mute, `loop_beats`, how many events its
-loop holds, and its notes, as steps (`pattern`) or as a list (`notes`),
-and its `controls`, each in the form the matching tool takes. Every tool
+id, name, port, channel, device, program, mute, `loop_beats`, how many
+events its loop holds, and its notes, as steps (`pattern`) or as a list
+(`notes`), and its `controls`, each in the form the matching tool takes. A
+program reads back by the device's name for it, else as a number with its
+bank. Every tool
 that changes a track returns it in the same form, as it will play.
 
 ## Undo, saving and exporting
@@ -398,6 +439,7 @@ load_project {"name": "first groove"}
 | Steps in a step string | 1024 |
 | Points in a control | 8192 |
 | Control changes in a loop | 8192 |
+| Program, `bank_msb`, `bank_lsb` | 0-127 each |
 | Undo history | 256 edits |
 | Project and export names | 64 characters |
 | Saved project file | 16 MiB |
@@ -408,10 +450,12 @@ load_project {"name": "first groove"}
 A refused call changes nothing, and its error says how to fix it, such as
 "there is no track 9; see get_project". The usual causes:
 
-- An unknown name. The error lists the device's voices or params;
-  `list_devices` shows its aliases too. A track without a device takes
-  only numbers, pitch names and standard control names: give it one with
-  `edit_track`.
+- An unknown name. The error lists the device's voices or params, or its
+  programs with similar names; `list_devices` shows its aliases and every
+  program too. A track without a device takes only numbers, pitch names
+  and standard control names: give it one with `edit_track`.
+- A program unlike the one another track on the same port and channel
+  sets.
 - A step string whose length doesn't divide the loop's.
 - Two notes of the same pitch that overlap, or a note that starts outside
   the loop or is longer than it.
@@ -436,7 +480,8 @@ if the user hears nothing:
    machines often use 10.
 
 To hear treason without hardware, connect it to a software synth, such as
-FluidSynth with a General MIDI sound font.
+FluidSynth with a General MIDI sound font, and pick its sounds with device
+`gm`'s programs.
 
 ### treason.toml
 
@@ -489,13 +534,17 @@ closed_hat = 42
 [aliases]                   # other names for voices
 bd = "kick"
 
+[programs]                  # kits or sounds, by the program number sent
+classic_kit = 0
+dusty_kit = { program = 4, bank_msb = 1 }   # in a bank: bank_msb, bank_lsb or both
+
 [params]                    # named controls, with CC numbers from its manual
 kick_decay = { cc = 23 }
 snare_tune = { cc = 20 }
 ```
 
-A synth's profile usually has only params. Names need a letter, since a
-number means a MIDI note or controller. An alias must point to a voice and
+A synth's profile usually has only programs and params. Names need a
+letter, since a number means a MIDI note, controller or program. An alias must point to a voice and
 can't share its name. A param's name wins over a standard name of the
 same spelling. The MIDI Guide (github.com/pencilresearch/midi) lists the
 CC numbers of many synths and drum machines.
@@ -522,12 +571,16 @@ connect Claude Code:
 
 Saved projects are TOML files in the projects directory, `<name>.toml`:
 `format = 1`, the tempo, the time signature, and each track with its port
-by name and its events one to a line, with times in ticks, 960 to a beat.
+by name, its program, and its events one to a line, with times in ticks,
+960 to a beat.
 
 ## Tips
 
 - Ask the user which gear is on which port and channel, and use its device
   profile if there is one: names beat numbers.
+- Leave out the program on gear whose sound the user set up by hand: a
+  program change replaces it. On a General MIDI synth, give every melodic
+  track one from `gm`.
 - Edits land on the next bar line, so a change to a slow loop takes a
   moment to hear.
 - Save after each idea the user likes. `undo` takes back what didn't work.
@@ -537,8 +590,8 @@ by name and its events one to a line, with times in ticks, 960 to a beat.
 
 - Make sound: it only sends MIDI.
 - Record or follow MIDI input, or an external clock.
-- Send program changes, pitch bend, aftertouch, NRPN or SysEx from the
-  tools.
+- Change programs within a loop, or send pitch bend, aftertouch, NRPN or
+  SysEx from the tools.
 - Probability, ratchets or conditional steps.
 - Arrange a song: every track loops. Change sections by editing tracks
   while playing, or by muting and unmuting them.

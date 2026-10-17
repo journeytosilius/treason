@@ -95,10 +95,11 @@ fn list_projects(config: &Config) -> anyhow::Result<()> {
 fn list_devices(config: &Config) -> anyhow::Result<()> {
     for device in config.load_devices()?.iter() {
         println!(
-            "{:<16} {} ({} voices, {} params)",
+            "{:<16} {} ({} voices, {} programs, {} params)",
             device.id,
             device.name,
             device.voices.len(),
+            device.programs.len(),
             device.params.len()
         );
     }

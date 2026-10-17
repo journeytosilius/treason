@@ -487,6 +487,7 @@ mod tests {
                     channel: Channel::DRUMS,
                 },
                 muted: false,
+                program: None,
                 clip: Clip::default(),
             })],
             ..Project::default()

@@ -435,6 +435,7 @@ mod tests {
             default_channel: Channel::from_number(1).unwrap(),
             voices: BTreeMap::from([("A1".to_owned(), U7::new(40).unwrap())]),
             aliases: BTreeMap::new(),
+            programs: BTreeMap::new(),
             params: BTreeMap::new(),
         };
         let notes = [note("A1", 0.0, 1.0), note("A2", 1.0, 1.0)];

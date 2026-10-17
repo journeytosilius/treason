@@ -16,7 +16,7 @@ use thiserror::Error;
 use toml::ser::ValueSerializer;
 use treason_core::midi::{Channel, U7};
 use treason_core::model::{
-    Clip, ClipError, ClipEvent, EventKind, OutputTarget, PortId, Project, Track, TrackId,
+    Clip, ClipError, ClipEvent, EventKind, OutputTarget, PortId, Program, Project, Track, TrackId,
 };
 use treason_core::time::{Bpm, ParseTimeSignatureError, Ticks};
 use treason_devices::DeviceRegistry;
@@ -61,6 +61,12 @@ pub enum FileError {
         /// The device it names.
         device: String,
     },
+    /// A track selects a bank but no program, which bank select needs.
+    #[error("track {0} has a bank but no program")]
+    BankWithoutProgram(TrackId),
+    /// Two tracks set different programs on the same port and channel.
+    #[error("tracks {0} and {1} set different programs on the same port and channel")]
+    ProgramClash(TrackId, TrackId),
     /// A track's clip is invalid.
     #[error("track {track}: {error}")]
     Clip {
@@ -103,6 +109,12 @@ struct TrackFile {
     device: Option<String>,
     port: String,
     channel: Channel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    program: Option<U7>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bank_msb: Option<U7>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bank_lsb: Option<U7>,
     #[serde(default)]
     muted: bool,
     loop_length: Ticks,
@@ -211,6 +223,9 @@ pub fn write(project: &Project, ports: &[String]) -> Result<String, FileError> {
             device: track.device.clone(),
             port: port.clone(),
             channel: track.target.channel,
+            program: track.program.map(|program| program.number),
+            bank_msb: track.program.and_then(|program| program.bank_msb),
+            bank_lsb: track.program.and_then(|program| program.bank_lsb),
             muted: track.muted,
             loop_length: track.clip.length(),
             events: Vec::new(),
@@ -264,11 +279,15 @@ pub fn read(text: &str, ports: &[String], devices: &DeviceRegistry) -> Result<Pr
             read_track(track, ports, devices).map(Arc::new)
         })
         .collect::<Result<_, _>>()?;
-    Ok(Project {
+    let project = Project {
         tempo: file.tempo,
         time_signature,
         tracks,
-    })
+    };
+    if let Some((first, second)) = project.program_clash() {
+        return Err(FileError::ProgramClash(first, second));
+    }
+    Ok(project)
 }
 
 fn read_track(
@@ -292,6 +311,17 @@ fn read_track(
             device: device.clone(),
         });
     }
+    let program = match track.program {
+        Some(number) => Some(Program {
+            number,
+            bank_msb: track.bank_msb,
+            bank_lsb: track.bank_lsb,
+        }),
+        None if track.bank_msb.is_some() || track.bank_lsb.is_some() => {
+            return Err(FileError::BankWithoutProgram(track.id));
+        }
+        None => None,
+    };
     let events = track.events.into_iter().map(ClipEvent::from).collect();
     let clip = Clip::new(track.loop_length, events).map_err(|error| FileError::Clip {
         track: track.id,
@@ -306,6 +336,7 @@ fn read_track(
             channel: track.channel,
         },
         muted: track.muted,
+        program,
         clip,
     })
 }
@@ -371,6 +402,7 @@ mod tests {
                 channel: Channel::DRUMS,
             },
             muted: false,
+            program: None,
             clip: Clip::new(Ticks::quarters(4), events).unwrap(),
         }
     }
@@ -384,6 +416,7 @@ mod tests {
             default_channel: Channel::DRUMS,
             voices: BTreeMap::from([("kick".into(), u7(36))]),
             aliases: BTreeMap::new(),
+            programs: BTreeMap::new(),
             params: BTreeMap::new(),
         });
         devices
@@ -423,6 +456,12 @@ mod tests {
         );
         bass.target.channel = Channel::from_number(2).unwrap();
         bass.muted = true;
+        bass.program = Some(Program {
+            number: u7(33),
+            bank_msb: Some(u7(121)),
+            bank_lsb: Some(u7(0)),
+        });
+        drums.program = Some(Program::new(u7(25)));
         let mut empty = track(7, 0, vec![]);
         empty.clip = Clip::new(Ticks(3360), vec![]).unwrap();
         Project {
@@ -466,6 +505,11 @@ mod tests {
         lead.name = "lead".into();
         lead.target.channel = Channel::from_number(1).unwrap();
         lead.muted = true;
+        lead.program = Some(Program {
+            number: u7(80),
+            bank_msb: None,
+            bank_lsb: Some(u7(2)),
+        });
         let project = Project {
             tempo: Bpm::new(124.0).unwrap(),
             tracks: vec![Arc::new(drums), Arc::new(lead)],
@@ -500,6 +544,8 @@ id = 2
 name = "lead"
 port = "synth"
 channel = 1
+program = 80
+bank_lsb = 2
 muted = true
 loop_length = 3840
 events = [
@@ -589,9 +635,10 @@ events = []
             (
                 track.device.as_deref(),
                 track.muted,
+                track.program,
                 track.clip.events().len()
             ),
-            (None, false, 0)
+            (None, false, None, 0)
         );
         assert_eq!(track.target.channel.number(), 16);
 
@@ -672,6 +719,17 @@ events = []
                     + "[[tracks]]\nid = 1\nname = \"u\"\nport = \"out\"\nchannel = 2\n\
                                     loop_length = 960\n",
                 "there are two tracks 1",
+            ),
+            (file("", "program = 128", ""), "128"),
+            (
+                file("", "bank_lsb = 1", ""),
+                "track 1 has a bank but no program",
+            ),
+            (
+                file("", "program = 5", "")
+                    + "[[tracks]]\nid = 2\nname = \"u\"\nport = \"out\"\nchannel = 1\n\
+                       program = 5\nbank_msb = 1\nloop_length = 960\n",
+                "tracks 1 and 2 set different programs on the same port and channel",
             ),
         ];
         for (text, expected) in cases {

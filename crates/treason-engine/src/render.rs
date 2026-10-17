@@ -1,11 +1,12 @@
 //! Turning clips into MIDI events.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::mem;
 use std::ops::Range;
 
 use thiserror::Error;
 use treason_core::midi::{Channel, MidiMessage, U7};
-use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
+use treason_core::model::{EventKind, PortId, Program, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
 use crate::notes::HOLD_PEDALS;
@@ -13,6 +14,11 @@ use crate::notes::HOLD_PEDALS;
 /// Bank select, the most and least significant bytes. A program change on
 /// the same tick uses them, so they go out before it.
 const BANK_SELECT: [u8; 2] = [0, 32];
+
+/// Places in each pass's render order before a track's clip events: its
+/// bank select's two bytes, so that its program goes out before the clip's
+/// own bank selects and program changes on the same tick.
+const PROGRAM_SLOTS: usize = 2;
 
 /// A message to send at a tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +38,16 @@ pub struct RenderedEvent {
     sequence: (usize, u64, usize),
 }
 
+/// Where the tracks' programs go out, along with a project's clips.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Programs<'a> {
+    /// The tick: where playback starts, or where a new snapshot takes over.
+    pub at: Ticks,
+    /// The snapshot playing until then. Only programs it doesn't already
+    /// set on their port and channel go out. With none, every program does.
+    pub since: Option<&'a Project>,
+}
+
 /// MIDI clock to render along with a project's clips.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ClockPulses<'a> {
@@ -43,13 +59,18 @@ pub struct ClockPulses<'a> {
 }
 
 /// Appends to `out` everything `project` plays in `window`, along with the
-/// pulses of `clock`, in send order.
+/// pulses of `clock` and the tracks' `programs`, in send order.
 ///
 /// Every unmuted track loops its clip from tick 0, so an event at clip
 /// position `p` plays at `p + k × length` for every `k`. A note's note-off
 /// lands at its start plus its length, which may be in a later window: each
 /// window holds the note-offs that fall inside it. Notes with velocity 0
 /// play nothing.
+///
+/// A track's program goes out at `programs.at`, if `window` holds it, as
+/// bank selects and a program change, muted or not. Tracks that share a
+/// port and channel share its program, so only the first track that sets
+/// it sends it.
 ///
 /// Events are ordered by tick. At the same tick, clock pulses come first, so
 /// the tick starts on time, then note-offs, bank selects (controllers 0 and
@@ -58,18 +79,22 @@ pub struct ClockPulses<'a> {
 /// and a note plays with the program and controller values set on its tick.
 /// Within each of those groups, events keep their order, by track and then
 /// as written in the clip, so a sequence such as an RPN's parameter
-/// selection and data entry arrives as written.
+/// selection and data entry arrives as written. A track's program comes
+/// before its clip's events in those groups.
 ///
 /// `out` is reused from window to window. This unbounded entry point may
 /// allocate if its remaining capacity cannot hold the whole window.
 pub fn render(
     project: &Project,
     clock: ClockPulses<'_>,
+    programs: Option<Programs<'_>>,
     window: Range<Ticks>,
     out: &mut Vec<RenderedEvent>,
 ) {
     let first = out.len();
-    visit(project, clock, None, window, |event| out.push(event));
+    visit(project, clock, programs, None, window, |event| {
+        out.push(event)
+    });
     out[first..].sort_unstable_by_key(send_order);
 }
 
@@ -84,8 +109,9 @@ pub struct SongTooLarge {
 }
 
 /// Everything `project` plays from tick 0 until `end`, for a file rather
-/// than a port: [`render`]'s events for that span, without MIDI clock, then
-/// a note-off at `end` for each note still sounding there, by track, then
+/// than a port: [`render`]'s events for that span, with every track's
+/// program at tick 0 and without MIDI clock, then a note-off at `end` for
+/// each note still sounding there, by track, then
 /// channel and note. Every note-on gets its own note-off, even where a
 /// track starts a note that is already sounding. Active sustain and
 /// sostenuto pedals are released after those note-offs, including when
@@ -104,7 +130,17 @@ pub fn render_song(
     }
     // Only a hint, so a count that doesn't fit leaves it to the vector.
     let mut out = Vec::with_capacity(usize::try_from(events).unwrap_or(0));
-    render(project, ClockPulses::default(), Ticks::ZERO..end, &mut out);
+    let programs = Some(Programs {
+        at: Ticks::ZERO,
+        since: None,
+    });
+    render(
+        project,
+        ClockPulses::default(),
+        programs,
+        Ticks::ZERO..end,
+        &mut out,
+    );
 
     // How many times each track's notes are sounding. A note-off ends one
     // of them, so a note started twice needs two.
@@ -146,16 +182,24 @@ pub fn render_song(
     Ok(out)
 }
 
-/// How many events [`render_song`] gives for `project` until `end`: two for
-/// each note, its note-on and note-off, and one for each other event, for
-/// every pass through the loop that starts the event before `end`, plus
-/// the pedal releases returned alongside the count.
+/// How many events [`render_song`] gives for `project` until `end`: the
+/// programs at tick 0, two for each note, its note-on and note-off, and one
+/// for each other event, for every pass through the loop that starts the
+/// event before `end`, plus the pedal releases returned alongside the
+/// count.
 fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
     let mut events = 0_u64;
     // Only the last change on each port/channel/pedal matters. Find it
     // arithmetically so even an oversized song needn't be rendered first.
     // The map holds at most two entries per MIDI output target.
     let mut pedals = BTreeMap::<(PortId, Channel, U7), RenderedEvent>::new();
+    if end != Ticks::ZERO {
+        let programs = Programs {
+            at: Ticks::ZERO,
+            since: None,
+        };
+        visit_programs(project, programs, None, &mut |_| events += 1);
+    }
     for (index, track) in project.tracks.iter().enumerate() {
         if track.muted {
             continue;
@@ -182,7 +226,7 @@ fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
                         controller,
                         value,
                     },
-                    sequence: (index, passes - 1, event_index),
+                    sequence: (index, passes - 1, PROGRAM_SLOTS + event_index),
                 };
                 let previous = pedals
                     .entry((track.target.port, track.target.channel, controller))
@@ -217,6 +261,7 @@ fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
 pub(crate) fn render_bounded(
     project: &Project,
     clock: ClockPulses<'_>,
+    programs: Option<Programs<'_>>,
     port: PortId,
     window: Range<Ticks>,
     after: Option<RenderedEvent>,
@@ -225,7 +270,7 @@ pub(crate) fn render_bounded(
     assert!(out.len() < out.capacity());
     let first = out.len();
     let mut overflow = false;
-    visit(project, clock, Some(port), window, |event| {
+    visit(project, clock, programs, Some(port), window, |event| {
         if after.is_some_and(|after| send_order(&event) <= send_order(&after)) {
             return;
         }
@@ -273,6 +318,7 @@ pub(crate) fn render_bounded(
 fn visit(
     project: &Project,
     clock: ClockPulses<'_>,
+    programs: Option<Programs<'_>>,
     port: Option<PortId>,
     window: Range<Ticks>,
     mut emit: impl FnMut(RenderedEvent),
@@ -281,6 +327,9 @@ fn visit(
         return;
     }
     let wanted = |target: PortId| port.is_none_or(|port| port == target);
+    if let Some(programs) = programs.filter(|programs| window.contains(&programs.at)) {
+        visit_programs(project, programs, port, &mut emit);
+    }
     for tick in clock_pulses(window.start.max(clock.from)..window.end) {
         for &port in clock.ports.iter().filter(|&&port| wanted(port)) {
             emit(RenderedEvent {
@@ -298,6 +347,84 @@ fn visit(
             render_track(index, track, window.clone(), &mut emit);
         }
     }
+}
+
+/// Visits the programs that go out at `programs.at`, on `port` or on every
+/// port: on each channel, the program of the first track there that sets
+/// one, unless `programs.since` already sets it there. Tracks on a channel
+/// agree on its program, so the first says. For one port it takes a pass
+/// over the tracks and allocates nothing, for the engine thread.
+fn visit_programs(
+    project: &Project,
+    programs: Programs<'_>,
+    port: Option<PortId>,
+    emit: &mut impl FnMut(RenderedEvent),
+) {
+    let Some(port) = port else {
+        // Port by port. Only files and tests render every port at once, so
+        // this may allocate.
+        let ports: BTreeSet<_> = project
+            .tracks
+            .iter()
+            .map(|track| track.target.port)
+            .collect();
+        for port in ports {
+            visit_programs(project, programs, Some(port), emit);
+        }
+        return;
+    };
+    let mut playing = [None; 16];
+    for old in programs.since.into_iter().flat_map(|since| &since.tracks) {
+        if old.target.port == port {
+            let program = &mut playing[usize::from(old.target.channel.index())];
+            *program = program.or(old.program);
+        }
+    }
+    let mut sent = [false; 16];
+    for (index, track) in project.tracks.iter().enumerate() {
+        let Some(program) = track.program.filter(|_| track.target.port == port) else {
+            continue;
+        };
+        let channel = usize::from(track.target.channel.index());
+        if mem::replace(&mut sent[channel], true) || playing[channel] == Some(program) {
+            continue;
+        }
+        let pass = programs.at.0 / track.clip.length().0;
+        for (slot, message) in program_messages(track.target.channel, program) {
+            emit(RenderedEvent {
+                tick: programs.at,
+                port,
+                track: Some(track.id),
+                message,
+                sequence: (index, pass, slot),
+            });
+        }
+    }
+}
+
+/// The bank selects and program change that set `program` on `channel`,
+/// each with its place in its track's render order.
+fn program_messages(
+    channel: Channel,
+    program: Program,
+) -> impl Iterator<Item = (usize, MidiMessage)> {
+    let bytes = [program.bank_msb, program.bank_lsb];
+    let banks = BANK_SELECT.into_iter().zip(bytes).enumerate().filter_map(
+        move |(slot, (controller, value))| {
+            let message = MidiMessage::ControlChange {
+                channel,
+                controller: U7::saturating(controller),
+                value: value?,
+            };
+            Some((slot, message))
+        },
+    );
+    let change = MidiMessage::ProgramChange {
+        channel,
+        program: program.number,
+    };
+    // Program changes rank on their own, after every bank select.
+    banks.chain([(0, change)])
 }
 
 /// The ticks in `window` that get a MIDI clock pulse: every 40th tick,
@@ -343,7 +470,7 @@ fn render_track(
                     port,
                     track: Some(track.id),
                     message,
-                    sequence: (track_index, pass, first + index),
+                    sequence: (track_index, pass, PROGRAM_SLOTS + first + index),
                 });
             };
             let at = offset + event.start.0;
@@ -415,7 +542,7 @@ mod tests {
     use std::sync::Arc;
 
     use treason_core::midi::Channel;
-    use treason_core::model::{Clip, ClipEvent, OutputTarget, TrackId};
+    use treason_core::model::{Clip, ClipEvent, OutputTarget, Program, TrackId};
 
     use super::*;
 
@@ -464,6 +591,7 @@ mod tests {
                 channel: Channel::DRUMS,
             },
             muted: false,
+            program: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
         }
     }
@@ -484,13 +612,46 @@ mod tests {
     /// show their port, such as "40 clock 1".
     fn play_clocked(project: &Project, clock: ClockPulses<'_>, window: Range<u64>) -> Vec<String> {
         let mut out = Vec::new();
-        render(
-            project,
-            clock,
-            Ticks(window.start)..Ticks(window.end),
-            &mut out,
-        );
+        let window = Ticks(window.start)..Ticks(window.end);
+        render(project, clock, None, window, &mut out);
         describe(&out)
+    }
+
+    /// What plays in `window` with `programs`, one line per event with its
+    /// channel, such as "0 ch2 pc 5".
+    fn play_programs(project: &Project, programs: Programs<'_>, window: Range<u64>) -> Vec<String> {
+        let mut out = Vec::new();
+        let window = Ticks(window.start)..Ticks(window.end);
+        render(project, NO_CLOCK, Some(programs), window, &mut out);
+        out.iter()
+            .zip(describe(&out))
+            .map(|(event, line)| {
+                let channel = event.message.channel().map_or(0, Channel::number);
+                let (tick, what) = line.split_once(' ').unwrap();
+                format!("{tick} ch{channel} {what}")
+            })
+            .collect()
+    }
+
+    /// A program, with bank select bytes if given.
+    fn sound(number: u8, bank_msb: Option<u8>, bank_lsb: Option<u8>) -> Option<Program> {
+        Some(Program {
+            number: U7::new(number).unwrap(),
+            bank_msb: bank_msb.and_then(U7::new),
+            bank_lsb: bank_lsb.and_then(U7::new),
+        })
+    }
+
+    /// `track` on `channel` of port 0, with `program`.
+    fn on(channel: u8, program: Option<Program>, track: Track) -> Track {
+        Track {
+            target: OutputTarget {
+                port: PortId(0),
+                channel: Channel::from_number(channel).unwrap(),
+            },
+            program,
+            ..track
+        }
     }
 
     /// One line per event, such as "240 off 36".
@@ -533,23 +694,27 @@ mod tests {
     #[test]
     fn bounded_batches_preserve_order_within_ticks_across_tracks_and_loops() {
         let project = project(vec![
-            track(
-                1,
-                480,
-                vec![
-                    note(0, 60, 480),
-                    control(0, 7, 90),
-                    program(0, 5),
-                    control(0, 0, 1),
-                    control(0, 32, 2),
-                    note(360, 62, 240),
-                ],
-            ),
+            Track {
+                program: sound(9, Some(3), Some(4)),
+                ..track(
+                    1,
+                    480,
+                    vec![
+                        note(0, 60, 480),
+                        control(0, 7, 90),
+                        program(0, 5),
+                        control(0, 0, 1),
+                        control(0, 32, 2),
+                        note(360, 62, 240),
+                    ],
+                )
+            },
             Track {
                 target: OutputTarget {
                     port: PortId(1),
                     channel: Channel::DRUMS,
                 },
+                program: sound(11, None, None),
                 ..track(
                     2,
                     240,
@@ -562,8 +727,19 @@ mod tests {
             ports: &[PortId(0), PortId(1)],
             from: Ticks::ZERO,
         };
+        // Programs go out at the first tick, crowding it further.
+        let programs = Some(Programs {
+            at: Ticks::ZERO,
+            since: None,
+        });
         let mut everything = Vec::new();
-        render(&project, clock, Ticks::ZERO..Ticks(2000), &mut everything);
+        render(
+            &project,
+            clock,
+            programs,
+            Ticks::ZERO..Ticks(2000),
+            &mut everything,
+        );
         for port in [PortId(0), PortId(1)] {
             let expected: Vec<_> = everything
                 .iter()
@@ -577,7 +753,8 @@ mod tests {
                 let mut after = None;
                 loop {
                     let window = start..Ticks(2000);
-                    let next = render_bounded(&project, clock, port, window, after, &mut batch);
+                    let next =
+                        render_bounded(&project, clock, programs, port, window, after, &mut batch);
                     assert_eq!(batch.capacity(), capacity);
                     actual.extend_from_slice(&batch);
                     batch.clear();
@@ -595,12 +772,19 @@ mod tests {
     fn bounded_rendering_counts_retained_events_against_capacity() {
         let project = beat();
         let mut expected = Vec::new();
-        render(&project, NO_CLOCK, Ticks::ZERO..Ticks(960), &mut expected);
+        render(
+            &project,
+            NO_CLOCK,
+            None,
+            Ticks::ZERO..Ticks(960),
+            &mut expected,
+        );
         let mut batch = Vec::with_capacity(3);
         assert_eq!(
             render_bounded(
                 &project,
                 NO_CLOCK,
+                None,
                 PortId(0),
                 Ticks::ZERO..Ticks(241),
                 None,
@@ -610,7 +794,15 @@ mod tests {
         );
         assert_eq!(batch, expected[..2]);
         let window = Ticks(241)..Ticks(960);
-        let after = render_bounded(&project, NO_CLOCK, PortId(0), window, None, &mut batch);
+        let after = render_bounded(
+            &project,
+            NO_CLOCK,
+            None,
+            PortId(0),
+            window,
+            None,
+            &mut batch,
+        );
         assert_eq!(batch, expected[..3]);
         assert_eq!(batch.capacity(), 3);
         let last = after.expect("the fourth event must remain unrendered");
@@ -619,6 +811,7 @@ mod tests {
             render_bounded(
                 &project,
                 NO_CLOCK,
+                None,
                 PortId(0),
                 last.tick..Ticks(960),
                 after,
@@ -628,6 +821,161 @@ mod tests {
         );
         assert_eq!(batch, expected[3..]);
         assert_eq!(batch.capacity(), 3);
+    }
+
+    #[test]
+    fn programs_go_out_where_playback_starts_before_the_clip() {
+        let lead = on(
+            1,
+            sound(5, Some(1), Some(2)),
+            track(
+                1,
+                960,
+                vec![note(0, 60, 240), control(0, 0, 9), program(0, 6)],
+            ),
+        );
+        // Shares the lead's channel and program, which the lead sends.
+        let double = on(1, lead.program, track(2, 960, vec![note(480, 64, 240)]));
+        // Muted, but its program still goes out, ready for when it plays.
+        let pad = Track {
+            muted: true,
+            ..on(
+                2,
+                sound(89, None, None),
+                track(3, 960, vec![note(0, 48, 960)]),
+            )
+        };
+        let plain = on(3, None, track(4, 960, vec![note(0, 36, 240)]));
+        let project = project(vec![lead, double, pad, plain]);
+        let start = |at| Programs {
+            at: Ticks(at),
+            since: None,
+        };
+        // Bank selects, then program changes, each track's before its
+        // clip's own, then the notes.
+        let first_tick = [
+            "0 ch1 cc 0=1",
+            "0 ch1 cc 32=2",
+            "0 ch1 cc 0=9",
+            "0 ch1 pc 5",
+            "0 ch1 pc 6",
+            "0 ch2 pc 89",
+            "0 ch1 on 60",
+            "0 ch3 on 36",
+        ];
+        assert_eq!(play_programs(&project, start(0), 0..1), first_tick);
+        // Only the window that holds the start sends them.
+        let clip_only = ["0 ch1 cc 0=9", "0 ch1 pc 6", "0 ch1 on 60", "0 ch3 on 36"];
+        assert_eq!(play_programs(&project, start(960), 0..1), clip_only);
+        let second_bar = play_programs(&project, start(960), 960..961);
+        assert_eq!(
+            second_bar,
+            first_tick.map(|line| line.replacen('0', "960", 1))
+        );
+    }
+
+    #[test]
+    fn each_port_has_its_own_channels() {
+        let on_port = |port, track: Track| Track {
+            target: OutputTarget {
+                port: PortId(port),
+                ..track.target
+            },
+            ..track
+        };
+        let empty = |id| track(id, 960, vec![]);
+        let before = project(vec![on_port(1, on(1, sound(7, None, None), empty(2)))]);
+        let after = project(vec![
+            on(1, sound(5, None, None), empty(1)),
+            on_port(1, on(1, sound(7, None, None), empty(2))),
+            on_port(2, on(1, sound(9, None, None), empty(3))),
+        ]);
+        let start = Programs {
+            at: Ticks::ZERO,
+            since: None,
+        };
+        let switch = Programs {
+            since: Some(&before),
+            ..start
+        };
+        let sent = |programs, port: Option<u16>| {
+            let mut out = Vec::new();
+            match port {
+                None => render(
+                    &after,
+                    NO_CLOCK,
+                    Some(programs),
+                    Ticks(0)..Ticks(1),
+                    &mut out,
+                ),
+                Some(port) => {
+                    out.reserve(8);
+                    let window = Ticks(0)..Ticks(1);
+                    let port = PortId(port);
+                    render_bounded(
+                        &after,
+                        NO_CLOCK,
+                        Some(programs),
+                        port,
+                        window,
+                        None,
+                        &mut out,
+                    );
+                }
+            }
+            let sent = |event: &RenderedEvent| match event.message {
+                MidiMessage::ProgramChange { program, .. } => (event.port.0, program.get()),
+                other => panic!("{other:?}"),
+            };
+            out.iter().map(sent).collect::<Vec<_>>()
+        };
+        assert_eq!(sent(start, None), [(0, 5), (1, 7), (2, 9)]);
+        assert_eq!(sent(switch, None), [(0, 5), (2, 9)]);
+        assert_eq!(sent(switch, Some(1)), []);
+        assert_eq!(sent(switch, Some(2)), [(2, 9)]);
+    }
+
+    #[test]
+    fn a_new_snapshot_sends_only_the_programs_it_changes() {
+        let empty = |id| track(id, 960, vec![]);
+        let before = project(vec![
+            on(1, sound(5, None, None), empty(1)),
+            on(2, sound(6, None, None), empty(2)),
+            on(3, sound(7, None, None), empty(3)),
+            on(4, None, empty(4)),
+            on(6, sound(9, None, None), empty(6)),
+            on(7, sound(10, None, Some(0)), empty(7)),
+        ]);
+        let after = project(vec![
+            // Unchanged.
+            on(1, sound(5, None, None), empty(1)),
+            // A new program.
+            on(2, sound(16, None, None), empty(2)),
+            // The same program, moved to another channel.
+            on(5, sound(7, None, None), empty(3)),
+            // A program where there was none.
+            on(4, sound(8, None, None), empty(4)),
+            // A new track whose channel already has its program.
+            on(1, sound(5, None, None), empty(5)),
+            // No program any more: the device keeps the one it has.
+            on(6, None, empty(6)),
+            // Another bank is another sound.
+            on(7, sound(10, None, Some(1)), empty(7)),
+        ]);
+        let switch = Programs {
+            at: Ticks(1920),
+            since: Some(&before),
+        };
+        assert_eq!(
+            play_programs(&after, switch, 1920..2880),
+            [
+                "1920 ch7 cc 32=1",
+                "1920 ch2 pc 16",
+                "1920 ch5 pc 7",
+                "1920 ch4 pc 8",
+                "1920 ch7 pc 10",
+            ]
+        );
     }
 
     #[test]
@@ -783,7 +1131,7 @@ mod tests {
         // Four-beat kicks against a three-beat bass line: polymeter.
         let project = project(vec![track(1, 3840, vec![note(0, 36, 240)]), bass, muted]);
         let mut out = Vec::new();
-        render(&project, NO_CLOCK, Ticks(0)..Ticks(7680), &mut out);
+        render(&project, NO_CLOCK, None, Ticks(0)..Ticks(7680), &mut out);
         let ons: Vec<(u64, u16, u8, u8)> = out
             .iter()
             .filter_map(|event| match event.message {
@@ -829,7 +1177,7 @@ mod tests {
         };
         out.push(earlier);
         let buffer = out.as_ptr();
-        render(&beat(), NO_CLOCK, Ticks(0)..Ticks(1920), &mut out);
+        render(&beat(), NO_CLOCK, None, Ticks(0)..Ticks(1920), &mut out);
         assert_eq!(out.as_ptr(), buffer);
         assert_eq!(out.len(), 9);
         assert_eq!(out[0], earlier, "what was there stays first");
@@ -1078,21 +1426,33 @@ mod tests {
                 length: Ticks(240),
             },
         };
-        let mut muted = track(3, 700, vec![note(0, 40, 700)]);
+        // Muted, but with a program, which goes out all the same.
+        let mut muted = on(
+            3,
+            sound(7, None, None),
+            track(3, 700, vec![note(0, 40, 700)]),
+        );
         muted.muted = true;
         let project = project(vec![
-            track(
-                1,
-                960,
-                vec![
-                    note(0, 36, 240),
-                    note(720, 38, 480),
-                    control(0, 74, 64),
-                    program(480, 5),
-                    silent,
-                ],
-            ),
-            track(2, 1440, vec![note(1000, 50, 1440), control(1439, 1, 2)]),
+            Track {
+                program: sound(5, Some(1), Some(2)),
+                ..track(
+                    1,
+                    960,
+                    vec![
+                        note(0, 36, 240),
+                        note(720, 38, 480),
+                        control(0, 74, 64),
+                        program(480, 5),
+                        silent,
+                    ],
+                )
+            },
+            // The same program on the same channel goes out once.
+            Track {
+                program: sound(5, Some(1), Some(2)),
+                ..track(2, 1440, vec![note(1000, 50, 1440), control(1439, 1, 2)])
+            },
             muted,
         ]);
         for end in [
@@ -1115,6 +1475,11 @@ mod tests {
                     .count()
             };
             assert_eq!(count(false), count(true), "{end}");
+            let programs = events
+                .iter()
+                .filter(|event| event.tick == Ticks::ZERO && event.sequence.2 < PROGRAM_SLOTS)
+                .count();
+            assert_eq!(programs, if end == 0 { 0 } else { 4 }, "{end}");
             assert!(events.windows(2).all(|pair| pair[0].tick <= pair[1].tick));
             assert!(events.iter().all(|event| event.tick <= Ticks(end)));
         }

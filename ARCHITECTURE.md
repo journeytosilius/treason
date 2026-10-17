@@ -70,7 +70,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 |---|---|---|---|
 | core | `midi` | `MidiMessage` and its encoding, `U7`, `U14`, `Channel` | done |
 | core | `time` | `Ticks` (960 PPQN), `Bpm`, `TimeSignature` | done |
-| core | `model` | `Project`, `Track`, `Clip`, `ClipEvent` | done |
+| core | `model` | `Project`, `Track`, `Program`, `Clip`, `ClipEvent` | done |
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | core | `export` | `MidiExport`, `ExportError`, `bars`: how long an export runs | done |
@@ -80,7 +80,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics and the messages clock ports get | done |
-| engine | `render` | `render` (clip events and clock pulses in a window), `clock_pulses`, `render_song` (a whole song, with its notes ended) | done |
+| engine | `render` | `render` (clip events, programs and clock pulses in a window), `clock_pulses`, `render_song` (a whole song, with its notes ended) | done |
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, per-port latency, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
@@ -94,6 +94,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `notes` | lists of notes in beats to clips | done |
 | mcp | `controls` | controls as points that jump or ramp, to control changes and back | done |
+| mcp | `programs` | programs by number or by a device's name, and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
 | mcp | `reference` (tests only) | `docs/tools.md`, made from the tool list | done |
 | treason | `main`, `config`, `serve`, `export` | subcommands `serve`, `ports`, `devices`, `projects`, `export`; `treason.toml`; picks the backend; `SmfExport` | done |
@@ -191,7 +192,7 @@ and stops, and the transport tools report that it isn't running.
 - Tempo changes and transport commands apply at once. Other edits, such
   as a new clip, a mute or a move to another port, wait for the next bar
   line. There the notes still sounding from tracks that changed end; a
-  track that only got a new name or device plays on. While stopped, edits
+  track that only got a new name, device or program plays on. While stopped, edits
   apply at once. The boundary comes from the playhead, even if lookahead has
   already rendered or submitted that bar. Future work there is replaced,
   and the previous snapshot stays available until delivery, so another edit
@@ -216,6 +217,16 @@ and stops, and the transport tools report that it isn't running.
   with the program and controller values set on its tick. Within each
   group, events keep their order, by track and then as written in the
   clip, so RPN sequences and repeated controllers arrive as written.
+- A track's program, after its bank selects, goes out where playback
+  starts, on Play, Continue and Locate, and at the bar line where a new
+  snapshot changes it, ahead of its clip's events on that tick. Tracks on
+  one port and channel share its program, so the first that sets one sends
+  it. A new snapshot sends only the programs the one before it didn't set
+  on that port and channel; one that sets none there leaves the device's
+  sound as it is. Muted tracks send theirs too, so a track sounds right
+  when it's unmuted, as do the tracks that share its channel. Programs are
+  rendered with the clips, so rewinds and windows split within a tick send
+  each one once, in order.
 - treason is the clock master for the ports configured with
   `clock = true`. While playing, they get a MIDI clock pulse every 40 ticks,
   first among the messages on its tick. Play sends them Start. The engine
@@ -258,7 +269,9 @@ and stops, and the transport tools report that it isn't running.
   copies a vector of pointers plus the one track that changed, and undo is a
   list of old snapshots.
 - A `Track` sends to one `OutputTarget` (port and channel) and loops one
-  `Clip`.
+  `Clip`. It may set a `Program` there: a program number and, for gear
+  with banks, bank select bytes. Tracks on one target agree on its
+  program, so an edit or a file that would give it two is refused.
 - A `Clip` has its own length, so clips of different lengths give polymeter.
   It holds note, control-change and program-change events sorted by start
   tick. Micro-timing is just where an event sits. A note can run past the
@@ -271,12 +284,14 @@ and stops, and the transport tools report that it isn't running.
 ## Device profiles
 
 TOML files in `devices/`. Each gives a device's default channel, its voices
-(a note per sound), aliases (`bd = "kick"`) and parameters (CC numbers; NRPN
-is planned). Names need a letter, because tools read a bare number as a MIDI
-note or controller. Any track can also name the controllers MIDI defines,
+(a note per sound), aliases (`bd = "kick"`), programs (a program number,
+with bank select bytes where the device has banks) and parameters (CC
+numbers; NRPN is planned). Names need a letter, because tools read a bare
+number as a MIDI note, controller or program. Any track can also name the controllers MIDI defines,
 such as `modulation` (1), `volume` (7) and `cutoff` (74), from
 `controllers`; a profile's own parameter names come first.
-`devices/gm-drums.toml` covers the General MIDI drum map.
+`devices/gm-drums.toml` covers the General MIDI drum map and the GM2 and GS
+drum kits, and `devices/gm.toml` names the 128 General MIDI programs.
 Profiles for real gear can be generated from the MIDI Guide dataset
 (github.com/pencilresearch/midi, CC-BY-SA-4.0).
 
@@ -313,6 +328,12 @@ server's instructions say to call it first. A test runs the guide's
 example calls in order over an MCP session, and another makes
 `docs/tools.md`, the reference for every tool, from the tool list and fails
 while the committed file differs, so neither drifts from the code.
+
+`add_track` and `edit_track` take a track's program by number, with bank
+select bytes, or by its device's name for it, which brings its own bank.
+`get_project` shows it back by name where the device has one for that
+program and bank, and by number otherwise. A name the device doesn't have
+is refused with up to five of its names that share a word with it.
 
 `get_project` shows a clip whose notes fit a step grid as step strings, in
 the form `set_steps` takes, and any other clip as a list of notes, in the
@@ -358,7 +379,8 @@ beats through the loop.
 
 `save_project` writes the project to `<projects>/<name>.toml`, and
 `load_project` reads it back exactly: the tempo, the time signature, and
-every track with its id, name, device, port, channel, mute and clip.
+every track with its id, name, device, port, channel, program, mute and
+clip.
 `treason serve --project <name>` starts with one, and `treason projects`
 lists them.
 
@@ -370,7 +392,8 @@ lists them.
   `treason.toml`. Times are whole ticks, and events go one to a line, in
   the clip's order, so events on the same tick keep their order.
 - Loading checks what an edit would: every port and device exists, track
-  ids are unique and clips are valid. A file that fails changes nothing.
+  ids are unique, tracks on one channel agree on its program and clips are
+  valid. A file that fails changes nothing.
 - Saving writes a temporary file and flushes it to disk. A new name is
   published with a hard link, which atomically refuses an existing name
   even when another process saves it concurrently. Replacements rename
@@ -403,6 +426,9 @@ saved project. A DAW opens it with each part on its own track.
   named after it, with its messages on its channel. Muted tracks are left
   out, as they are from playback. MIDI clock and transport messages are
   for live gear and stay out of the file.
+- Each track's program opens its file track, ahead of its notes. A muted
+  track's program sets its channel for the tracks that play there, so it
+  goes to the first of them, and stays out when none does.
 - The file plays from bar 1 for a number of bars: by default until every
   loop that plays something ends on the same bar line, so each pattern is
   complete. A one-bar drum loop with a three-bar bass line exports three
@@ -517,6 +543,23 @@ Then the controls of the gear:
 12. Controls: the `set_controls` tool, so a track sends modulation and
     other control changes, with ramps and repeats, alone or with notes.
     Done.
+
+Then expression, the rest of what MIDI 1.0 gives a sequencer to say:
+
+13. Programs: a program and bank per track, sent where playback starts,
+    after a jump and where an edit changes it, with the General MIDI names
+    in the `gm` profile and patch names in any profile. Done.
+14. Pitch bend and channel pressure: `pitch_bend` and `pressure` in
+    `set_controls`, bend recentred on stop, and a bend range per track
+    (RPN 0).
+15. Per-note expression: polyphonic aftertouch and release velocity in
+    `set_notes`, and more velocities in step strings, such as ghost notes.
+16. Fine control: 14-bit controllers, RPN and NRPN, with NRPN parameters
+    in device profiles.
+17. SysEx, on its own path.
+18. MPE.
+
+MIDI 2.0 comes after that.
 
 Later: following an external clock (which needs MIDI input), and
 probability, ratchets and conditions on events.

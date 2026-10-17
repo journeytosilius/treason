@@ -124,6 +124,7 @@ impl DeviceRegistry {
 #[cfg(test)]
 mod tests {
     use treason_core::midi::{Channel, U7};
+    use treason_core::model::Program;
 
     use super::*;
 
@@ -132,11 +133,35 @@ mod tests {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices");
         let registry = DeviceRegistry::load_dir(&dir).unwrap();
 
-        let gm = registry.get("gm-drums").unwrap();
-        assert_eq!(gm.default_channel, Channel::DRUMS);
-        assert_eq!(gm.voice("kick"), U7::new(36));
-        assert_eq!(gm.voice("bd"), U7::new(36));
-        assert_eq!(gm.voice_name(U7::new(42).unwrap()), Some("closed_hat"));
-        assert_eq!(gm.param("volume").map(|param| param.cc), U7::new(7));
+        let drums = registry.get("gm-drums").unwrap();
+        assert_eq!(drums.default_channel, Channel::DRUMS);
+        assert_eq!(drums.voice("kick"), U7::new(36));
+        assert_eq!(drums.voice("bd"), U7::new(36));
+        assert_eq!(drums.voice_name(U7::new(42).unwrap()), Some("closed_hat"));
+        assert_eq!(drums.param("volume").map(|param| param.cc), U7::new(7));
+        let kit = drums.program("tr_808_kit").unwrap();
+        assert_eq!(kit, Program::new(U7::new(25).unwrap()));
+
+        // Every General MIDI program once, numbered as sent.
+        let gm = registry.get("gm").unwrap();
+        let mut numbers: Vec<u8> = gm.programs.values().map(|p| p.number.get()).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (0..=127).collect::<Vec<u8>>());
+        assert!(
+            gm.programs
+                .values()
+                .all(|p| p.bank_msb.is_none() && p.bank_lsb.is_none())
+        );
+        for (name, number) in [
+            ("acoustic_grand_piano", 0),
+            ("electric_bass_finger", 33),
+            ("pad_2_warm", 89),
+            ("gunshot", 127),
+        ] {
+            assert_eq!(
+                gm.program(name),
+                Some(Program::new(U7::new(number).unwrap()))
+            );
+        }
     }
 }

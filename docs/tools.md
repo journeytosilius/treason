@@ -10,8 +10,8 @@ explains how the tools fit together, with examples.
 
 | Tool | What it does |
 |---|---|
-| [`add_track`](#add_track) | Adds a track that loops one empty bar. |
-| [`edit_track`](#edit_track) | Renames a track or moves it to another port, channel or device, as one edit. |
+| [`add_track`](#add_track) | Adds a track that loops one empty bar, with a program to set the sound of its channel if you like. |
+| [`edit_track`](#edit_track) | Renames a track, moves it to another port, channel or device, or changes its program, as one edit. |
 | [`export_midi`](#export_midi) | Exports the project as a Standard MIDI File that a DAW can open: a track for each unmuted track, named after it, with the tempo and time signature. |
 | [`get_guide`](#get_guide) | The guide to driving treason: how projects, tracks and loops work, what each tool is for, the names and notations, the limits, what the errors mean and how to connect gear, with examples of every call. Read it once before you start. |
 | [`get_project`](#get_project) | Shows the project: tempo, time signature and every track, with each clip as step strings or notes, in the form set_steps or set_notes takes, and its controls in the form set_controls takes. |
@@ -36,32 +36,38 @@ explains how the tools fit together, with examples.
 
 ## add_track
 
-Adds a track that loops one empty bar. Returns the track: pass its id to the other tools.
+Adds a track that loops one empty bar, with a program to set the sound of its channel if you like. Returns the track: pass its id to the other tools.
 
 Input:
 
 | Field | Type | Description |
 |---|---|---|
 | `name` | string | A name for the track, such as "drums" or "bass". |
+| `bank_lsb` | integer, optional | Bank select LSB (controller 32), 0-127, sent before a program given by number, on gear with banks. |
+| `bank_msb` | integer, optional | Bank select MSB (controller 0), 0-127, sent before a program given by number, on gear with banks. |
 | `channel` | integer, optional | The MIDI channel, 1-16. Defaults to the device's channel, or 1. |
 | `device` | string, optional | A device profile id, from list_devices. It lets set_steps and set_notes use the device's voice names. |
 | `port` | string, optional | The output port, from list_ports. Defaults to the first port. |
+| `program` | [`ProgramRef`](#programref), optional | The sound to select on the track's channel: a program number, 0-127, or one of the device's programs from list_devices, such as "electric_bass_finger" on device "gm". Sent when playback starts, after a jump, and at the bar where it changes. Tracks on the same port and channel share one program. Without it, the device keeps the sound it has. |
 
 Returns [`TrackView`](#trackview).
 
 ## edit_track
 
-Renames a track or moves it to another port, channel or device, as one edit. Its clip stays as it is. While playing, the change takes effect at the next bar. Returns the track.
+Renames a track, moves it to another port, channel or device, or changes its program, as one edit. Its clip stays as it is. While playing, the change takes effect at the next bar. Returns the track.
 
 Input:
 
 | Field | Type | Description |
 |---|---|---|
 | `track` | integer | The track's id. |
+| `bank_lsb` | integer, optional | Bank select LSB (controller 32), 0-127, for the program. |
+| `bank_msb` | integer, optional | Bank select MSB (controller 0), 0-127, for the program. |
 | `channel` | integer, optional | Another MIDI channel, 1-16. Without it the channel stays, even when the device changes. |
 | `device` | string, optional | Another device profile id, from list_devices. Later set_steps calls use its voice names; the notes already in the clip stay as they are. |
 | `name` | string, optional | A new name. |
 | `port` | string, optional | Another output port, from list_ports. |
+| `program` | [`ProgramRef`](#programref), optional | Another program, as in add_track, or null to stop sending one. Its bank comes with it: give bank_msb and bank_lsb again if it needs them. |
 
 Returns [`TrackView`](#trackview).
 
@@ -107,7 +113,7 @@ Returns:
 
 ## list_devices
 
-Lists the device profiles. A track with a device names its notes by voice, such as "kick" or "closed_hat", and its controls by parameter, such as "cutoff".
+Lists the device profiles. A track with a device names its notes by voice, such as "kick" or "closed_hat", its controls by parameter, such as "cutoff", and its sound by program, such as "electric_bass_finger" on "gm", the General MIDI sounds.
 
 Read only: it changes nothing.
 
@@ -371,6 +377,7 @@ What a synth or drum machine calls its notes and controls.
 | `id` | string | Use this id in add_track. |
 | `name` | string | The device's name. |
 | `params` | map of names to integer | Parameter names and their MIDI CC numbers. |
+| `programs` | map of names to [`ProgramView`](#programview) | Program names, for add_track and edit_track, and the program each selects. |
 | `voices` | map of names to integer | Voice names and their MIDI notes. On a drum machine, one per sound. |
 | `manufacturer` | string, optional | Who makes it. |
 
@@ -424,6 +431,25 @@ A control's value at a point in the loop.
 | `value` | integer | The value, 0-127. |
 | `ramp` | [`Ramp`](#ramp), optional | How the value gets here from the point before. Missing where it jumps. |
 
+### ProgramRef
+
+A program: its number, or a name from the track's device.
+
+One of:
+
+- integer: A program number, 0-127, as sent. A manual that numbers programs from 1 means one more than this.
+- string: One of the device's programs, from list_devices, such as "electric_bass_finger".
+
+### ProgramView
+
+A device's program.
+
+| Field | Type | Description |
+|---|---|---|
+| `program` | integer | The program number, 0-127. |
+| `bank_lsb` | integer, optional | Bank select LSB, sent next, for a program in a bank. |
+| `bank_msb` | integer, optional | Bank select MSB, sent first, for a program in a bank. |
+
 ### Ramp
 
 How a control moves from one point to the next.
@@ -446,7 +472,10 @@ A track.
 | `muted` | boolean | A muted track plays nothing. |
 | `name` | string | The track's name. |
 | `port` | string | The output port. |
+| `bank_lsb` | integer, optional | Bank select LSB, sent before a program shown by number. |
+| `bank_msb` | integer, optional | Bank select MSB, sent before a program shown by number. |
 | `controls` | map of names to [`ControlView`](#controlview), optional | The loop's controls (MIDI CC) in the form set_controls takes, by name. Missing when it sends none. |
 | `device` | string, optional | The device profile that names its voices and parameters, if any. |
 | `notes` | list of [`NoteView`](#noteview), optional | The loop's notes in the form set_notes takes, by start. Shown for clips that aren't step patterns, such as melodies. |
 | `pattern` | [`PatternView`](#patternview), optional | The loop's notes as step strings, in the form set_steps takes. Shown when every note sits on a step grid at set_steps' velocities; missing for other clips, such as melodies. |
+| `program` | [`ProgramRef`](#programref), optional | The sound its channel is set to: the device's name for the program, or its number. Missing when the track sets none. |
