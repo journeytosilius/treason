@@ -329,7 +329,10 @@ beats through the loop.
   changes where they are, cut off by a shorter loop. The clip holds the
   changes rather than the points, so a repeat doesn't stretch to fill a
   longer loop. `set_controls` replaces the controls it names and keeps the
-  rest. On a track with notes, the notes set the loop's length.
+  rest. Replaced changes retain their original positions among events on
+  the same tick, preserving sequences such as RPN selection and Data Entry.
+  New changes without an original slot follow existing events on that tick.
+  On a track with notes, the notes set the loop's length.
 - `get_project` reads the control changes back as points: a ramp where the
   changes fit one exactly, otherwise jumps. Written back over the same
   loop, they send the same changes, though a repeat comes back as every pass

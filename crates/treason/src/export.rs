@@ -277,6 +277,68 @@ mod tests {
     }
 
     #[test]
+    fn partial_control_updates_preserve_the_rendered_rpn_sequence() {
+        let mut synth = track(1, "synth", 3, 3840, &[]);
+        synth.clip = Clip::new(
+            Ticks(3840),
+            [(101, 0), (100, 0), (6, 12)]
+                .map(|(controller, value)| ClipEvent {
+                    start: Ticks::ZERO,
+                    kind: EventKind::Control {
+                        controller: U7::new(controller).unwrap(),
+                        value: U7::new(value).unwrap(),
+                    },
+                })
+                .to_vec(),
+        )
+        .unwrap();
+        for controllers in [vec![100], vec![100, 101]] {
+            let controls = controllers
+                .into_iter()
+                .map(|controller| {
+                    (
+                        controller.to_string(),
+                        treason_mcp::dto::ControlLane {
+                            points: vec![treason_mcp::dto::ControlPoint {
+                                at: 0.0,
+                                value: if controller == 100 { 2 } else { 0 },
+                                ramp: None,
+                            }],
+                            repeat_beats: None,
+                        },
+                    )
+                })
+                .collect();
+            let mut updated = synth.clone();
+            updated.clip = treason_mcp::controls::clip_with_controls(
+                &synth.clip,
+                &controls,
+                Some(4.0),
+                Ticks(3840),
+                None,
+            )
+            .unwrap();
+            let project = Project {
+                tracks: vec![Arc::new(updated)],
+                ..Project::default()
+            };
+            // The complete file stream goes through the live renderer;
+            // checking each controller separately would miss the bug.
+            let file = SmfExport.export(&project, "rpn", 1).unwrap();
+            assert_eq!(
+                tracks(&file)[1],
+                [
+                    "0 name synth",
+                    "0 cc101 0 ch3",
+                    "0 cc100 2 ch3",
+                    "0 cc6 12 ch3",
+                    "3840 end",
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn exports_too_big_are_refused_before_rendering() {
         // A note on every tick: 7,680 note-ons and note-offs a bar.
         let project = Project {

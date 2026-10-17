@@ -8,7 +8,7 @@
 //! clip's control changes back as points that send the same.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::PI;
 
 use thiserror::Error;
@@ -258,21 +258,22 @@ pub fn clip_with_controls(
         lanes.push(place(name, controller, lane)?);
     }
 
-    let replaced = |event: &&ClipEvent| match event.kind {
+    let replaced = |event: &ClipEvent| match event.kind {
         EventKind::Control { controller, .. } => {
             lanes.iter().any(|lane| lane.controller == controller)
         }
         _ => false,
     };
-    let kept: Vec<ClipEvent> = clip
+    let kept: Vec<(usize, ClipEvent)> = clip
         .events()
         .iter()
-        .filter(|event| !replaced(event))
         .copied()
+        .enumerate()
+        .filter(|(_, event)| !replaced(event))
         .collect();
     let notes = kept
         .iter()
-        .any(|event| matches!(event.kind, EventKind::Note { .. }));
+        .any(|(_, event)| matches!(event.kind, EventKind::Note { .. }));
     let length = match loop_beats {
         Some(beats) => {
             let length = ticks(beats)
@@ -304,31 +305,58 @@ pub fn clip_with_controls(
         lane.check(length, lengthen)?;
     }
 
-    let mut events: Vec<ClipEvent> = kept
+    let mut events: Vec<(usize, ClipEvent)> = kept
         .into_iter()
-        .filter(|event| event.start < length)
+        .filter(|(_, event)| event.start < length)
         .collect();
     let mut changes = events
         .iter()
-        .filter(|event| matches!(event.kind, EventKind::Control { .. }))
+        .filter(|(_, event)| matches!(event.kind, EventKind::Control { .. }))
         .count();
+    // Replace each controller occurrence in its original same-tick slot.
+    // Grouping lanes by name must not move RPN selection after Data Entry,
+    // or regroup interleaved occurrences of a repeated controller.
+    let mut slots: BTreeMap<(Ticks, U7), VecDeque<usize>> = BTreeMap::new();
+    for (position, event) in clip.events().iter().enumerate() {
+        if replaced(event)
+            && let EventKind::Control { controller, .. } = event.kind
+        {
+            slots
+                .entry((event.start, controller))
+                .or_default()
+                .push_back(position);
+        }
+    }
     for lane in &lanes {
         lane.send(length, |tick, value| {
             changes += 1;
             if changes > MAX_CONTROL_CHANGES {
                 return Err(ControlsError::TooManyChanges);
             }
-            events.push(ClipEvent {
-                start: Ticks(tick),
-                kind: EventKind::Control {
-                    controller: lane.controller,
-                    value,
+            let position = slots
+                .get_mut(&(Ticks(tick), lane.controller))
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(clip.events().len());
+            events.push((
+                position,
+                ClipEvent {
+                    start: Ticks(tick),
+                    kind: EventKind::Control {
+                        controller: lane.controller,
+                        value,
+                    },
                 },
-            });
+            ));
             Ok(())
         })?;
     }
-    Ok(Clip::new(length, events)?)
+    // New occurrences follow the existing events on their tick, in lane
+    // order. The stable sort keeps their order when they share a slot.
+    events.sort_by_key(|(position, event)| (event.start, *position));
+    Ok(Clip::new(
+        length,
+        events.into_iter().map(|(_, event)| event).collect(),
+    )?)
 }
 
 /// `notes`, a track's new clip of notes, with the control and program
