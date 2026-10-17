@@ -341,9 +341,11 @@ any control.
 - `bend_range` in `add_track` and `edit_track` sets the synth's range in
   semitones, 0-127; most synths take up to 24. treason sends it, as RPN 0,
   after the track's program, where playback starts, after a jump and at
-  the bar line where an edit changes it, since a program change can reset
-  it. Like the program, tracks on one port and channel share it, and
-  `"bend_range": null` stops sending one.
+  the bar line where an edit changes it, and after every program change
+  in a clip, including later loop passes, since a program change can reset
+  it. Explicit clip RPN controls can then override it. Like the program,
+  tracks on one port and channel share it, and `"bend_range": null` stops
+  sending one.
 - Bend and pressure act on the whole channel. `stop`, `panic`, a jump and
   the end of an export put them back at rest, and so does muting,
   removing or moving a track that left them off rest, or giving it a loop

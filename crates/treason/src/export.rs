@@ -42,7 +42,7 @@ impl MidiExport for SmfExport {
             // tracks' programs and bend ranges to the first unmuted track
             // on their target.
             let startup_channel = match event.message {
-                _ if event.is_setup() => event.message.channel(),
+                _ if event.is_setup() && event.tick == Ticks::ZERO => event.message.channel(),
                 MidiMessage::ProgramChange { channel, .. } if event.tick == Ticks::ZERO => {
                     Some(channel)
                 }
@@ -242,6 +242,44 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn clip_programs_keep_their_restored_range_in_the_export() {
+        let first = track(1, "first", 1, 3840, &[(0, 60, 240)]);
+        let mut setter = track(2, "setter", 1, 960, &[]);
+        setter.bend_range = U7::new(12);
+        setter.clip = Clip::new(
+            Ticks(960),
+            vec![ClipEvent {
+                start: Ticks::ZERO,
+                kind: EventKind::Program {
+                    program: U7::new(5).unwrap(),
+                },
+            }],
+        )
+        .unwrap();
+        let project = Project {
+            tracks: [first, setter].map(Arc::new).into(),
+            ..Project::default()
+        };
+        let file = SmfExport.export(&project, "shared", 1).unwrap();
+        let range = |at| {
+            [(101, 0), (100, 0), (6, 12), (38, 0), (101, 127), (100, 127)]
+                .map(|(cc, value)| format!("{at} cc{cc} {value} ch1"))
+        };
+        let mut first = vec!["0 name first".to_owned()];
+        first.extend(range(0));
+        first.push("0 pc 5 ch1".to_owned());
+        first.extend(range(0));
+        first.extend(["0 on 60 ch1", "240 off 60 ch1", "3840 end"].map(String::from));
+        let mut setter = vec!["0 name setter".to_owned()];
+        for at in [960, 1920, 2880] {
+            setter.push(format!("{at} pc 5 ch1"));
+            setter.extend(range(at));
+        }
+        setter.push("3840 end".to_owned());
+        assert_eq!(tracks(&file)[1..], [first, setter]);
     }
 
     #[test]

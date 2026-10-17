@@ -220,7 +220,9 @@ and stops, and the transport tools report that it isn't running.
   selected with it, and a note plays with the program, controller and bend
   values set on its tick. Within each group, events keep their order, by
   track and then as written in the clip, so RPN sequences and repeated
-  controllers arrive as written. The setup goes channel by channel.
+  controllers arrive as written. Each clip program change restores the
+  channel's configured bend range, including on later loop passes, before
+  explicit clip controls can override it. The setup goes channel by channel.
 - A channel's setup goes out where playback starts, on Play, Continue and
   Locate, and at the bar line where a new snapshot changes it: the
   program, after its bank selects, then the bend range, as RPN 0
@@ -447,11 +449,11 @@ saved project. A DAW opens it with each part on its own track.
   out, as they are from playback. MIDI clock and transport messages are
   for live gear and stay out of the file.
 - The channels' setup, with their bend ranges, and the bank selects and
-  program changes at tick 0 go to the first unmuted file track on their
-  port and channel, in render order, ahead of its notes. This keeps
-  channel setup ahead of notes on later file tracks too, even when a later
-  or muted track sets it. A muted track's setup stays out when no unmuted
-  track shares its port and channel.
+  program changes with their restored ranges at tick 0 go to the first
+  unmuted file track on their port and channel, in render order, ahead of
+  its notes. This keeps channel setup ahead of notes on later file tracks
+  too, even when a later or muted track sets it. A muted track's setup stays
+  out when no unmuted track shares its port and channel.
 - The file plays from bar 1 for a number of bars: by default until every
   loop that plays something ends on the same bar line, so each pattern is
   complete. A one-bar drum loop with a three-bar bass line exports three

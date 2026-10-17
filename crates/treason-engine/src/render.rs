@@ -35,16 +35,18 @@ pub struct RenderedEvent {
     rank: Rank,
     /// The order it was rendered in: by track, then as written in the clip;
     /// for a clock pulse, by port; and for a channel's setup, by port,
-    /// channel and message. Breaks ties in the send order without a sort
-    /// that allocates.
-    sequence: (usize, u64, usize),
+    /// channel and message. The last slot orders the messages a clip event
+    /// sends. Breaks ties without a sort that allocates.
+    sequence: (usize, u64, usize, usize),
 }
 
 impl RenderedEvent {
     /// Whether it sets up its channel, as part of a track's program or bend
-    /// range, rather than coming from a clip or the clock.
+    /// range, including the range restored after a clip program change.
     pub fn is_setup(&self) -> bool {
         self.rank == Rank::Setup
+            || (self.rank == Rank::Program
+                && matches!(self.message, MidiMessage::ControlChange { .. }))
     }
 }
 
@@ -61,7 +63,8 @@ enum Rank {
     Setup,
     /// The clips' bank selects, before the program changes they're for.
     BankSelect,
-    /// The clips' program changes.
+    /// The clips' program changes, each followed by its channel's bend
+    /// range when configured, since the program may reset it.
     Program,
     /// Other control changes, pitch bend and pressure, so a note plays with
     /// the values set on its tick.
@@ -135,7 +138,9 @@ pub struct ClockPulses<'a> {
 /// program, controller and bend values set on its tick. Within each of
 /// those groups, events keep their order, by track and then as written in
 /// the clip, so a sequence such as an RPN's parameter selection and data
-/// entry arrives as written. The setup goes channel by channel.
+/// entry arrives as written. Each clip program change restores its
+/// channel's configured bend range before the clip's own controls, so an
+/// explicit RPN can override it. The setup goes channel by channel.
 ///
 /// `out` is reused from window to window. This unbounded entry point may
 /// allocate if its remaining capacity cannot hold the whole window.
@@ -229,7 +234,7 @@ pub fn render_song(
             },
             rank: Rank::NoteOff,
             // After every pass, as the last word on each note.
-            sequence: (index, u64::MAX, usize::from(note.get())),
+            sequence: (index, u64::MAX, usize::from(note.get()), 0),
         };
         out.extend(std::iter::repeat_n(off, count as usize));
     }
@@ -277,9 +282,9 @@ fn holds(message: MidiMessage) -> Option<(Held, MidiMessage)> {
 
 /// How many events [`render_song`] gives for `project` until `end`: the
 /// setup at tick 0, two for each note, its note-on and note-off, and one
-/// for each other event, for every pass through the loop that starts the
-/// event before `end`, plus the releases of held pedals, bends and
-/// pressure at the end, returned alongside the count.
+/// for each other event, plus any bend range restored by a clip program,
+/// for every pass that starts the event before `end`, plus the releases of
+/// held pedals, bends and pressure at the end, returned alongside the count.
 fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
     let mut events = 0_u64;
     // Only the last change to each pedal, bend and pressure on each port
@@ -300,10 +305,14 @@ fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
         }
         let length = track.clip.length().0;
         let channel = track.target.channel;
+        let range_messages = channel_bend_range(project, track).map_or(0, |range| {
+            bend_range_messages(channel, range).count() as u64
+        });
         for (event_index, event) in track.clip.events().iter().enumerate() {
             let messages = match event.kind {
                 EventKind::Note { velocity, .. } if velocity == U7::MIN => 0,
                 EventKind::Note { .. } => 2,
+                EventKind::Program { .. } => 1 + range_messages,
                 _ => 1,
             };
             let passes = end.0.saturating_sub(event.start.0).div_ceil(length);
@@ -320,7 +329,7 @@ fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
                 track: Some(track.id),
                 message,
                 rank: Rank::of(message),
-                sequence: (index, passes - 1, event_index),
+                sequence: (index, passes - 1, event_index, 0),
             };
             let previous = held
                 .entry((track.target.port, channel, state))
@@ -432,13 +441,19 @@ fn visit(
                 message: MidiMessage::TimingClock,
                 rank: Rank::Clock,
                 // Pulses rank on their own, so this only orders their ports.
-                sequence: (0, 0, usize::from(port.0)),
+                sequence: (0, 0, usize::from(port.0), 0),
             });
         }
     }
     for (index, track) in project.tracks.iter().enumerate() {
         if !track.muted && wanted(track.target.port) {
-            render_track(index, track, window.clone(), &mut emit);
+            render_track(
+                index,
+                track,
+                channel_bend_range(project, track),
+                window.clone(),
+                &mut emit,
+            );
         }
     }
 }
@@ -495,6 +510,7 @@ fn visit_setup(
                 usize::from(port.0),
                 u64::from(track.target.channel.index()),
                 slot,
+                0,
             ),
         });
     };
@@ -600,6 +616,16 @@ fn channel_message(kind: EventKind, channel: Channel) -> Option<MidiMessage> {
     }
 }
 
+/// The range configured on a track's port and channel, even by a muted
+/// track. Tracks sharing the target agree on it, as in [`visit_setup`].
+fn channel_bend_range(project: &Project, track: &Track) -> Option<U7> {
+    project
+        .tracks
+        .iter()
+        .filter(|other| other.target == track.target)
+        .find_map(|other| other.bend_range)
+}
+
 /// The ticks in `window` that get a MIDI clock pulse: every 40th tick,
 /// counting from 0, which is 24 pulses per quarter note.
 pub fn clock_pulses(window: Range<Ticks>) -> impl Iterator<Item = Ticks> {
@@ -613,6 +639,7 @@ pub fn clock_pulses(window: Range<Ticks>) -> impl Iterator<Item = Ticks> {
 fn render_track(
     track_index: usize,
     track: &Track,
+    bend_range: Option<U7>,
     window: Range<Ticks>,
     mut emit: impl FnMut(RenderedEvent),
 ) {
@@ -637,14 +664,20 @@ fn render_track(
         for (index, event) in clip.events_in(span).iter().enumerate() {
             // Stable across window boundaries and partial batches, including
             // note-offs from the previous pass through a looping clip.
-            let mut emit = |tick, message| {
+            let mut emit = |tick, message, slot| {
                 emit(RenderedEvent {
                     tick: Ticks(tick),
                     port,
                     track: Some(track.id),
                     message,
-                    rank: Rank::of(message),
-                    sequence: (track_index, pass, first + index),
+                    // Extra messages restore the bend range as part of
+                    // the clip program, ahead of explicit clip controls.
+                    rank: if slot == 0 {
+                        Rank::of(message)
+                    } else {
+                        Rank::Program
+                    },
+                    sequence: (track_index, pass, first + index, slot),
                 });
             };
             let at = offset + event.start.0;
@@ -661,7 +694,7 @@ fn render_track(
                             note,
                             velocity,
                         };
-                        emit(at, on);
+                        emit(at, on, 0);
                     }
                     let off_at = at + length.0;
                     if (start..end).contains(&off_at) {
@@ -670,13 +703,20 @@ fn render_track(
                             note,
                             velocity: U7::MIN,
                         };
-                        emit(off_at, off);
+                        emit(off_at, off, 0);
                     }
                 }
                 kind => {
                     // Before the window, it was already sent.
                     if let Some(message) = channel_message(kind, channel).filter(|_| at >= start) {
-                        emit(at, message);
+                        emit(at, message, 0);
+                        if matches!(kind, EventKind::Program { .. })
+                            && let Some(range) = bend_range
+                        {
+                            for (slot, message) in bend_range_messages(channel, range) {
+                                emit(at, message, slot);
+                            }
+                        }
                     }
                 }
             }
@@ -687,7 +727,7 @@ fn render_track(
 /// Where an event goes in the send order: by tick, then by [`Rank`], then
 /// in the order they were rendered. No two events tie, so an unstable sort
 /// keeps that order.
-fn send_order(event: &RenderedEvent) -> (Ticks, Rank, (usize, u64, usize)) {
+fn send_order(event: &RenderedEvent) -> (Ticks, Rank, (usize, u64, usize, usize)) {
     (event.tick, event.rank, event.sequence)
 }
 
@@ -873,6 +913,7 @@ mod tests {
         let project = project(vec![
             Track {
                 program: sound(9, Some(3), Some(4)),
+                bend_range: U7::new(12),
                 ..track(
                     1,
                     480,
@@ -1106,6 +1147,84 @@ mod tests {
         // The clip's bend uses the new range, before its notes.
         expected.extend(["0 ch1 bend 16383", "0 ch1 on 60", "0 ch1 on 64"].map(String::from));
         assert_eq!(play_setup(&project, start, 0..1), expected);
+    }
+
+    #[test]
+    fn clip_programs_restore_the_channels_range_before_explicit_rpn_bends_and_notes() {
+        for shared in [false, true] {
+            let mut lead = on(
+                1,
+                None,
+                track(
+                    1,
+                    960,
+                    vec![
+                        note(0, 60, 240),
+                        program(0, 5),
+                        control(0, 101, 0),
+                        control(0, 100, 0),
+                        control(0, 6, 24),
+                        control(0, 38, 0),
+                        control(0, 101, 127),
+                        control(0, 100, 127),
+                        bend(0, 16383),
+                    ],
+                ),
+            );
+            let mut setter = on(1, None, track(2, 960, vec![]));
+            if shared {
+                // Even a later, muted track supplies the channel's range.
+                setter.bend_range = U7::new(12);
+                setter.muted = true;
+            } else {
+                lead.bend_range = U7::new(12);
+            }
+            // A range on another port must not be used for the lead.
+            let other_port = Track {
+                target: OutputTarget {
+                    port: PortId(1),
+                    channel: Channel::from_number(1).unwrap(),
+                },
+                ..ranged(2, track(3, 960, vec![]))
+            };
+            let project = project(vec![other_port, lead, setter]);
+            let setup = Setup {
+                at: Ticks::ZERO,
+                since: None,
+            };
+            for at in [0, 960] {
+                let mut expected = Vec::new();
+                if at == 0 {
+                    expected.extend(bend_range(0, 1, 12));
+                    expected.extend(bend_range(0, 1, 2));
+                }
+                expected.push(format!("{at} ch1 pc 5"));
+                expected.extend(bend_range(at, 1, 12));
+                // The clip can still override the restored default.
+                expected.extend(bend_range(at, 1, 24));
+                expected.extend([format!("{at} ch1 bend 16383"), format!("{at} ch1 on 60")]);
+                assert_eq!(
+                    play_setup(&project, setup, at..at + 1),
+                    expected,
+                    "shared {shared}, tick {at}",
+                );
+            }
+            for end in [0, 1, 959, 960, 961, 1920] {
+                let events = render_song(&project, Ticks(end), u64::MAX).unwrap();
+                let size = events.len() as u64;
+                assert_eq!(song_size(&project, Ticks(end)).0, size);
+                assert!(render_song(&project, Ticks(end), size).is_ok());
+                if size > 0 {
+                    assert_eq!(
+                        render_song(&project, Ticks(end), size - 1),
+                        Err(SongTooLarge {
+                            events: size,
+                            limit: size - 1,
+                        }),
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1524,7 +1643,7 @@ mod tests {
             track: Some(TrackId(1)),
             message: MidiMessage::Stop,
             rank: Rank::NoteOn,
-            sequence: (0, 0, 0),
+            sequence: (0, 0, 0, 0),
         };
         out.push(earlier);
         let buffer = out.as_ptr();
@@ -1830,7 +1949,10 @@ mod tests {
                     .count()
             };
             assert_eq!(count(false), count(true), "{end}");
-            let programs = events.iter().filter(|event| event.is_setup()).count();
+            let programs = events
+                .iter()
+                .filter(|event| event.is_setup() && event.tick == Ticks::ZERO)
+                .count();
             // Bank selects, a program change and a bend range's six, then
             // the muted track's program.
             assert_eq!(programs, if end == 0 { 0 } else { 3 + 6 + 1 }, "{end}");
