@@ -13,7 +13,7 @@ makes up for its gear's delay, so everything sounds together. On Linux,
 `backend = "alsa-seq"` hands messages to the kernel's sequencer ahead of
 time, which keeps the timing within a millisecond even when the computer is
 busy. An agent saves the project by name and loads it back later, with
-everything it holds. See
+everything it holds, and exports it as a MIDI file that opens in a DAW. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
 stub.
 
@@ -34,6 +34,7 @@ cargo run -- projects             # the saved projects, newest first
 cargo run -- serve                # MCP over HTTP at http://127.0.0.1:6434/mcp
 cargo run -- serve --stdio        # MCP over stdin and stdout, for one agent
 cargo run -- serve --project jam  # start with the saved project "jam"
+cargo run -- export jam           # the saved project "jam" as exports/jam.mid
 ```
 
 Settings live in `treason.toml`; the example in this directory explains
@@ -58,6 +59,12 @@ before you stop: `save_project` writes it to `projects/<name>.toml`, and
 `load_project` or `serve --project` brings it back with its tempo, time
 signature and tracks, each with its clip, port, channel, device and mute.
 `status` says whether there are unsaved changes.
+
+`export_midi` writes the project as a MIDI file, `exports/<name>.mid`, with
+the tempo, the time signature and a track for each unmuted track, and
+`treason export` does the same for a saved project. By default the file runs
+until every loop ends on the same bar line, so each pattern is complete;
+`bars` (or `--bars`) sets the length, and `--output` writes elsewhere.
 
 ## Development
 

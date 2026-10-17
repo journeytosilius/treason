@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use treason_control::{ControlError, Edit, ProjectError, ProjectName, ProjectStore, Session};
+use treason_control::{
+    ControlError, Edit, ExportStore, ProjectError, ProjectName, ProjectStore, Session,
+};
+use treason_core::export::{self, ExportError, MAX_BARS, MidiExport};
 use treason_core::midi::Channel;
 use treason_core::model::{Clip, OutputTarget, PortId, Project, Track, TrackId};
 use treason_core::playback::{Playback, TransportCommand};
@@ -13,9 +16,9 @@ use treason_core::time::{Bpm, Ticks, TimeSignature};
 use treason_devices::DeviceProfile;
 
 use crate::dto::{
-    AddTrack, DeviceList, DeviceView, EditTrack, LoadProject, Play, PortList, ProjectList,
-    ProjectView, SaveProject, SetMuted, SetNotes, SetSteps, SetTempo, SetTimeSignature, StatusView,
-    TrackRef, TrackView,
+    AddTrack, DeviceList, DeviceView, EditTrack, ExportMidi, LoadProject, Play, PortList,
+    ProjectList, ProjectView, SaveProject, SetMuted, SetNotes, SetSteps, SetTempo,
+    SetTimeSignature, StatusView, TrackRef, TrackView,
 };
 use crate::{notes, pattern};
 
@@ -31,21 +34,28 @@ pub struct TreasonServer {
     session: SharedSession,
     ports: Arc<[String]>,
     projects: Arc<ProjectStore>,
+    exports: Arc<ExportStore>,
+    exporter: Arc<dyn MidiExport + Send + Sync>,
     tool_router: ToolRouter<Self>,
 }
 
 impl TreasonServer {
     /// Serves `session`. `ports` names the output ports, in `PortId` order,
-    /// and `projects` is where the project is saved.
+    /// `projects` is where the project is saved, and `exporter` writes the
+    /// MIDI files that go in `exports`.
     pub fn new(
         session: Session<Box<dyn Playback + Send>>,
         ports: Vec<String>,
         projects: ProjectStore,
+        exports: ExportStore,
+        exporter: Arc<dyn MidiExport + Send + Sync>,
     ) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
             ports: ports.into(),
             projects: Arc::new(projects),
+            exports: Arc::new(exports),
+            exporter,
             tool_router: Self::tool_router(),
         }
     }
@@ -134,12 +144,36 @@ fn describe_project(error: ProjectError) -> String {
             "there is already a project `{name}`; choose another name, or pass overwrite: true \
              to replace it"
         ),
+        ProjectError::ExportExists(name) => format!(
+            "there is already a MIDI file `{name}`; choose another name, or pass overwrite: true \
+             to replace it"
+        ),
         ProjectError::NotFound(name) => format!("there is no project `{name}`; see list_projects"),
         ProjectError::UnsavedChanges => "the project has unsaved changes, which loading would \
             lose; save them first with save_project, or pass discard_changes: true to load anyway"
             .into(),
         other => other.to_string(),
     }
+}
+
+/// A refused export, worded so the agent can fix the call.
+fn describe_export(error: ExportError) -> String {
+    match error {
+        ExportError::NoBars => format!("bars must be 1 to {MAX_BARS}, not 0"),
+        ExportError::TooManyBars(bars) => format!("bars must be 1 to {MAX_BARS}, not {bars}"),
+        ExportError::NoCycle => format!(
+            "the tracks' loops line up only after more than {MAX_BARS} bars; pass bars to say how \
+             many to export"
+        ),
+        ExportError::TooManyEvents(_) => format!("{error}; pass fewer bars"),
+        ExportError::Write(_) => error.to_string(),
+    }
+}
+
+/// `count` of `thing`, such as "1 track" or "3 tracks".
+fn count(count: usize, thing: &str) -> String {
+    let s = if count == 1 { "" } else { "s" };
+    format!("{count} {thing}{s}")
 }
 
 /// A rejected edit or command, worded so the agent can fix the call.
@@ -276,6 +310,66 @@ impl TreasonServer {
             )))
         })
         .await?
+    }
+
+    /// Exports the project as a Standard MIDI File that a DAW can open: a
+    /// track for each unmuted track, named after it, with the tempo and
+    /// time signature. Muted tracks are left out, as they are from playback.
+    /// The file plays from bar 1 for `bars` bars, by default until every
+    /// track's loop ends on the same bar line. It goes in the exports
+    /// directory as <name>.mid, by default under the project's own name;
+    /// replacing a different MIDI file needs overwrite: true. Returns where
+    /// the file is.
+    #[tool]
+    async fn export_midi(
+        &self,
+        Parameters(ExportMidi {
+            name,
+            bars,
+            overwrite,
+        }): Parameters<ExportMidi>,
+    ) -> Result<String, String> {
+        let name = name
+            .map(ProjectName::new)
+            .transpose()
+            .map_err(describe_project)?;
+        let (project, own) = {
+            let session = self.session();
+            (Arc::clone(session.project()), session.name().cloned())
+        };
+        let Some(name) = name.or_else(|| own.clone()) else {
+            return Err("the project has no name yet; give export_midi a name".into());
+        };
+        let overwrite = overwrite || own.as_ref() == Some(&name);
+        let bars = export::bars(&project, bars).map_err(describe_export)?;
+        let playing = project.tracks.iter().filter(|track| !track.muted).count();
+        let muted = project.tracks.len() - playing;
+
+        // Rendering a long song takes a while, so it runs on a thread that
+        // may block, with a snapshot rather than the session.
+        let exporter = Arc::clone(&self.exporter);
+        let exports = Arc::clone(&self.exports);
+        let path = tokio::task::spawn_blocking(move || {
+            let file = exporter
+                .export(&project, name.as_str(), bars)
+                .map_err(describe_export)?;
+            exports
+                .save(&name, &file, overwrite)
+                .map_err(describe_project)
+        })
+        .await
+        .map_err(|error| format!("the export failed: {error}"))??;
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let mut reply = format!(
+            "Exported {} with {} to {}.",
+            count(bars as usize, "bar"),
+            count(playing, "track"),
+            path.display()
+        );
+        if muted > 0 {
+            reply.push_str(&format!(" Left out {}.", count(muted, "muted track")));
+        }
+        Ok(reply)
     }
 
     /// Sets the tempo. It changes at once, even while playing.
@@ -519,7 +613,8 @@ its own clip on one MIDI port and channel, so clips of different lengths give po
 Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
 set_notes for melodic parts, then play. Edits apply while playing: tempo at once, everything \
 else at the next bar. undo reverts an edit. save_project keeps the work under a name, and \
-load_project brings it back; status says whether there are unsaved changes."
+load_project brings it back; status says whether there are unsaved changes. export_midi writes \
+a MIDI file that a DAW can open."
 )]
 impl ServerHandler for TreasonServer {}
 
@@ -551,6 +646,24 @@ mod tests {
         }
     }
 
+    /// Writes what it was asked to export instead of MIDI, and refuses a
+    /// song titled "huge" as too big.
+    struct FakeExport;
+
+    impl MidiExport for FakeExport {
+        fn export(
+            &self,
+            project: &Project,
+            title: &str,
+            bars: u32,
+        ) -> Result<Vec<u8>, ExportError> {
+            if title == "huge" {
+                return Err(ExportError::TooManyEvents(2_000_000));
+            }
+            Ok(format!("{title}: {} tracks, {bars} bars", project.tracks.len()).into_bytes())
+        }
+    }
+
     /// A directory for one test, removed when the test ends.
     struct TestDir(PathBuf);
 
@@ -569,7 +682,8 @@ mod tests {
         }
     }
 
-    /// A server that saves projects in `dir`.
+    /// A server that saves projects in `dir`, and exports to `exports` in
+    /// it.
     fn server_in(dir: &Path) -> TreasonServer {
         let devices_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices");
         let devices = DeviceRegistry::load_dir(&devices_dir).unwrap();
@@ -579,6 +693,8 @@ mod tests {
             session,
             vec!["out".into(), "synth".into()],
             ProjectStore::new(dir),
+            ExportStore::new(dir.join("exports")),
+            Arc::new(FakeExport),
         )
     }
 
@@ -597,6 +713,7 @@ mod tests {
             [
                 "add_track",
                 "edit_track",
+                "export_midi",
                 "get_project",
                 "list_devices",
                 "list_ports",
@@ -878,8 +995,14 @@ mod tests {
             devices.insert(device);
             let playback: Box<dyn Playback + Send> = Box::new(Silent);
             let session = Session::new(Arc::new(Project::default()), devices, playback);
-            let projects = ProjectStore::new(std::env::temp_dir().join("treason-mcp-unsaved"));
-            let server = TreasonServer::new(session, vec!["out".into()], projects);
+            let unsaved = std::env::temp_dir().join("treason-mcp-unsaved");
+            let server = TreasonServer::new(
+                session,
+                vec!["out".into()],
+                ProjectStore::new(&unsaved),
+                ExportStore::new(unsaved.join("exports")),
+                Arc::new(FakeExport),
+            );
             let track = add(&server, Some("pitched"));
             let mut request = notes(
                 track,
@@ -1160,5 +1283,118 @@ mod tests {
         assert_eq!(server.status().0.project.as_deref(), Some("first"));
         // Saving under the project's own name needs nothing more.
         server.save_project(save(None, false)).await.unwrap();
+    }
+
+    fn export(name: Option<&str>, bars: Option<u32>, overwrite: bool) -> Parameters<ExportMidi> {
+        Parameters(ExportMidi {
+            name: name.map(str::to_owned),
+            bars,
+            overwrite,
+        })
+    }
+
+    /// A melody of one note on track `track`, looping every `beats` beats.
+    fn melody(track: u32, beats: f64) -> Parameters<SetNotes> {
+        Parameters(SetNotes {
+            loop_beats: Some(beats),
+            ..notes(track, &[("C4", 0.0, 1.0)]).0
+        })
+    }
+
+    #[tokio::test]
+    async fn exports_complete_every_loop_under_the_projects_name() {
+        let dir = TestDir::new("export");
+        let server = server_in(&dir.0);
+        let exports = dir.0.join("exports");
+        let file =
+            |name: &str| std::fs::read_to_string(exports.join(format!("{name}.mid"))).unwrap();
+
+        // A three-beat loop meets the 4/4 bar line after three bars.
+        let lead = add(&server, None);
+        server.set_notes(melody(lead, 3.0)).unwrap();
+        let reply = server
+            .export_midi(export(Some("demo"), None, false))
+            .await
+            .unwrap();
+        let path = exports.join("demo.mid");
+        assert_eq!(
+            reply,
+            format!("Exported 3 bars with 1 track to {}.", path.display())
+        );
+        assert_eq!(file("demo"), "demo: 1 tracks, 3 bars");
+
+        // The project isn't called demo, so replacing the file takes
+        // overwrite.
+        let error = rejected(
+            server
+                .export_midi(export(Some("demo"), Some(8), false))
+                .await,
+        );
+        assert!(error.contains("pass overwrite: true"), "{error}");
+        assert_eq!(file("demo"), "demo: 1 tracks, 3 bars");
+        server
+            .export_midi(export(Some("demo"), Some(8), true))
+            .await
+            .unwrap();
+        assert_eq!(file("demo"), "demo: 1 tracks, 8 bars");
+
+        // Once saved, the project exports under its own name, as often as
+        // it likes. The exporter gets muted tracks too, and leaves them out.
+        server.save_project(save(Some("jam"), false)).await.unwrap();
+        let drums = add(&server, None);
+        server
+            .set_muted(Parameters(SetMuted {
+                track: drums,
+                muted: true,
+            }))
+            .unwrap();
+        for bars in [2, 1] {
+            let reply = server
+                .export_midi(export(None, Some(bars), false))
+                .await
+                .unwrap();
+            assert!(
+                reply.ends_with("jam.mid. Left out 1 muted track."),
+                "{reply}"
+            );
+            assert_eq!(
+                reply.starts_with("Exported 1 bar with 1 track to "),
+                bars == 1,
+                "{reply}"
+            );
+        }
+        assert_eq!(file("jam"), "jam: 2 tracks, 1 bars");
+    }
+
+    #[tokio::test]
+    async fn exporting_says_how_to_fix_the_call() {
+        let dir = TestDir::new("export-errors");
+        let server = server_in(&dir.0);
+        // A 1023-beat loop meets the 4/4 bar line only after 1023 bars.
+        let lead = add(&server, None);
+        server.set_notes(melody(lead, 1023.0)).unwrap();
+        let cases = [
+            (export(None, Some(4), false), "give export_midi a name"),
+            (export(Some("a/b"), Some(4), false), "letters, digits"),
+            (
+                export(Some("x"), Some(0), false),
+                "bars must be 1 to 1000, not 0",
+            ),
+            (
+                export(Some("x"), Some(1001), false),
+                "bars must be 1 to 1000, not 1001",
+            ),
+            (export(Some("x"), None, false), "pass bars to say how many"),
+            (export(Some("huge"), Some(4), false), "pass fewer bars"),
+        ];
+        for (call, expected) in cases {
+            let error = rejected(server.export_midi(call).await);
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        assert!(!dir.0.join("exports").exists());
+        server
+            .export_midi(export(Some("x"), Some(4), false))
+            .await
+            .unwrap();
     }
 }

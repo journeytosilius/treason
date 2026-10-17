@@ -445,6 +445,24 @@ pub struct LoadProject {
     pub discard_changes: bool,
 }
 
+/// Input for export_midi.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExportMidi {
+    /// The MIDI file's name, without ".mid": up to 64 letters, digits,
+    /// spaces, dashes and underscores, beginning with a letter or digit.
+    /// Defaults to the project's own name, which status shows.
+    pub name: Option<String>,
+    /// How many bars to export, from bar 1: 1 to 1000. Defaults to enough
+    /// for every track's loop to end on the same bar line, so that each
+    /// pattern is complete.
+    pub bars: Option<u32>,
+    /// Replace the MIDI file of that name. Not needed for the project's own
+    /// name.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 /// The name of a port, falling back to its number.
 fn port_name(ports: &[String], port: PortId) -> String {
     ports

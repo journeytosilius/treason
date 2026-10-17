@@ -8,6 +8,10 @@ devices = "devices"
 # Where saved projects go, a TOML file each. Saving creates the directory.
 projects = "projects"
 
+# Where `treason export` and the export_midi tool put MIDI files, a .mid file
+# each. Exporting creates the directory.
+exports = "exports"
+
 [mcp]
 # Where to serve MCP over HTTP. Keep it on loopback: only local agents should
 # reach the sequencer.

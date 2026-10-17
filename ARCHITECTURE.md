@@ -22,13 +22,13 @@ sound itself.
 
 | Crate | Responsibility | Depends on |
 |---|---|---|
-| `treason-core` | MIDI types, musical time, the project model, and the traits between crates (`MidiOutput`, `Playback`). No I/O, threads or async. | nothing of ours |
+| `treason-core` | MIDI types, musical time, the project model, and the traits between crates (`MidiOutput`, `Playback`, `MidiExport`). No I/O, threads or async. | nothing of ours |
 | `treason-devices` | Device profiles: the names each synth or drum machine gives its notes and controls, loaded from TOML. | core |
 | `treason-engine` | Real-time playback: timebase, transport, rendering, note tracking, MIDI clock, the engine thread. | core |
-| `treason-io` | MIDI backends that implement `MidiOutput`, each behind a Cargo feature. | core |
-| `treason-control` | The application layer: validates edits, keeps undo history, publishes snapshots through `Playback`, saves and loads projects. | core, devices |
+| `treason-io` | MIDI backends that implement `MidiOutput`, and the MIDI file writer, each behind a Cargo feature. | core |
+| `treason-control` | The application layer: validates edits, keeps undo history, publishes snapshots through `Playback`, saves and loads projects, keeps exported MIDI files. | core, devices |
 | `treason-mcp` | The MCP server: the agent's tools, their schemas, and the HTTP and stdio transports. | control, core, devices |
-| `treason` | The binary and composition root: CLI, configuration, wiring. | all |
+| `treason` | The binary and composition root: CLI, configuration, wiring, and the MIDI export that joins the engine's renderer to the file writer. | all |
 
 ```text
                        treason (bin)
@@ -48,7 +48,9 @@ sound itself.
 The engine and the backends never see each other: the binary hands the
 engine a `MidiOutput`. Likewise the control layer never sees the engine. It
 talks to a `Playback`, which the engine's handle implements and tests replace
-with a fake.
+with a fake. The MCP server exports MIDI files the same way, through a
+`MidiExport` that the binary builds from the engine's renderer and
+`treason-io`'s writer.
 
 ## Repository layout
 
@@ -70,27 +72,28 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `model` | `Project`, `Track`, `Clip`, `ClipEvent` | done |
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
+| core | `export` | `MidiExport`, `ExportError`, `bars`: how long an export runs | done |
 | devices | `profile`, `registry` | `DeviceProfile`, `DeviceRegistry` | done |
 | engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
 | engine | `timebase` | `Timebase`: ticks to when they're heard and back, across tempo changes | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics and the messages clock ports get | done |
-| engine | `render` | `render` (clip events and clock pulses in a window), `clock_pulses` | done |
+| engine | `render` | `render` (clip events and clock pulses in a window), `clock_pulses`, `render_song` (a whole song, with its notes ended) | done |
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, per-port latency, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: a kernel-scheduled queue that knows exactly what it sent | done |
-| io | `smf` (feature `smf`) | `write`: Standard MIDI Files | stub |
+| io | `smf` (feature `smf`) | `write`, `Song`: Standard MIDI Files, format 1 | done |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
-| control | `file`, `store` | project files; `ProjectStore`: saving and loading by name | done |
+| control | `file`, `store` | project files; `ProjectStore`: saving and loading by name; `ExportStore`: exported MIDI files | done |
 | mcp | `server` | `TreasonServer`: the tools | done |
 | mcp | `dto` | tool inputs and outputs | done |
 | mcp | `notation` | step strings and pitch names | done |
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `notes` | lists of notes in beats to clips | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
-| treason | `main`, `config`, `serve` | subcommands `serve`, `ports`, `devices`; `treason.toml`; picks the backend | done |
+| treason | `main`, `config`, `serve`, `export` | subcommands `serve`, `ports`, `devices`, `projects`, `export`; `treason.toml`; picks the backend; `SmfExport` | done |
 
 ## Runtime
 
@@ -283,6 +286,7 @@ breaking the other.
 | `play`, `stop`, `panic` | transport |
 | `undo`, `redo` | history |
 | `save_project`, `load_project` | saved projects |
+| `export_midi` | MIDI files |
 
 Tool descriptions and parameter schemas come from the Rust doc comments
 (through schemars), so the code documents the agent's interface. A rejected
@@ -334,12 +338,43 @@ project. So loading refuses to drop unsaved changes unless told to. While
 playing, a load applies like any edit: the tempo at once, the tracks at
 the next bar.
 
+## MIDI export
+
+`export_midi` writes the project as a Standard MIDI File,
+`<exports>/<name>.mid`, and `treason export <name>` does the same for a
+saved project. A DAW opens it with each part on its own track.
+
+- Format 1 at 960 ticks per quarter note, treason's own resolution, so
+  every event keeps its exact tick. The first track holds the title, the
+  time signature and the tempo. Then comes a track for each unmuted track,
+  named after it, with its messages on its channel. Muted tracks are left
+  out, as they are from playback. MIDI clock and transport messages are
+  for live gear and stay out of the file.
+- The file plays from bar 1 for a number of bars: by default until every
+  loop that plays something ends on the same bar line, so each pattern is
+  complete. A one-bar drum loop with a three-bar bass line exports three
+  bars. Loops that take more than 1000 bars to line up need a length, and
+  no export runs longer.
+- The engine's `render_song` renders the song with the same code that
+  plays it, so the file holds what `play` would send. Notes still sounding
+  at the end stop there, and a note started again before it ended gets a
+  note-off for each start.
+- An export is counted before it is rendered, and one of more than
+  1,000,000 events is refused, which bounds the memory and the file.
+- The file is written like a saved project: flushed under a temporary
+  name, then linked or renamed into place. Exporting under the project's
+  own name replaces the old file, and replacing any other file needs
+  `overwrite`. `treason export` always replaces its project's file.
+
+The MCP server takes a snapshot of the project and renders it on a thread
+that may block, so a long song doesn't hold up the session or other tools.
+
 ## Configuration
 
 `treason.toml`, read from the working directory or given with `--config`.
-Every setting has a default: the device directory, the directory for
-saved projects, the MCP address, the engine's lookahead and real-time
-priority, the backend, and the output ports. The backend is midir unless `engine.backend` names the ALSA
+Every setting has a default: the device directory, the directories for
+saved projects and exported MIDI files, the MCP address, the engine's
+lookahead and real-time priority, the backend, and the output ports. The backend is midir unless `engine.backend` names the ALSA
 sequencer queue (`alsa-seq`, Linux only), and the binary turns on
 `treason-io`'s `alsa-seq` feature on Linux. Each port
 has a name that tracks refer to and either connects to an existing port by
@@ -358,7 +393,7 @@ All support Rust 1.95 (checked on crates.io on 2026-10-16).
 | spin_sleep, thread-priority | 1.3, 3.1 | engine | accurate waits, real-time priority |
 | midir | 0.11 | io, feature `midir` | portable MIDI output and virtual ports; needs `libasound2-dev` |
 | alsa | 0.12 | io, feature `alsa-seq` | kernel-scheduled output on Linux |
-| midly | 0.5 | io, feature `smf` | MIDI file export |
+| midly | 0.5 | io, feature `smf`; bin (tests) | MIDI file export, without its default `parallel` feature and the rayon it brings |
 | rmcp, schemars | 3.5, 1.2 | mcp | MCP server and tool schemas (rmcp needs Rust 1.88 or later) |
 | tokio, tokio-util, axum | 1.53, 0.7, 0.8 | mcp, bin | async runtime, HTTP server |
 | clap, anyhow | 4.6, 1.0 | bin | CLI, error reporting |
@@ -416,7 +451,8 @@ The third milestone keeps the work:
 
 10. Saved projects: `save_project`, `load_project` and `list_projects`,
     `treason serve --project` and `treason projects`. Done.
-11. MIDI file export: `smf::write`, so a project opens in a DAW.
+11. MIDI file export: `smf::write`, the `export_midi` tool and
+    `treason export`, so a project opens in a DAW. Done.
 
 Later: following an external clock (which needs MIDI input), and
 probability, ratchets and conditions on events.
