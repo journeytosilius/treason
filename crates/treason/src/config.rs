@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
+use treason_control::ProjectStore;
 use treason_devices::DeviceRegistry;
 use treason_engine::{EngineConfig, PortSettings};
 use treason_io::PortSpec;
@@ -20,6 +21,8 @@ const DEFAULT_FILE: &str = "treason.toml";
 pub struct Config {
     /// The device profile directory. Relative to the config file.
     pub devices: PathBuf,
+    /// Where projects are saved. Relative to the config file.
+    pub projects: PathBuf,
     /// The MCP server.
     pub mcp: McpOptions,
     /// The engine.
@@ -93,6 +96,7 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         if let Some(dir) = path.parent() {
             config.devices = dir.join(&config.devices);
+            config.projects = dir.join(&config.projects);
         }
         config
             .validate()
@@ -104,6 +108,11 @@ impl Config {
     pub fn load_devices(&self) -> anyhow::Result<DeviceRegistry> {
         DeviceRegistry::load_dir(&self.devices)
             .with_context(|| format!("loading device profiles from {}", self.devices.display()))
+    }
+
+    /// The saved projects.
+    pub fn project_store(&self) -> ProjectStore {
+        ProjectStore::new(&self.projects)
     }
 
     /// The ports' names, in `PortId` order.
@@ -166,6 +175,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             devices: PathBuf::from("devices"),
+            projects: PathBuf::from("projects"),
             mcp: McpOptions::default(),
             engine: EngineOptions::default(),
             ports: vec![PortOptions {
@@ -205,6 +215,10 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../treason.toml");
         let config = Config::load(Some(&path)).unwrap();
         assert!(config.load_devices().unwrap().get("gm-drums").is_some());
+        assert_eq!(
+            config.project_store().dir(),
+            path.parent().unwrap().join("projects")
+        );
         assert_eq!(config.port_names(), ["out"]);
         assert_eq!(config.engine_config().lookahead, Duration::from_millis(20));
         assert_eq!(config.engine.backend, Backend::Midir);

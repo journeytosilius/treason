@@ -26,7 +26,7 @@ sound itself.
 | `treason-devices` | Device profiles: the names each synth or drum machine gives its notes and controls, loaded from TOML. | core |
 | `treason-engine` | Real-time playback: timebase, transport, rendering, note tracking, MIDI clock, the engine thread. | core |
 | `treason-io` | MIDI backends that implement `MidiOutput`, each behind a Cargo feature. | core |
-| `treason-control` | The application layer: validates edits, keeps undo history, publishes snapshots through `Playback`. | core, devices |
+| `treason-control` | The application layer: validates edits, keeps undo history, publishes snapshots through `Playback`, saves and loads projects. | core, devices |
 | `treason-mcp` | The MCP server: the agent's tools, their schemas, and the HTTP and stdio transports. | control, core, devices |
 | `treason` | The binary and composition root: CLI, configuration, wiring. | all |
 
@@ -83,6 +83,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | io | `alsa_seq` (feature `alsa-seq`) | `AlsaSeqOutput`: a kernel-scheduled queue that knows exactly what it sent | done |
 | io | `smf` (feature `smf`) | `write`: Standard MIDI Files | stub |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
+| control | `file`, `store` | project files; `ProjectStore`: saving and loading by name | done |
 | mcp | `server` | `TreasonServer`: the tools | done |
 | mcp | `dto` | tool inputs and outputs | done |
 | mcp | `notation` | step strings and pitch names | done |
@@ -275,12 +276,13 @@ breaking the other.
 
 | Tools | |
 |---|---|
-| `get_project`, `status`, `list_devices`, `list_ports` | read only |
+| `get_project`, `status`, `list_devices`, `list_ports`, `list_projects` | read only |
 | `add_track`, `edit_track`, `remove_track`, `set_muted` | tracks |
 | `set_steps`, `set_notes` | clips |
 | `set_tempo`, `set_time_signature` | project |
 | `play`, `stop`, `panic` | transport |
 | `undo`, `redo` | history |
+| `save_project`, `load_project` | saved projects |
 
 Tool descriptions and parameter schemas come from the Rust doc comments
 (through schemars), so the code documents the agent's interface. A rejected
@@ -295,12 +297,49 @@ otherwise, with sharps: C4 is middle C, note 60. If that pitch name is a
 device voice or alias for another note, readback uses the decimal MIDI
 number instead, so writing the notes back preserves their pitches.
 
+## Saved projects
+
+`save_project` writes the project to `<projects>/<name>.toml`, and
+`load_project` reads it back exactly: the tempo, the time signature, and
+every track with its id, name, device, port, channel, mute and clip.
+`treason serve --project <name>` starts with one, and `treason projects`
+lists them.
+
+- The format is the control layer's own, not the core model's serde form,
+  so the model can change without breaking saved projects. Each file
+  starts with `format = 1`, and a file in a format this version doesn't
+  read is refused as such.
+- Tracks name their port, since a port's number is its place in
+  `treason.toml`. Times are whole ticks, and events go one to a line, in
+  the clip's order, so events on the same tick keep their order.
+- Loading checks what an edit would: every port and device exists, track
+  ids are unique and clips are valid. A file that fails changes nothing.
+- Saving writes a temporary file and flushes it to disk. A new name is
+  published with a hard link, which atomically refuses an existing name
+  even when another process saves it concurrently. Replacements rename
+  the temporary file over the old one. A failed save leaves the old
+  project as it was. A project file holds at most 16 MiB, and saving
+  refuses a bigger project, so every saved project loads.
+- Names hold letters, digits, spaces, dashes and underscores, so they can't
+  reach outside the directory or hide a file.
+
+The session remembers the name the project was last saved as or loaded
+from, and the snapshot it saved then. Any other snapshot has unsaved
+changes, so undoing back to the save leaves none. Saving without a name
+saves under the project's own name, and saving over another project needs
+`overwrite`. Loading replaces the project and clears the undo history,
+because stepping back past a load would leave the session named after a
+project it no longer holds, and the next save would overwrite that
+project. So loading refuses to drop unsaved changes unless told to. While
+playing, a load applies like any edit: the tempo at once, the tracks at
+the next bar.
+
 ## Configuration
 
 `treason.toml`, read from the working directory or given with `--config`.
-Every setting has a default: the device directory, the MCP address, the
-engine's lookahead and real-time priority, the backend, and the output
-ports. The backend is midir unless `engine.backend` names the ALSA
+Every setting has a default: the device directory, the directory for
+saved projects, the MCP address, the engine's lookahead and real-time
+priority, the backend, and the output ports. The backend is midir unless `engine.backend` names the ALSA
 sequencer queue (`alsa-seq`, Linux only), and the binary turns on
 `treason-io`'s `alsa-seq` feature on Linux. Each port
 has a name that tracks refer to and either connects to an existing port by
@@ -373,5 +412,11 @@ The second milestone drives other gear:
    Done.
 9. The ALSA sequencer queue backend, for kernel-timed delivery. Done.
 
-Later: MIDI file export, following an external clock (which needs MIDI
-input), and probability, ratchets and conditions on events.
+The third milestone keeps the work:
+
+10. Saved projects: `save_project`, `load_project` and `list_projects`,
+    `treason serve --project` and `treason projects`. Done.
+11. MIDI file export: `smf::write`, so a project opens in a DAW.
+
+Later: following an external clock (which needs MIDI input), and
+probability, ratchets and conditions on events.

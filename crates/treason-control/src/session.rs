@@ -1,4 +1,5 @@
-//! The session: the current project, its history and the link to playback.
+//! The session: the current project, its history, where it is saved and the
+//! link to playback.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use treason_core::playback::{Playback, PlaybackError, PlaybackStatus, TransportC
 use treason_devices::DeviceRegistry;
 
 use crate::edit::Edit;
+use crate::store::{ProjectError, ProjectName, ProjectStore};
 
 /// How many past snapshots undo keeps.
 const UNDO_LIMIT: usize = 256;
@@ -32,14 +34,20 @@ pub enum ControlError {
 
 /// The project being worked on and everything that changes it.
 ///
-/// Holds the current snapshot, undo and redo history, the device profiles and
-/// the [`Playback`] that plays it. Single-threaded by design: an adapter that
-/// serves several clients puts it behind a mutex. None of this runs on the
-/// engine thread, so holding that lock never delays playback.
+/// Holds the current snapshot, undo and redo history, the project's name and
+/// the snapshot last saved, the device profiles and the [`Playback`] that
+/// plays it. Single-threaded by design: an adapter that serves several
+/// clients puts it behind a mutex. None of this runs on the engine thread,
+/// so holding that lock never delays playback.
 pub struct Session<P> {
     project: Arc<Project>,
     undo: VecDeque<Arc<Project>>,
     redo: Vec<Arc<Project>>,
+    /// What the project was last saved as or loaded from.
+    name: Option<ProjectName>,
+    /// The snapshot last saved or loaded, or the first one. Any other has
+    /// unsaved changes.
+    saved: Arc<Project>,
     devices: DeviceRegistry,
     playback: P,
 }
@@ -49,12 +57,21 @@ impl<P: Playback> Session<P> {
     pub fn new(project: Arc<Project>, devices: DeviceRegistry, mut playback: P) -> Self {
         playback.publish(Arc::clone(&project));
         Self {
+            saved: Arc::clone(&project),
             project,
             undo: VecDeque::new(),
             redo: Vec::new(),
+            name: None,
             devices,
             playback,
         }
+    }
+
+    /// Names the project, as one loaded from the project `name`, so that
+    /// saving without a name saves there.
+    pub fn with_name(mut self, name: ProjectName) -> Self {
+        self.name = Some(name);
+        self
     }
 
     /// The current snapshot.
@@ -70,6 +87,65 @@ impl<P: Playback> Session<P> {
     /// What plays the project.
     pub fn playback(&self) -> &P {
         &self.playback
+    }
+
+    /// The name the project was last saved as or loaded from.
+    pub fn name(&self) -> Option<&ProjectName> {
+        self.name.as_ref()
+    }
+
+    /// Whether the project has changed since it was last saved or loaded,
+    /// or since the session started. Undoing back to that point leaves no
+    /// changes.
+    pub fn has_unsaved_changes(&self) -> bool {
+        !Arc::ptr_eq(&self.project, &self.saved)
+    }
+
+    /// Saves the project in `store` as `name`, or under its own name, and
+    /// makes that its name. Saving over another project needs `overwrite`.
+    /// `ports` names the output ports, in `PortId` order.
+    pub fn save(
+        &mut self,
+        store: &ProjectStore,
+        ports: &[String],
+        name: Option<ProjectName>,
+        overwrite: bool,
+    ) -> Result<ProjectName, ProjectError> {
+        let Some(name) = name.or_else(|| self.name.clone()) else {
+            return Err(ProjectError::Unnamed);
+        };
+        let overwrite = overwrite || self.name.as_ref() == Some(&name);
+        store.save(&name, &self.project, ports, overwrite)?;
+        self.saved = Arc::clone(&self.project);
+        self.name = Some(name.clone());
+        Ok(name)
+    }
+
+    /// Replaces the project with the one saved in `store` as `name` and
+    /// publishes it. Refuses while the project has unsaved changes, unless
+    /// `discard_changes`. `ports` names the output ports, in `PortId` order.
+    ///
+    /// Clears the undo history: stepping back past a load would leave the
+    /// session named after a project it no longer holds, and the next save
+    /// would overwrite that project.
+    pub fn load(
+        &mut self,
+        store: &ProjectStore,
+        ports: &[String],
+        name: ProjectName,
+        discard_changes: bool,
+    ) -> Result<(), ProjectError> {
+        if self.has_unsaved_changes() && !discard_changes {
+            return Err(ProjectError::UnsavedChanges);
+        }
+        let project = Arc::new(store.load(&name, ports, &self.devices)?);
+        self.saved = Arc::clone(&project);
+        self.project = project;
+        self.undo.clear();
+        self.redo.clear();
+        self.name = Some(name);
+        self.publish();
+        Ok(())
     }
 
     /// Validates `edit`, applies it and publishes the result.
@@ -187,6 +263,7 @@ mod tests {
     use treason_core::time::Bpm;
 
     use super::*;
+    use crate::store::TestDir;
 
     #[derive(Default)]
     struct FakePlayback {
@@ -307,5 +384,235 @@ mod tests {
         let after = session.project();
         assert!(!Arc::ptr_eq(&before.tracks[0], &after.tracks[0]));
         assert!(Arc::ptr_eq(&before.tracks[1], &after.tracks[1]));
+    }
+
+    fn name(name: &str) -> ProjectName {
+        ProjectName::new(name).unwrap()
+    }
+
+    fn ports() -> Vec<String> {
+        vec!["out".into()]
+    }
+
+    fn tempo(bpm: f64) -> Edit {
+        Edit::SetTempo(Bpm::new(bpm).unwrap())
+    }
+
+    #[test]
+    fn saving_names_the_project_and_undo_can_return_to_it() {
+        let dir = TestDir::new("session-save");
+        let store = ProjectStore::new(dir.path());
+        let mut session = session(vec![track(1)]);
+        assert_eq!(
+            (session.name(), session.has_unsaved_changes()),
+            (None, false)
+        );
+        assert!(matches!(
+            session.save(&store, &ports(), None, false),
+            Err(ProjectError::Unnamed)
+        ));
+
+        session.apply(tempo(140.0)).unwrap();
+        assert!(session.has_unsaved_changes());
+        let saved = session.save(&store, &ports(), Some(name("jam")), false);
+        assert_eq!(saved.unwrap(), name("jam"));
+        assert_eq!(session.name(), Some(&name("jam")));
+        assert!(!session.has_unsaved_changes());
+        assert_eq!(
+            store
+                .load(&name("jam"), &ports(), session.devices())
+                .unwrap(),
+            **session.project()
+        );
+
+        session.apply(tempo(150.0)).unwrap();
+        assert!(session.has_unsaved_changes());
+        assert!(session.undo());
+        assert!(!session.has_unsaved_changes(), "back where it was saved");
+        assert!(session.redo());
+        assert!(session.has_unsaved_changes());
+
+        // Saving again needs no name and no overwrite.
+        assert_eq!(
+            session.save(&store, &ports(), None, false).unwrap(),
+            name("jam")
+        );
+        assert!(!session.has_unsaved_changes());
+        let tempo = store
+            .load(&name("jam"), &ports(), session.devices())
+            .unwrap()
+            .tempo;
+        assert_eq!(tempo.get(), 150.0);
+    }
+
+    #[test]
+    fn saving_over_another_project_needs_overwrite() {
+        let dir = TestDir::new("session-overwrite");
+        let store = ProjectStore::new(dir.path());
+        let other = Project {
+            tempo: Bpm::new(90.0).unwrap(),
+            ..Project::default()
+        };
+        store.save(&name("other"), &other, &ports(), false).unwrap();
+        let mut session = session(vec![track(1)]);
+        session
+            .save(&store, &ports(), Some(name("jam")), false)
+            .unwrap();
+        session.apply(tempo(140.0)).unwrap();
+
+        let refused = session.save(&store, &ports(), Some(name("other")), false);
+        assert!(matches!(refused, Err(ProjectError::Exists(taken)) if taken == name("other")));
+        assert_eq!(session.name(), Some(&name("jam")));
+        assert!(session.has_unsaved_changes());
+        assert_eq!(
+            store
+                .load(&name("other"), &ports(), session.devices())
+                .unwrap(),
+            other
+        );
+
+        session
+            .save(&store, &ports(), Some(name("other")), true)
+            .unwrap();
+        assert_eq!(session.name(), Some(&name("other")));
+        let loaded = store
+            .load(&name("other"), &ports(), session.devices())
+            .unwrap();
+        assert_eq!(loaded, **session.project());
+    }
+
+    #[test]
+    fn competing_first_saves_preserve_the_winners_project() {
+        let dir = TestDir::new("competing-first-saves");
+        let path = dir.path();
+        let ready = std::sync::Barrier::new(2);
+        let saves = std::thread::scope(|scope| {
+            let ready = &ready;
+            let saves = [90.0, 140.0].map(|bpm| {
+                scope.spawn(move || {
+                    // Independent stores and sessions, as in two servers
+                    // sharing a projects directory, with no common mutex.
+                    let store = ProjectStore::new(path);
+                    let mut session = session(vec![track(1)]);
+                    session.apply(tempo(bpm)).unwrap();
+                    assert!(!store.exists(&name("jam")).unwrap());
+                    ready.wait();
+                    let result = session.save(&store, &ports(), Some(name("jam")), false);
+                    (session, result)
+                })
+            });
+            saves.map(|save| save.join().unwrap())
+        });
+
+        let mut winner = None;
+        for (session, result) in saves {
+            match result {
+                Ok(saved) => {
+                    assert!(winner.is_none(), "only one first save may succeed");
+                    assert_eq!(saved, name("jam"));
+                    assert_eq!(session.name(), Some(&name("jam")));
+                    assert!(!session.has_unsaved_changes());
+                    winner = Some(Arc::clone(session.project()));
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(&error, ProjectError::Exists(taken) if *taken == name("jam")),
+                        "{error}"
+                    );
+                    assert_eq!(session.name(), None);
+                    assert!(session.has_unsaved_changes());
+                }
+            }
+        }
+        let winner = winner.expect("one first save must succeed");
+        let store = ProjectStore::new(path);
+        assert_eq!(
+            store
+                .load(&name("jam"), &ports(), &DeviceRegistry::new())
+                .unwrap(),
+            *winner
+        );
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_failed_save_changes_nothing() {
+        let dir = TestDir::new("session-failed-save");
+        let store = ProjectStore::new(dir.path());
+        let mut session = session(vec![track(1)]);
+        session.apply(tempo(140.0)).unwrap();
+        // The track's port has no name.
+        let error = session
+            .save(&store, &[], Some(name("jam")), false)
+            .unwrap_err();
+        assert!(matches!(error, ProjectError::File { .. }), "{error}");
+        assert_eq!(session.name(), None);
+        assert!(session.has_unsaved_changes());
+        assert!(!store.exists(&name("jam")).unwrap());
+    }
+
+    #[test]
+    fn loading_replaces_the_project_and_its_history() {
+        let dir = TestDir::new("session-load");
+        let store = ProjectStore::new(dir.path());
+        let saved = Project {
+            tempo: Bpm::new(90.0).unwrap(),
+            tracks: vec![Arc::new(track(4)), Arc::new(track(2))],
+            ..Project::default()
+        };
+        store.save(&name("jam"), &saved, &ports(), false).unwrap();
+        let mut session = session(vec![track(1)]);
+        session.apply(tempo(140.0)).unwrap();
+        let before = Arc::clone(session.project());
+
+        let refused = session.load(&store, &ports(), name("jam"), false);
+        assert!(matches!(refused, Err(ProjectError::UnsavedChanges)));
+        assert!(Arc::ptr_eq(session.project(), &before));
+        assert_eq!(session.playback().published.len(), 2);
+
+        session.load(&store, &ports(), name("jam"), true).unwrap();
+        assert_eq!(**session.project(), saved);
+        assert_eq!(session.name(), Some(&name("jam")));
+        assert!(!session.has_unsaved_changes());
+        assert!(!session.undo(), "loading clears the history");
+        assert!(!session.redo());
+        let published = &session.playback().published;
+        assert_eq!(published.len(), 3);
+        assert!(Arc::ptr_eq(&published[2], session.project()));
+        // New tracks follow the loaded ones.
+        assert_eq!(session.project().next_track_id(), TrackId(5));
+
+        // With no unsaved changes, loading needs no permission.
+        session.load(&store, &ports(), name("jam"), false).unwrap();
+    }
+
+    #[test]
+    fn a_failed_load_changes_nothing() {
+        let dir = TestDir::new("session-failed-load");
+        let store = ProjectStore::new(dir.path());
+        let mut with_device = track(1);
+        with_device.device = Some("tr8".into());
+        let unknown_device = Project {
+            tracks: vec![Arc::new(with_device)],
+            ..Project::default()
+        };
+        store
+            .save(&name("tr8"), &unknown_device, &ports(), false)
+            .unwrap();
+        let mut session = session(vec![track(1)]).with_name(name("jam"));
+        session.apply(tempo(140.0)).unwrap();
+        let before = Arc::clone(session.project());
+
+        for (load, expected) in [("missing", "no project `missing`"), ("tr8", "device `tr8`")] {
+            let error = session
+                .load(&store, &ports(), name(load), true)
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(Arc::ptr_eq(session.project(), &before));
+            assert_eq!(session.name(), Some(&name("jam")));
+            assert!(session.has_unsaved_changes());
+            assert_eq!(session.playback().published.len(), 2);
+        }
+        assert!(session.undo(), "the history stays");
     }
 }

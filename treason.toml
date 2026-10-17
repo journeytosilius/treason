@@ -5,6 +5,9 @@
 # The device profile directory (*.toml).
 devices = "devices"
 
+# Where saved projects go, a TOML file each. Saving creates the directory.
+projects = "projects"
+
 [mcp]
 # Where to serve MCP over HTTP. Keep it on loopback: only local agents should
 # reach the sequencer.
