@@ -426,9 +426,11 @@ saved project. A DAW opens it with each part on its own track.
   named after it, with its messages on its channel. Muted tracks are left
   out, as they are from playback. MIDI clock and transport messages are
   for live gear and stay out of the file.
-- Each track's program opens its file track, ahead of its notes. A muted
-  track's program sets its channel for the tracks that play there, so it
-  goes to the first of them, and stays out when none does.
+- Bank selects and program changes at tick 0 go to the first unmuted file
+  track on their port and channel, in render order, ahead of its notes.
+  This keeps channel setup ahead of notes on later file tracks too, even
+  when a later or muted track sets the program. A muted track's program
+  stays out when no unmuted track shares its port and channel.
 - The file plays from bar 1 for a number of bars: by default until every
   loop that plays something ends on the same bar line, so each pattern is
   complete. A one-bar drum loop with a three-bar bass line exports three

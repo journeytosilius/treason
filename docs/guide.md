@@ -422,9 +422,11 @@ load_project {"name": "first groove"}
   once and its tracks at the next bar. `list_projects` lists saved
   projects, newest first.
 - `export_midi` writes a Standard MIDI File that a DAW opens, with a track
-  for each unmuted track, the tempo and the time signature. By default it
-  runs from bar 1 until every loop ends on the same bar line, so each
-  pattern is complete; `bars` sets the length, at most 1000. Its `name`
+  for each unmuted track, the tempo and the time signature. Startup bank
+  selects and program changes go before the notes in the first unmuted
+  track on their port and channel, including programs set by muted tracks.
+  By default it runs from bar 1 until every loop ends on the same bar line,
+  so each pattern is complete; `bars` sets the length, at most 1000. Its `name`
   defaults to the project's, and replacing another file needs
   `"overwrite": true`. It replies with the file's path.
 
