@@ -180,6 +180,10 @@ mod tests {
                                 channel,
                                 message: MidiMessage::NoteOff { key, .. },
                             } => format!("off {key} ch{}", channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::Controller { controller, value },
+                            } => format!("cc{controller} {value} ch{}", channel.as_int() + 1),
                             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                                 format!("name {}", String::from_utf8_lossy(name))
                             }
@@ -240,6 +244,145 @@ mod tests {
                 "7680 end",
             ]
         );
+    }
+
+    #[test]
+    fn tracks_of_controls_alone_export_their_control_changes() {
+        let control = |start, value| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Control {
+                controller: U7::new(1).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        };
+        let mut modulation = track(1, "modulation", 3, 3840, &[]);
+        modulation.clip = Clip::new(Ticks(3840), vec![control(0, 0), control(1920, 127)]).unwrap();
+        let project = Project {
+            tracks: vec![Arc::new(modulation)],
+            ..Project::default()
+        };
+        assert_eq!(export::bars(&project, None), Ok(1));
+        let file = SmfExport.export(&project, "wheel", 2).unwrap();
+        assert_eq!(
+            tracks(&file)[1],
+            [
+                "0 name modulation",
+                "0 cc1 0 ch3",
+                "1920 cc1 127 ch3",
+                "3840 cc1 0 ch3",
+                "5760 cc1 127 ch3",
+                "7680 end",
+            ]
+        );
+    }
+
+    #[test]
+    fn exports_release_pedal_holds_even_after_the_normal_note_off() {
+        for pedal in [64, 66] {
+            for note_length in [960, 5760] {
+                let mut synth = track(1, "synth", 3, 7680, &[(0, 60, note_length)]);
+                let mut events = synth.clip.events().to_vec();
+                // Sostenuto captures keys already down. Sustain can be
+                // pressed before the note starts.
+                let pedal_at = if pedal == 64 { 0 } else { 240 };
+                for (at, value) in [(pedal_at, 127), (6720, 0)] {
+                    events.push(ClipEvent {
+                        start: Ticks(at),
+                        kind: EventKind::Control {
+                            controller: U7::new(pedal).unwrap(),
+                            value: U7::new(value).unwrap(),
+                        },
+                    });
+                }
+                synth.clip = Clip::new(Ticks(7680), events).unwrap();
+                let project = Project {
+                    tracks: vec![Arc::new(synth)],
+                    ..Project::default()
+                };
+                // Export only the first bar: the authored pedal-off is
+                // outside the file, and the short note's key is up well
+                // before the cutoff, while the pedal still holds it.
+                let file = SmfExport.export(&project, "pedals", 1).unwrap();
+                let mut expected = vec!["0 name synth".to_owned()];
+                if pedal == 64 {
+                    expected.extend(["0 cc64 127 ch3".into(), "0 on 60 ch3".into()]);
+                } else {
+                    expected.extend(["0 on 60 ch3".into(), "240 cc66 127 ch3".into()]);
+                }
+                expected.extend([
+                    format!("{} off 60 ch3", note_length.min(3840)),
+                    format!("3840 cc{pedal} 0 ch3"),
+                    "3840 end".into(),
+                ]);
+                assert_eq!(
+                    tracks(&file)[1],
+                    expected,
+                    "pedal {pedal}, note {note_length}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_control_updates_preserve_the_rendered_rpn_sequence() {
+        let mut synth = track(1, "synth", 3, 3840, &[]);
+        synth.clip = Clip::new(
+            Ticks(3840),
+            [(101, 0), (100, 0), (6, 12)]
+                .map(|(controller, value)| ClipEvent {
+                    start: Ticks::ZERO,
+                    kind: EventKind::Control {
+                        controller: U7::new(controller).unwrap(),
+                        value: U7::new(value).unwrap(),
+                    },
+                })
+                .to_vec(),
+        )
+        .unwrap();
+        for controllers in [vec![100], vec![100, 101]] {
+            let controls = controllers
+                .into_iter()
+                .map(|controller| {
+                    (
+                        controller.to_string(),
+                        treason_mcp::dto::ControlLane {
+                            points: vec![treason_mcp::dto::ControlPoint {
+                                at: 0.0,
+                                value: if controller == 100 { 2 } else { 0 },
+                                ramp: None,
+                            }],
+                            repeat_beats: None,
+                        },
+                    )
+                })
+                .collect();
+            let mut updated = synth.clone();
+            updated.clip = treason_mcp::controls::clip_with_controls(
+                &synth.clip,
+                &controls,
+                Some(4.0),
+                Ticks(3840),
+                None,
+            )
+            .unwrap();
+            let project = Project {
+                tracks: vec![Arc::new(updated)],
+                ..Project::default()
+            };
+            // The complete file stream goes through the live renderer;
+            // checking each controller separately would miss the bug.
+            let file = SmfExport.export(&project, "rpn", 1).unwrap();
+            assert_eq!(
+                tracks(&file)[1],
+                [
+                    "0 name synth",
+                    "0 cc101 0 ch3",
+                    "0 cc100 2 ch3",
+                    "0 cc6 12 ch3",
+                    "3840 end",
+                ]
+            );
+        }
     }
 
     #[test]

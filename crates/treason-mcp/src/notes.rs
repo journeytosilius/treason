@@ -301,13 +301,14 @@ fn check_overlaps(notes: &[NoteSpec], placed: &[Placed], length: Ticks) -> Resul
 
 /// A time in beats as whole ticks, rounded to the nearest. `None` unless
 /// it's a number from 0 to the longest loop.
-fn ticks(beats: f64) -> Option<Ticks> {
+pub(crate) fn ticks(beats: f64) -> Option<Ticks> {
     (0.0..=f64::from(MAX_LOOP_BEATS))
         .contains(&beats)
         .then(|| Ticks((beats * PPQN as f64).round() as u64))
 }
 
-fn beats(ticks: Ticks) -> f64 {
+/// A time in ticks as beats.
+pub(crate) fn beats(ticks: Ticks) -> f64 {
     ticks.0 as f64 / PPQN as f64
 }
 

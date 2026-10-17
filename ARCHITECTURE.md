@@ -73,7 +73,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | core | `export` | `MidiExport`, `ExportError`, `bars`: how long an export runs | done |
-| devices | `profile`, `registry` | `DeviceProfile`, `DeviceRegistry` | done |
+| devices | `profile`, `registry`, `controllers` | `DeviceProfile`, `DeviceRegistry`, and the standard controller names such as `modulation` | done |
 | engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
 | engine | `timebase` | `Timebase`: ticks to when they're heard and back, across tempo changes | done |
 | engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
@@ -92,6 +92,7 @@ seams between modules are fixed and compile-checked before the logic exists.
 | mcp | `notation` | step strings and pitch names | done |
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `notes` | lists of notes in beats to clips | done |
+| mcp | `controls` | controls as points that jump or ramp, to control changes and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
 | treason | `main`, `config`, `serve`, `export` | subcommands `serve`, `ports`, `devices`, `projects`, `export`; `treason.toml`; picks the backend; `SmfExport` | done |
 
@@ -242,6 +243,12 @@ and stops, and the transport tools report that it isn't running.
    note-offs on stop, panic, clip changes and shutdown. The engine adds
    fixed ownership tables (one track ID per MIDI key) to its projected and
    delivered sets, allocated before playback, for selective track cleanup.
+   Fixed bitsets also track sustain and sostenuto through delivery and
+   cancellation, even after normal note-offs have emptied the key set.
+   Cleanup releases active pedals on the affected channels; pedals are
+   channel-wide, so this also releases holds from other tracks sharing a
+   channel. Panic resets both pedals and sends All Sound Off and All Notes
+   Off on every channel, including for voices the engine did not start.
 
 ## Project model
 
@@ -264,7 +271,10 @@ and stops, and the transport tools report that it isn't running.
 TOML files in `devices/`. Each gives a device's default channel, its voices
 (a note per sound), aliases (`bd = "kick"`) and parameters (CC numbers; NRPN
 is planned). Names need a letter, because tools read a bare number as a MIDI
-note. `devices/gm-drums.toml` covers the General MIDI drum map.
+note or controller. Any track can also name the controllers MIDI defines,
+such as `modulation` (1), `volume` (7) and `cutoff` (74), from
+`controllers`; a profile's own parameter names come first.
+`devices/gm-drums.toml` covers the General MIDI drum map.
 Profiles for real gear can be generated from the MIDI Guide dataset
 (github.com/pencilresearch/midi, CC-BY-SA-4.0).
 
@@ -281,7 +291,7 @@ breaking the other.
 |---|---|
 | `get_project`, `status`, `list_devices`, `list_ports`, `list_projects` | read only |
 | `add_track`, `edit_track`, `remove_track`, `set_muted` | tracks |
-| `set_steps`, `set_notes` | clips |
+| `set_steps`, `set_notes`, `set_controls` | clips |
 | `set_tempo`, `set_time_signature` | project |
 | `play`, `stop`, `panic` | transport |
 | `undo`, `redo` | history |
@@ -293,13 +303,45 @@ Tool descriptions and parameter schemas come from the Rust doc comments
 call comes back as a tool error whose message says how to fix it, such as
 "there is no port `x`; see list_ports", so the agent can correct itself.
 
-`get_project` shows a clip that fits a step grid as step strings, in the
-form `set_steps` takes, and any other clip as a list of notes, in the form
-`set_notes` takes. So the agent reads back what it wrote, in the same terms.
+`get_project` shows a clip whose notes fit a step grid as step strings, in
+the form `set_steps` takes, and any other clip as a list of notes, in the
+form `set_notes` takes. So the agent reads back what it wrote, in the same
+terms.
 Notes go by the device's voice names where it has them and by pitch
 otherwise, with sharps: C4 is middle C, note 60. If that pitch name is a
 device voice or alias for another note, readback uses the decimal MIDI
 number instead, so writing the notes back preserves their pitches.
+
+`set_controls` moves a track's controls (MIDI CC), such as a synth's mod
+wheel or filter cutoff, with or without notes on the track. Each control is
+a list of points, values at times in beats, that it jumps to or ramps to
+from the point before, linearly or along half a sine wave, so ramps between
+a low and a high make an LFO. A control can repeat its points every few
+beats through the loop.
+
+- The MCP layer turns the points into control changes in the clip, so the
+  engine plays them like any other event. A ramp sends a value on a grid of
+  1/32 beats, and only where it has changed, which bounds what it adds to a
+  DIN port. A clip holds at most 8192 control changes.
+- A point may end a ramp on the end of the loop or of the repeat. It sends
+  nothing there, since the next pass starts again from the first point.
+- `set_steps` and `set_notes` replace the notes and keep the control
+  changes where they are, cut off by a shorter loop. The clip holds the
+  changes rather than the points, so a repeat doesn't stretch to fill a
+  longer loop. `set_controls` replaces the controls it names and keeps the
+  rest. Replaced changes retain their original positions among events on
+  the same tick, preserving sequences such as RPN selection and Data Entry.
+  New changes without an original slot follow existing events on that tick.
+  On a track with notes, the notes set the loop's length.
+- `get_project` reads the control changes back as points: a ramp where the
+  changes fit one exactly, otherwise jumps. Written back over the same
+  loop, they send the same changes, though a repeat comes back as every pass
+  of it, so a control can have as many points as a clip holds changes.
+  Successive jumps at the same time keep their list order, including
+  duplicate values; ramps must advance time. This also lets loaded clips
+  with repeated same-tick controllers pass the public write validation.
+  Controls go by the device's parameter name, then the standard name, then
+  the number, checked to resolve to the same controller.
 
 ## Saved projects
 
@@ -359,7 +401,10 @@ saved project. A DAW opens it with each part on its own track.
 - The engine's `render_song` renders the song with the same code that
   plays it, so the file holds what `play` would send. Notes still sounding
   at the end stop there, and a note started again before it ended gets a
-  note-off for each start.
+  note-off for each start. Active sustain and sostenuto pedals are then
+  released at the export boundary, even when all keys ended earlier.
+  Pedal state is shared by tracks on the same port and channel, and these
+  final releases count toward the export's event limit.
 - An export is counted before it is rendered, and one of more than
   1,000,000 events is refused, which bounds the memory and the file.
 - The file is written like a saved project: flushed under a temporary
@@ -455,6 +500,12 @@ The third milestone keeps the work:
     `treason serve --project` and `treason projects`. Done.
 11. MIDI file export: `smf::write`, the `export_midi` tool and
     `treason export`, so a project opens in a DAW. Done.
+
+Then the controls of the gear:
+
+12. Controls: the `set_controls` tool, so a track sends modulation and
+    other control changes, with ramps and repeats, alone or with notes.
+    Done.
 
 Later: following an external clock (which needs MIDI input), and
 probability, ratchets and conditions on events.

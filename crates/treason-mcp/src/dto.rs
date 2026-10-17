@@ -2,8 +2,9 @@
 //!
 //! Designed for the model rather than mirroring the core types: channels
 //! count from 1, positions are bars and beats, notes go by voice or pitch
-//! name, and patterns are step strings. The doc comments become the
-//! descriptions in the tools' JSON schemas, so they are written for the agent.
+//! name, patterns are step strings, and controls go by name. The doc
+//! comments become the descriptions in the tools' JSON schemas, so they are
+//! written for the agent.
 
 use std::collections::BTreeMap;
 
@@ -14,6 +15,7 @@ use treason_core::playback::{PlaybackStatus, TransportState};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::{DeviceProfile, DeviceRegistry};
 
+use crate::controls;
 use crate::notation;
 use crate::pattern::{self, StepPattern};
 
@@ -61,16 +63,20 @@ pub struct TrackView {
     pub muted: bool,
     /// The length of the track's loop, in beats.
     pub loop_beats: f64,
-    /// The loop as step strings, in the form set_steps takes. Shown when
-    /// every note sits on a step grid at set_steps' velocities; missing for
-    /// other clips, such as melodies.
+    /// The loop's notes as step strings, in the form set_steps takes. Shown
+    /// when every note sits on a step grid at set_steps' velocities; missing
+    /// for other clips, such as melodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<PatternView>,
     /// The loop's notes in the form set_notes takes, by start. Shown for
     /// clips that aren't step patterns, such as melodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<Vec<NoteView>>,
-    /// How many notes and other events the loop holds.
+    /// The loop's controls (MIDI CC) in the form set_controls takes, by
+    /// name. Missing when it sends none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<BTreeMap<String, ControlView>>,
+    /// How many notes, control changes and other events the loop holds.
     pub events: usize,
 }
 
@@ -84,6 +90,7 @@ impl TrackView {
             None => Some(NoteView::all(&track.clip, device)).filter(|notes| !notes.is_empty()),
             Some(_) => None,
         };
+        let controls = Some(ControlView::all(&track.clip, device)).filter(|all| !all.is_empty());
         Self {
             id: track.id.0,
             name: track.name.clone(),
@@ -94,6 +101,7 @@ impl TrackView {
             loop_beats: beats(track.clip.length()),
             pattern,
             notes,
+            controls,
             events: track.clip.events().len(),
         }
     }
@@ -150,6 +158,50 @@ impl NoteView {
             })
             .collect()
     }
+}
+
+/// One control of a loop, as points in the form set_controls takes.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct ControlView {
+    /// The control's values, by time. Written back with set_controls and
+    /// the track's loop_beats, they play the same, though they may not be
+    /// the points first written: a repeat reads back as every pass of it.
+    pub points: Vec<PointView>,
+}
+
+impl ControlView {
+    /// The controls `clip` sends, by name: `device`'s name for the
+    /// controller where it has one, then the standard name, then the
+    /// number.
+    fn all(clip: &Clip, device: Option<&DeviceProfile>) -> BTreeMap<String, Self> {
+        controls::controls_from_clip(clip)
+            .into_iter()
+            .map(|(controller, points)| {
+                let points = points
+                    .into_iter()
+                    .map(|point| PointView {
+                        at: beats(point.at),
+                        value: point.value.get(),
+                        ramp: point.ramp,
+                    })
+                    .collect();
+                (controls::control_name(controller, device), Self { points })
+            })
+            .collect()
+    }
+}
+
+/// A control's value at a point in the loop.
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+pub struct PointView {
+    /// When, in beats from the start of the loop.
+    pub at: f64,
+    /// The value, 0-127.
+    pub value: u8,
+    /// How the value gets here from the point before. Missing where it
+    /// jumps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ramp: Option<Ramp>,
 }
 
 /// A loop written as step strings.
@@ -408,6 +460,73 @@ pub enum NoteRef {
     /// A voice of the track's device, such as "kick", or a pitch such as
     /// "C4" (middle C, note 60), "F#2" or "Bb3".
     Name(String),
+}
+
+/// Input for set_controls.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetControls {
+    /// The track's id.
+    pub track: u32,
+    /// The controls to set, keyed by a parameter of the track's device (see
+    /// list_devices), a standard name, or a controller number, 0-119. The
+    /// standard names, with their numbers: modulation (1, the mod wheel),
+    /// breath (2), foot (4), portamento_time (5), volume (7), balance (8),
+    /// pan (10), expression (11), sustain (64), portamento (65), sostenuto
+    /// (66), soft_pedal (67), legato (68), resonance (71), release (72),
+    /// attack (73), cutoff (74), decay (75), vibrato_rate (76),
+    /// vibrato_depth (77), vibrato_delay (78), reverb (91), tremolo (92),
+    /// chorus (93), detune (94) and phaser (95).
+    pub controls: BTreeMap<String, ControlLane>,
+    /// The loop length in beats, at most 1024, on a track without notes:
+    /// on a track with notes, they set the loop. Defaults to the track's
+    /// loop, or on a track with nothing else, to the end of the last point
+    /// or repeat, rounded up to a whole bar. A shorter loop cuts off the
+    /// track's other controls at its end.
+    pub loop_beats: Option<f64>,
+}
+
+/// How one control moves through the loop.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ControlLane {
+    /// The control's values, in any order, at most 8192. An empty list
+    /// removes the control. Successive jumps at the same time are sent in
+    /// their list order, including repeated values.
+    pub points: Vec<ControlPoint>,
+    /// Repeat the points every this many beats through the loop, such as 1
+    /// for an LFO that cycles once a beat. Defaults to the whole loop. A
+    /// repeat that doesn't divide the loop starts again with it.
+    pub repeat_beats: Option<f64>,
+}
+
+/// A control's value at a point in the loop.
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPoint {
+    /// When, in beats from the start of the loop, or of each repeat: 0 is
+    /// the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of
+    /// a beat. A ramp can end at the end of the loop or repeat, which is
+    /// where the next pass starts again from the first point.
+    pub at: f64,
+    /// The value, 0-127.
+    pub value: u8,
+    /// How the value gets here from the point before: "linear" ramps
+    /// evenly, and "smooth" eases out and in, so smooth ramps between a low
+    /// and a high make a sine wave. Without it, the value jumps here. The
+    /// first point can't ramp, since nothing comes before it. A ramp must
+    /// end later than the point before; same-time points must jump.
+    pub ramp: Option<Ramp>,
+}
+
+/// How a control moves from one point to the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Ramp {
+    /// At an even rate.
+    Linear,
+    /// Slowly at both ends and fastest midway, along half a sine wave.
+    Smooth,
 }
 
 /// Input for play.

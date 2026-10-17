@@ -2,8 +2,8 @@
 //!
 //! [`clip_from_steps`] turns what set_steps receives into a [`Clip`], naming
 //! voices through the track's device profile. [`steps_from_clip`] goes the
-//! other way, so the agent reads back any clip that fits a step grid in the
-//! form it writes.
+//! other way, so the agent reads back any clip whose notes fit a step grid
+//! in the form it writes.
 
 use std::collections::BTreeMap;
 
@@ -181,21 +181,23 @@ pub fn clip_from_steps(
     Ok(Clip::new(Ticks(loop_steps as u64 * step), events)?)
 }
 
-/// A clip as step strings, if it fits a step grid: every event a note one
-/// step long that starts on a step, at the velocity of `x` or `X`, with a
+/// A clip's notes as step strings, if they fit a step grid: every note one
+/// step long and starting on a step, at the velocity of `x` or `X`, with a
 /// step size on offer. Notes go by their voice name in `device` where it has
-/// one, and by number otherwise. An empty clip has no pattern.
+/// one, and by number otherwise. Other events, such as control changes,
+/// don't count, and a clip without notes has no pattern.
 pub fn steps_from_clip(clip: &Clip, device: Option<&DeviceProfile>) -> Option<StepPattern> {
     let mut step = None;
     let mut hits = Vec::with_capacity(clip.events().len());
     for event in clip.events() {
+        // Only notes make up the pattern.
         let EventKind::Note {
             note,
             velocity,
             length,
         } = event.kind
         else {
-            return None;
+            continue;
         };
         if *step.get_or_insert(length) != length {
             return None;
