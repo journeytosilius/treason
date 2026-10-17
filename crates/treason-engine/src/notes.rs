@@ -2,7 +2,7 @@
 //! the engine can always end them.
 
 use treason_core::midi::{Channel, MidiMessage, U7, U14};
-use treason_core::model::TrackId;
+use treason_core::model::{DEFAULT_RELEASE, TrackId};
 
 /// Pedals that can hold a note after its key's note-off.
 pub(crate) const HOLD_PEDALS: [U7; 2] = [U7::saturating(64), U7::saturating(66)];
@@ -246,7 +246,7 @@ fn note_offs(channel: Channel, bits: &mut u128) -> impl Iterator<Item = MidiMess
         Some(MidiMessage::NoteOff {
             channel,
             note: U7::saturating(note),
-            velocity: U7::MIN,
+            velocity: DEFAULT_RELEASE,
         })
     })
 }
@@ -263,11 +263,12 @@ mod tests {
         }
     }
 
+    /// A note-off as the engine sends one to end a note itself.
     fn note_off(channel: Channel, note: u8) -> MidiMessage {
         MidiMessage::NoteOff {
             channel,
             note: U7::new(note).unwrap(),
-            velocity: U7::MIN,
+            velocity: DEFAULT_RELEASE,
         }
     }
 

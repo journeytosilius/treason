@@ -1017,7 +1017,9 @@ mod tests {
     use std::sync::mpsc;
 
     use treason_core::midi::U14;
-    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, Program, TrackId};
+    use treason_core::model::{
+        Clip, ClipEvent, DEFAULT_RELEASE, EventKind, OutputTarget, Program, TrackId,
+    };
     use treason_core::playback::{Playback, PlaybackStatus};
     use treason_core::time::Bpm;
     use treason_io::RecordingOutput;
@@ -1047,6 +1049,7 @@ mod tests {
                     note: U7::new(note).unwrap(),
                     velocity: U7::new(100).unwrap(),
                     length: Ticks(length),
+                    release: DEFAULT_RELEASE,
                 },
             })
             .collect();

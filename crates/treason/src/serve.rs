@@ -178,7 +178,9 @@ mod tests {
     use tokio::sync::oneshot;
     use treason_control::{ExportStore, ProjectStore};
     use treason_core::midi::{Channel, MidiMessage, U7};
-    use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
+    use treason_core::model::{
+        Clip, ClipEvent, DEFAULT_RELEASE, EventKind, OutputTarget, PortId, Track, TrackId,
+    };
     use treason_core::output::{Delivery, MidiOutput, TimedMessage};
     use treason_core::playback::TransportCommand;
     use treason_core::time::Ticks;
@@ -264,6 +266,7 @@ mod tests {
                             note: U7::new(60).unwrap(),
                             velocity: U7::MAX,
                             length: Ticks::quarters(1),
+                            release: DEFAULT_RELEASE,
                         },
                     }],
                 )

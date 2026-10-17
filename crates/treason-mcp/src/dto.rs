@@ -11,13 +11,14 @@ use std::collections::BTreeMap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use treason_core::midi::U7;
-use treason_core::model::{Clip, EventKind, PortId, Project, Track};
+use treason_core::model::{Clip, DEFAULT_RELEASE, PortId, Project, Track};
 use treason_core::playback::{PlaybackStatus, TransportState};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::{DeviceProfile, DeviceRegistry};
 
-use crate::controls;
+use crate::controls::{self, Control, Point};
 use crate::notation;
+use crate::notes;
 use crate::pattern::{self, StepPattern};
 use crate::programs;
 
@@ -80,8 +81,9 @@ pub struct TrackView {
     /// The length of the track's loop, in beats.
     pub loop_beats: f64,
     /// The loop's notes as step strings, in the form set_steps takes. Shown
-    /// when every note sits on a step grid at set_steps' velocities; missing
-    /// for other clips, such as melodies.
+    /// when every note sits on a step grid at set_steps' velocities, with no
+    /// release or pressure of its own; missing for other clips, such as
+    /// melodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<PatternView>,
     /// The loop's notes in the form set_notes takes, by start. Shown for
@@ -147,20 +149,25 @@ pub struct NoteView {
     pub length: f64,
     /// How hard, 1-127.
     pub velocity: u8,
+    /// How fast the key comes up, 0-127. Missing when it's MIDI's default,
+    /// 64.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<u8>,
+    /// How hard the key is pressed while the note sounds, as points timed
+    /// from its start. Missing when it sends no pressure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<ControlView>,
 }
 
 impl NoteView {
     /// The notes `clip` plays, by start, named after `device`'s voices where
     /// it has them.
     fn all(clip: &Clip, device: Option<&DeviceProfile>) -> Vec<Self> {
-        clip.events()
-            .iter()
-            .filter_map(|event| match event.kind {
-                EventKind::Note {
-                    note,
-                    velocity,
-                    length,
-                } => Some(Self {
+        notes::notes_from_clip(clip)
+            .into_iter()
+            .map(|read| {
+                let note = read.note;
+                Self {
                     note: device
                         .and_then(|device| device.voice_name(note))
                         .map_or_else(
@@ -177,22 +184,27 @@ impl NoteView {
                             },
                             str::to_owned,
                         ),
-                    start: beats(event.start),
-                    length: beats(length),
-                    velocity: velocity.get(),
-                }),
-                _ => None,
+                    start: beats(read.start),
+                    length: beats(read.length),
+                    velocity: read.velocity.get(),
+                    release: (read.release != DEFAULT_RELEASE).then_some(read.release.get()),
+                    // A key's pressure takes the values a channel's does.
+                    pressure: (!read.pressure.is_empty())
+                        .then(|| ControlView::new(Control::Pressure, read.pressure)),
+                }
             })
             .collect()
     }
 }
 
-/// One control of a loop, as points in the form set_controls takes.
+/// One control of a loop, or a note's pressure, as points in the form
+/// set_controls and set_notes take.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct ControlView {
-    /// The control's values, by time. Written back with set_controls and
-    /// the track's loop_beats, they play the same, though they may not be
-    /// the points first written: a repeat reads back as every pass of it.
+    /// The values, by time. Written back with set_controls and the track's
+    /// loop_beats, or for a note's pressure with set_notes, they play the
+    /// same, though they may not be the points first written: a repeat
+    /// reads back as every pass of it.
     pub points: Vec<PointView>,
 }
 
@@ -204,24 +216,32 @@ impl ControlView {
         controls::controls_from_clip(clip)
             .into_iter()
             .map(|(control, points)| {
-                let points = points
-                    .into_iter()
-                    .map(|point| PointView {
-                        at: beats(point.at),
-                        value: control.written(point.value),
-                        ramp: point.ramp,
-                    })
-                    .collect();
-                (controls::control_name(control, device), Self { points })
+                let name = controls::control_name(control, device);
+                (name, Self::new(control, points))
             })
             .collect()
     }
+
+    /// `points` of `control`, with their values as the agent writes them.
+    fn new(control: Control, points: Vec<Point>) -> Self {
+        let points = points
+            .into_iter()
+            .map(|point| PointView {
+                at: beats(point.at),
+                value: control.written(point.value),
+                ramp: point.ramp,
+            })
+            .collect();
+        Self { points }
+    }
 }
 
-/// A control's value at a point in the loop.
+/// A control's value at a point in the loop, or a note's pressure at a
+/// point in the note.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct PointView {
-    /// When, in beats from the start of the loop.
+    /// When, in beats from the start of the loop, or of the note for its
+    /// pressure.
     pub at: f64,
     /// The value: 0-127, or for pitch_bend, -8192 to 8191 around the
     /// centre at 0.
@@ -238,7 +258,7 @@ pub struct PatternView {
     /// Steps per beat, as in set_steps.
     pub steps_per_beat: u32,
     /// One step string per voice, with a space between beats: "x" a hit,
-    /// "X" an accent, "." a rest.
+    /// "X" an accent, "1" to "9" a hit from soft to hard, "." a rest.
     pub steps: BTreeMap<String, String>,
 }
 
@@ -518,7 +538,10 @@ pub struct SetSteps {
     pub track: u32,
     /// One step string per voice, keyed by the device's voice names (or
     /// their aliases) or by MIDI note number. Each character is a step: "x"
-    /// a hit, "X" an accent, "." or "-" a rest. Spaces and "|" are ignored.
+    /// a hit (velocity 100), "X" an accent (127), "1" to "9" a hit from soft
+    /// to hard (velocity 14, 28, 42, 56, 71, 85, 99, 113 and 127), such as
+    /// "2" for a ghost note, and "." or "-" a rest. Spaces and "|" are
+    /// ignored.
     /// Example: {"kick": "x...x...x...x...", "snare": "....x.......x...",
     /// "closed_hat": "..x...x...x...x."}. The loop is as long as the longest
     /// string. A shorter one repeats to fill it, so {"closed_hat": "..x."}
@@ -560,6 +583,19 @@ pub struct NoteSpec {
     pub length: f64,
     /// How hard, 1-127. Defaults to 100.
     pub velocity: Option<u8>,
+    /// How fast the key comes up, 0-127, sent with the note-off for gear
+    /// that shapes the release by it. Defaults to 64, MIDI's default for
+    /// gear that can't sense it.
+    pub release: Option<u8>,
+    /// How hard the key is pressed while the note sounds: polyphonic
+    /// aftertouch, 0-127, which only this note's key gets. Points as
+    /// set_controls takes them, with at in beats from the note's start, at
+    /// most the note's length: a ramp can end at the end of the note, where
+    /// the key comes up and nothing more is sent. A note that runs past the
+    /// end of the loop takes its pressure into the next pass. Example: a
+    /// swell over a two-beat note, {"points": [{"at": 0, "value": 0}, {"at":
+    /// 2, "value": 100, "ramp": "smooth"}]}.
+    pub pressure: Option<ControlLane>,
 }
 
 /// A note: a MIDI note number, or a name.
@@ -598,28 +634,32 @@ pub struct SetControls {
     pub loop_beats: Option<f64>,
 }
 
-/// How one control moves through the loop.
+/// How one control moves through the loop, or a note's pressure through
+/// the note.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLane {
-    /// The control's values, in any order, at most 8192. An empty list
-    /// removes the control. Successive jumps at the same time are sent in
-    /// their list order, including repeated values.
+    /// The values, in any order, at most 8192. An empty list removes the
+    /// control. Successive jumps at the same time are sent in their list
+    /// order, including repeated values.
     pub points: Vec<ControlPoint>,
-    /// Repeat the points every this many beats through the loop, such as 1
-    /// for an LFO that cycles once a beat. Defaults to the whole loop. A
-    /// repeat that doesn't divide the loop starts again with it.
+    /// Repeat the points every this many beats through the loop, or the
+    /// note, such as 1 for an LFO that cycles once a beat. Defaults to the
+    /// whole loop or note. A repeat that doesn't divide it starts again
+    /// with it.
     pub repeat_beats: Option<f64>,
 }
 
-/// A control's value at a point in the loop.
+/// A control's value at a point in the loop, or a note's pressure at a
+/// point in the note.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPoint {
-    /// When, in beats from the start of the loop, or of each repeat: 0 is
-    /// the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of
-    /// a beat. A ramp can end at the end of the loop or repeat, which is
-    /// where the next pass starts again from the first point.
+    /// When, in beats from the start of the loop, or of the note, or of
+    /// each repeat: 0 is the first beat, 1.5 the offbeat after the second.
+    /// Rounds to 1/960 of a beat. A ramp can end at the end of the loop,
+    /// repeat or note, where it sends nothing: the next pass starts again
+    /// from the first point there, or the key comes up.
     pub at: f64,
     /// The value, 0-127. For pitch_bend, -8192 to 8191: 0 is the centre,
     /// 8191 bends up by the track's bend_range and -8192 down by it, so with

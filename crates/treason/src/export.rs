@@ -137,7 +137,7 @@ mod tests {
     use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
     use treason_core::midi::{Channel, U7, U14};
     use treason_core::model::{
-        Clip, ClipEvent, EventKind, OutputTarget, PortId, Program, Track, TrackId,
+        Clip, ClipEvent, DEFAULT_RELEASE, EventKind, OutputTarget, PortId, Program, Track, TrackId,
     };
     use treason_core::time::Bpm;
 
@@ -152,6 +152,7 @@ mod tests {
                     note: U7::new(note).unwrap(),
                     velocity: U7::new(100).unwrap(),
                     length: Ticks(length),
+                    release: DEFAULT_RELEASE,
                 },
             })
             .collect();

@@ -163,7 +163,8 @@ impl Program {
 /// Every track loops its own clip, so clips of different lengths give
 /// polymeter. Events are kept sorted by start, which lets the engine find the
 /// events in a time window with a binary search. A note may run past the
-/// loop point into the next pass, but no note is longer than the loop.
+/// loop point into the next pass, but no note is longer than the loop. A
+/// key's pressure comes only while a note of that key sounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RawClip")]
 pub struct Clip {
@@ -206,6 +207,7 @@ impl Clip {
                 longest_note = longest_note.max(note_length);
             }
         }
+        check_key_pressure(length, &events)?;
         // A stable sort keeps the given order of events that start together.
         events.sort_by_key(|event| event.start);
         Ok(Self {
@@ -238,6 +240,57 @@ impl Clip {
         let end = self.events.partition_point(|event| event.start < range.end);
         &self.events[first..end]
     }
+}
+
+/// Checks that each key pressure in `events` comes while a note of its key
+/// sounds, in a loop `length` long, counting the notes that run past its
+/// end into the start of the next pass.
+fn check_key_pressure(length: Ticks, events: &[ClipEvent]) -> Result<(), ClipError> {
+    let pressed = |event: &ClipEvent| matches!(event.kind, EventKind::NotePressure { .. });
+    if !events.iter().any(pressed) {
+        return Ok(());
+    }
+    // The ticks each key's notes sound for, as spans of the loop by key and
+    // start, merged so that only the last to start at or before a tick can
+    // cover it.
+    let mut spans = Vec::new();
+    for event in events {
+        if let EventKind::Note {
+            note, length: held, ..
+        } = event.kind
+        {
+            let (start, end) = (event.start.0, event.start.0 + held.0);
+            spans.push((note, start, end.min(length.0)));
+            if end > length.0 {
+                spans.push((note, 0, end - length.0));
+            }
+        }
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(U7, u64, u64)> = Vec::with_capacity(spans.len());
+    for (note, start, end) in spans {
+        match merged.last_mut() {
+            Some((key, _, last)) if *key == note && start <= *last => *last = end.max(*last),
+            _ => merged.push((note, start, end)),
+        }
+    }
+    for event in events.iter().filter(|event| pressed(event)) {
+        let EventKind::NotePressure { note, .. } = event.kind else {
+            continue;
+        };
+        let tick = event.start.0;
+        let after = merged.partition_point(|&(key, start, _)| (key, start) <= (note, tick));
+        let sounding = after
+            .checked_sub(1)
+            .is_some_and(|index| merged[index].0 == note && tick < merged[index].2);
+        if !sounding {
+            return Err(ClipError::PressureWithoutNote {
+                start: event.start,
+                note,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl Default for Clip {
@@ -284,6 +337,9 @@ pub enum ClipError {
         note_length: Ticks,
         length: Ticks,
     },
+    /// Pressure on a key while no note of it sounds.
+    #[error("the pressure on note {note} at {start} comes while no note of that key sounds")]
+    PressureWithoutNote { start: Ticks, note: U7 },
 }
 
 /// Something that happens at a point in a clip.
@@ -295,15 +351,21 @@ pub struct ClipEvent {
     pub kind: EventKind,
 }
 
+/// The velocity of a note-off that doesn't say how fast its key comes up:
+/// MIDI's default, for gear that can't sense it.
+pub const DEFAULT_RELEASE: U7 = U7::saturating(64);
+
 /// What a clip event does. The port and channel come from the track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EventKind {
-    /// A note, held for `length`.
+    /// A note, held for `length`. Its note-off goes out with `release`, how
+    /// fast its key comes up.
     Note {
         note: U7,
         velocity: U7,
         length: Ticks,
+        release: U7,
     },
     /// A control change.
     Control { controller: U7, value: U7 },
@@ -314,6 +376,9 @@ pub enum EventKind {
     /// Channel pressure, or aftertouch: how hard every key on the channel
     /// is pressed, 0 at rest.
     Pressure { value: U7 },
+    /// Key pressure, or polyphonic aftertouch: how hard the key of one
+    /// sounding note is pressed, 0 at rest.
+    NotePressure { note: U7, value: U7 },
 }
 
 #[cfg(test)]
@@ -327,6 +392,7 @@ mod tests {
                 note: U7::new(36).unwrap(),
                 velocity: U7::MAX,
                 length: Ticks::sixteenths(1),
+                release: DEFAULT_RELEASE,
             },
         }
     }
@@ -365,6 +431,7 @@ mod tests {
                 note: U7::MAX,
                 velocity: U7::MAX,
                 length: Ticks(length),
+                release: DEFAULT_RELEASE,
             },
         };
         let clip = Clip::new(Ticks(960), vec![note(720, 480), note(0, 960)]).unwrap();
@@ -382,6 +449,59 @@ mod tests {
         let json = serde_json::to_string(&clip).unwrap();
         assert!(!json.contains("longest"), "{json}");
         assert_eq!(serde_json::from_str::<Clip>(&json).unwrap(), clip);
+    }
+
+    #[test]
+    fn key_pressure_comes_only_while_a_note_of_its_key_sounds() {
+        let key = |number| U7::new(number).unwrap();
+        let note = |number, start, length| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Note {
+                note: key(number),
+                velocity: U7::MAX,
+                length: Ticks(length),
+                release: DEFAULT_RELEASE,
+            },
+        };
+        let notes = [
+            note(60, 240, 240),
+            // Runs past the end of the loop, through its first 240 ticks.
+            note(60, 720, 480),
+            // Holds through the next, which ends first.
+            note(67, 0, 600),
+            note(67, 100, 100),
+        ];
+        for (number, start, sounding) in [
+            (60, 240, true),
+            (60, 479, true),
+            (60, 480, false),
+            (60, 600, false),
+            (60, 720, true),
+            (60, 0, true),
+            (60, 239, true),
+            (67, 300, true),
+            (67, 600, false),
+            (62, 300, false),
+        ] {
+            let mut events = notes.to_vec();
+            events.push(ClipEvent {
+                start: Ticks(start),
+                kind: EventKind::NotePressure {
+                    note: key(number),
+                    value: U7::MAX,
+                },
+            });
+            let expected = if sounding {
+                Ok(())
+            } else {
+                Err(ClipError::PressureWithoutNote {
+                    start: Ticks(start),
+                    note: key(number),
+                })
+            };
+            let clip = Clip::new(Ticks(960), events).map(|_| ());
+            assert_eq!(clip, expected, "pressure on {number} at {start}");
+        }
     }
 
     #[test]

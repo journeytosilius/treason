@@ -76,7 +76,8 @@ fn cycle_bars(project: &Project) -> Option<u32> {
             EventKind::Control { .. }
             | EventKind::Program { .. }
             | EventKind::PitchBend { .. }
-            | EventKind::Pressure { .. } => true,
+            | EventKind::Pressure { .. }
+            | EventKind::NotePressure { .. } => true,
         })
     }) {
         let length = track.clip.length().0;
@@ -103,7 +104,9 @@ mod tests {
 
     use super::*;
     use crate::midi::{Channel, U7, U14};
-    use crate::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
+    use crate::model::{
+        Clip, ClipEvent, DEFAULT_RELEASE, EventKind, OutputTarget, PortId, Track, TrackId,
+    };
     use crate::time::{Ticks, TimeSignature};
 
     /// A track whose clip is `length` long and plays one note, unless
@@ -115,6 +118,7 @@ mod tests {
                 note: U7::new(60).unwrap(),
                 velocity: U7::MAX,
                 length: Ticks(1),
+                release: DEFAULT_RELEASE,
             },
         };
         let events = if empty { Vec::new() } else { vec![note] };
@@ -243,6 +247,7 @@ mod tests {
                     note: U7::new(60).unwrap(),
                     velocity: U7::MIN,
                     length: Ticks(1),
+                    release: DEFAULT_RELEASE,
                 },
             }],
         )
@@ -290,6 +295,7 @@ mod tests {
                             note: U7::new(60).unwrap(),
                             velocity: U7::MIN,
                             length: Ticks(1),
+                            release: DEFAULT_RELEASE,
                         },
                     },
                     ClipEvent {

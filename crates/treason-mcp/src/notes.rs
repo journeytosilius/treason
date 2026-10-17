@@ -1,15 +1,19 @@
 //! Clips written as lists of notes, for melodies, basslines and chords.
 //!
 //! The agent names each note by pitch, voice or number and times it in
-//! beats. [`clip_from_notes`] checks the notes and builds the clip; `dto`
-//! reads clips back as notes.
+//! beats, and can give it a release velocity and key pressure, as points
+//! through the note. [`clip_from_notes`] checks the notes and builds the
+//! clip; [`notes_from_clip`] reads a clip's notes back.
+
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 use treason_core::midi::U7;
-use treason_core::model::{Clip, ClipError, ClipEvent, EventKind};
+use treason_core::model::{Clip, ClipError, ClipEvent, DEFAULT_RELEASE, EventKind};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::DeviceProfile;
 
+use crate::controls::{self, Control, ControlError, Curve, Point, Span};
 use crate::dto::{NoteRef, NoteSpec};
 use crate::notation::{self, NotationError};
 use crate::pattern::HIT_VELOCITY;
@@ -22,6 +26,10 @@ pub const MAX_LOOP_BEATS: u32 = 1024;
 
 /// The velocity of a note that doesn't give one, the same as a step's hit.
 pub const DEFAULT_VELOCITY: U7 = HIT_VELOCITY;
+
+/// The most key-pressure changes one clip's notes can send, all of them
+/// together. It bounds what a loop sends and what each edit keeps for undo.
+pub const MAX_PRESSURE_CHANGES: usize = 8192;
 
 /// Notes that can't become a clip. The messages tell the agent how to fix
 /// the call.
@@ -63,6 +71,11 @@ pub enum NotesError {
         /// The note as written.
         note: String,
     },
+    /// More key-pressure changes than a clip can hold.
+    #[error(
+        "the notes' pressure would send more than {MAX_PRESSURE_CHANGES} changes each loop: use fewer points, ramps that change less, or shorter notes"
+    )]
+    TooManyPressureChanges,
     /// The clip itself was rejected.
     #[error(transparent)]
     Clip(#[from] ClipError),
@@ -102,6 +115,12 @@ pub enum NoteError {
     /// A velocity that isn't 1-127. 0 would be silent.
     #[error("velocity must be 1-127, not {0}")]
     Velocity(u8),
+    /// A release velocity past MIDI's range.
+    #[error("release must be 0-127, not {0}")]
+    Release(u8),
+    /// Key pressure that can't be sent.
+    #[error("pressure: {0}")]
+    Pressure(ControlError),
     /// A note that starts at or after the end of the loop.
     #[error(
         "it starts at beat {start}, but the loop is {loop_beats} beats long: start it earlier, or make loop_beats longer"
@@ -130,6 +149,22 @@ struct Placed {
     start: Ticks,
     length: Ticks,
     velocity: U7,
+    release: U7,
+    /// Its key pressure, which fits in it.
+    pressure: Option<Curve>,
+}
+
+/// A note of a clip, read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRead {
+    pub note: U7,
+    pub start: Ticks,
+    pub length: Ticks,
+    pub velocity: U7,
+    pub release: U7,
+    /// Points that send its key pressure, timed from its start. Empty when
+    /// it sends none.
+    pub pressure: Vec<Point>,
 }
 
 /// The clip `notes` play.
@@ -139,8 +174,8 @@ struct Placed {
 /// lengths are in beats and round to the nearest tick. The loop lasts
 /// `loop_beats`, or by default until the end of the last note, rounded up
 /// to whole bars of `bar`. A note can run past the end of the loop into
-/// the next pass, but not overlap another note of the same pitch there or
-/// anywhere else.
+/// the next pass, taking its key pressure with it, but not overlap another
+/// note of the same pitch there or anywhere else.
 pub fn clip_from_notes(
     notes: &[NoteSpec],
     loop_beats: Option<f64>,
@@ -203,18 +238,103 @@ pub fn clip_from_notes(
     }
     check_overlaps(notes, &placed, length)?;
 
-    let events = placed
-        .iter()
-        .map(|note| ClipEvent {
+    let mut events = Vec::with_capacity(placed.len());
+    let mut changes = 0;
+    for note in &placed {
+        events.push(ClipEvent {
             start: note.start,
             kind: EventKind::Note {
                 note: note.note,
                 velocity: note.velocity,
                 length: note.length,
+                release: note.release,
             },
-        })
-        .collect();
+        });
+        let Some(pressure) = &note.pressure else {
+            continue;
+        };
+        pressure.send(note.length, |since, value| {
+            changes += 1;
+            if changes > MAX_PRESSURE_CHANGES {
+                return Err(NotesError::TooManyPressureChanges);
+            }
+            events.push(ClipEvent {
+                // Past the end of the loop, at the start of the next pass.
+                start: Ticks((note.start.0 + since) % length.0),
+                kind: EventKind::NotePressure {
+                    note: note.note,
+                    value: U7::saturating(u8::try_from(value).unwrap_or(u8::MAX)),
+                },
+            });
+            Ok(())
+        })?;
+    }
     Ok(Clip::new(length, events)?)
+}
+
+/// The notes `clip` plays, by start, each with the key pressure it sends as
+/// points that send the same when set_notes writes them over the same loop.
+pub fn notes_from_clip(clip: &Clip) -> Vec<NoteRead> {
+    let mut notes = Vec::new();
+    // Each key's notes, by start, as indexes into `notes`.
+    let mut keys: BTreeMap<U7, Vec<usize>> = BTreeMap::new();
+    for event in clip.events() {
+        if let EventKind::Note {
+            note,
+            velocity,
+            length,
+            release,
+        } = event.kind
+        {
+            keys.entry(note).or_default().push(notes.len());
+            notes.push(NoteRead {
+                note,
+                start: event.start,
+                length,
+                velocity,
+                release,
+                pressure: Vec::new(),
+            });
+        }
+    }
+    let length = clip.length().0;
+    let mut changes = vec![Vec::new(); notes.len()];
+    for event in clip.events() {
+        if let EventKind::NotePressure { note, value } = event.kind
+            && let Some(index) = keys
+                .get(&note)
+                .and_then(|indexes| sounding(&notes, indexes, event.start.0, length))
+        {
+            let since = (event.start.0 + length - notes[index].start.0) % length;
+            changes[index].push((since, u16::from(value.get())));
+        }
+    }
+    let mut budget = controls::READ_BUDGET;
+    for (note, mut changes) in notes.iter_mut().zip(changes) {
+        // Pressure that ran past the end of the loop comes first in the
+        // clip. The stable sort keeps the order of changes on one tick.
+        changes.sort_by_key(|&(since, _)| since);
+        let max = u16::from(U7::MAX.get());
+        note.pressure = controls::read(&changes, note.length.0, max, &mut budget);
+    }
+    notes
+}
+
+/// Which of a key's notes, `indexes` into `notes` by start, sounds at
+/// `tick` of a loop `length` long, counting a note that runs past the end
+/// of the loop: the latest to start, if two do.
+fn sounding(notes: &[NoteRead], indexes: &[usize], tick: u64, length: u64) -> Option<usize> {
+    let split = indexes.partition_point(|&index| notes[index].start.0 <= tick);
+    let (before, after) = indexes.split_at(split);
+    before
+        .iter()
+        .rev()
+        .chain(after.iter().rev())
+        .copied()
+        .find(|&index| {
+            let note = &notes[index];
+            (tick + length - note.start.0) % length < note.length.0
+        })
 }
 
 /// Checks one note on its own.
@@ -226,15 +346,32 @@ fn place(spec: &NoteSpec, device: Option<&DeviceProfile>) -> Result<Placed, Note
             .filter(|&velocity| velocity > U7::MIN)
             .ok_or(NoteError::Velocity(velocity))?,
     };
+    let release = match spec.release {
+        None => DEFAULT_RELEASE,
+        Some(release) => U7::new(release).ok_or(NoteError::Release(release))?,
+    };
     let start = ticks(spec.start).ok_or(NoteError::Start(spec.start))?;
     let length = ticks(spec.length)
         .filter(|&length| length > Ticks::ZERO)
         .ok_or(NoteError::Length(spec.length))?;
+    let pressure = spec
+        .pressure
+        .as_ref()
+        .map(|lane| {
+            // A key's pressure takes the values a channel's does.
+            let curve = Curve::new(lane, Control::Pressure)?;
+            curve.check(Span::Note, length, "lengthen the note")?;
+            Ok(curve)
+        })
+        .transpose()
+        .map_err(NoteError::Pressure)?;
     Ok(Placed {
         note,
         start,
         length,
         velocity,
+        release,
+        pressure,
     })
 }
 
@@ -330,6 +467,7 @@ mod tests {
     use treason_devices::DeviceRegistry;
 
     use super::*;
+    use crate::dto::{ControlLane, ControlPoint, Ramp};
 
     const BAR: Ticks = Ticks(4 * PPQN);
 
@@ -348,19 +486,72 @@ mod tests {
             start,
             length,
             velocity: None,
+            release: None,
+            pressure: None,
         }
+    }
+
+    /// Key pressure at `at` beats into the note.
+    fn point(at: f64, value: i32, ramp: Option<Ramp>) -> ControlPoint {
+        ControlPoint { at, value, ramp }
+    }
+
+    fn pressure(points: Vec<ControlPoint>, repeat_beats: Option<f64>) -> Option<ControlLane> {
+        Some(ControlLane {
+            points,
+            repeat_beats,
+        })
+    }
+
+    /// The clip's key pressure as (note, tick, value).
+    fn pressed(clip: &Clip) -> Vec<(u8, u64, u8)> {
+        clip.events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::NotePressure { note, value } => {
+                    Some((note.get(), event.start.0, value.get()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The notes `read` holds, as set_notes takes them.
+    fn written_back(read: &[NoteRead]) -> Vec<NoteSpec> {
+        read.iter()
+            .map(|note| NoteSpec {
+                note: NoteRef::Number(note.note.get()),
+                start: beats(note.start),
+                length: beats(note.length),
+                velocity: Some(note.velocity.get()),
+                release: Some(note.release.get()),
+                pressure: pressure(
+                    note.pressure
+                        .iter()
+                        .map(|point| point_at(point.at, point.value, point.ramp))
+                        .collect(),
+                    None,
+                ),
+            })
+            .collect()
+    }
+
+    fn point_at(at: Ticks, value: u16, ramp: Option<Ramp>) -> ControlPoint {
+        point(beats(at), i32::from(value), ramp)
     }
 
     /// The clip's notes as (note, start, length, velocity) in ticks.
     fn played(clip: &Clip) -> Vec<(u8, u64, u64, u8)> {
         clip.events()
             .iter()
-            .map(|event| match event.kind {
+            .filter_map(|event| match event.kind {
                 EventKind::Note {
                     note,
                     velocity,
                     length,
-                } => (note.get(), event.start.0, length.0, velocity.get()),
+                    ..
+                } => Some((note.get(), event.start.0, length.0, velocity.get())),
+                EventKind::NotePressure { .. } => None,
                 other => panic!("not a note: {other:?}"),
             })
             .collect()
@@ -599,6 +790,252 @@ mod tests {
         assert_eq!(
             clip_from_notes(&[], None, BAR, None),
             Err(NotesError::NoNotes)
+        );
+    }
+
+    #[test]
+    fn notes_send_their_release_and_their_keys_pressure() {
+        let notes = [
+            NoteSpec {
+                release: Some(30),
+                // A jump, then a ramp to the end of the note, where the key
+                // comes up before the ramp's last value.
+                pressure: pressure(
+                    vec![
+                        point(0.0, 5, None),
+                        point(0.5, 0, None),
+                        point(1.0, 16, Some(Ramp::Linear)),
+                    ],
+                    None,
+                ),
+                ..note("C3", 1.0, 1.0)
+            },
+            NoteSpec {
+                release: Some(0),
+                ..note("E3", 0.0, 1.0)
+            },
+        ];
+        let clip = clip_from_notes(&notes, None, BAR, None).unwrap();
+        let releases: Vec<(u8, u8)> = clip
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Note { note, release, .. } => Some((note.get(), release.get())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases, [(52, 0), (48, 30)]);
+        let ramp = (1..16).map(|step| (48, 1440 + step * 30, step as u8));
+        let expected: Vec<_> = [(48, 960, 5), (48, 1440, 0)]
+            .into_iter()
+            .chain(ramp)
+            .collect();
+        assert_eq!(pressed(&clip), expected);
+
+        let plain = clip_from_notes(&[note("C3", 0.0, 1.0)], None, BAR, None).unwrap();
+        assert!(matches!(
+            plain.events()[0].kind,
+            EventKind::Note {
+                release: DEFAULT_RELEASE,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pressure_runs_with_its_note_into_the_next_pass() {
+        let crossing = NoteSpec {
+            pressure: pressure(vec![point(0.0, 20, None), point(0.75, 60, None)], None),
+            ..note("B2", 3.5, 1.0)
+        };
+        let clip = clip_from_notes(&[crossing], Some(4.0), BAR, None).unwrap();
+        assert_eq!(pressed(&clip), [(47, 240, 60), (47, 3360, 20)]);
+
+        let read = notes_from_clip(&clip);
+        assert_eq!(read.len(), 1);
+        let points: Vec<_> = read[0]
+            .pressure
+            .iter()
+            .map(|point| (point.at, point.value, point.ramp))
+            .collect();
+        assert_eq!(points, [(Ticks(0), 20, None), (Ticks(720), 60, None)]);
+    }
+
+    #[test]
+    fn bad_release_and_pressure_say_how_to_fix_them() {
+        let with = |release, pressure| NoteSpec {
+            release,
+            pressure,
+            ..note("C3", 0.0, 1.0)
+        };
+        let many = (0..=controls::MAX_POINTS)
+            .map(|index| point(index as f64 / 960.0, 0, None))
+            .collect();
+        for (spec, expected) in [
+            (
+                with(Some(128), None),
+                "note 1 (`C3`): release must be 0-127, not 128",
+            ),
+            (
+                with(
+                    None,
+                    pressure(vec![point(0.0, 0, None), point(1.5, 9, None)], None),
+                ),
+                "note 1 (`C3`): pressure: point 2: it's at beat 1.5, after the note ends at beat 1: move it earlier, or lengthen the note",
+            ),
+            (
+                with(
+                    None,
+                    pressure(vec![point(1.0, 50, None), point(0.0, 0, None)], None),
+                ),
+                "note 1 (`C3`): pressure: point 1: it jumps at the end of the note, where the key comes up, so it sends nothing: give it a ramp to end on, or move it earlier",
+            ),
+            (
+                with(None, pressure(vec![point(0.0, 0, None)], Some(2.0))),
+                "note 1 (`C3`): pressure: repeat_beats is 2, longer than the 1-beat note: shorten it, or lengthen the note",
+            ),
+            (
+                with(None, pressure(vec![point(0.0, 128, None)], None)),
+                "note 1 (`C3`): pressure: point 1: value must be 0-127, not 128",
+            ),
+            (
+                with(
+                    None,
+                    pressure(vec![point(0.5, 9, Some(Ramp::Smooth))], None),
+                ),
+                "note 1 (`C3`): pressure: point 1: it ramps, but it's the first point",
+            ),
+            (
+                with(None, pressure(many, None)),
+                "note 1 (`C3`): pressure: 8193 points is more than the 8192",
+            ),
+        ] {
+            let error = clip_from_notes(&[spec], None, BAR, None).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.starts_with(expected),
+                "expected {expected:?}: {message}"
+            );
+        }
+        // A key can come up as slowly as it likes.
+        assert!(clip_from_notes(&[with(Some(0), None)], None, BAR, None).is_ok());
+    }
+
+    #[test]
+    fn a_clip_holds_a_bounded_number_of_pressure_changes() {
+        // Each point a jump on a tick of its own, through a nine-beat note.
+        let busy = |count: usize| NoteSpec {
+            pressure: pressure(
+                (0..count)
+                    .map(|index| point(index as f64 / 960.0, (index % 2) as i32, None))
+                    .collect(),
+                None,
+            ),
+            ..note("C3", 0.0, 9.0)
+        };
+        let full = clip_from_notes(&[busy(MAX_PRESSURE_CHANGES)], None, BAR, None).unwrap();
+        assert_eq!(pressed(&full).len(), MAX_PRESSURE_CHANGES);
+        let one_more = NoteSpec {
+            pressure: pressure(vec![point(0.0, 1, None)], None),
+            ..note("D3", 0.0, 1.0)
+        };
+        assert_eq!(
+            clip_from_notes(&[busy(MAX_PRESSURE_CHANGES), one_more], None, BAR, None),
+            Err(NotesError::TooManyPressureChanges)
+        );
+    }
+
+    #[test]
+    fn notes_read_back_with_their_release_and_pressure() {
+        let notes = [
+            NoteSpec {
+                release: Some(20),
+                pressure: pressure(
+                    vec![
+                        point(0.0, 0, None),
+                        point(1.0, 100, Some(Ramp::Smooth)),
+                        point(2.0, 0, Some(Ramp::Linear)),
+                    ],
+                    None,
+                ),
+                ..note("C3", 0.0, 2.0)
+            },
+            // Successive jumps on one tick keep their order.
+            NoteSpec {
+                pressure: pressure(
+                    vec![
+                        point(0.0, 10, None),
+                        point(0.5, 20, None),
+                        point(0.5, 90, None),
+                    ],
+                    None,
+                ),
+                ..note("D3", 2.0, 1.0)
+            },
+            NoteSpec {
+                pressure: pressure(vec![point(0.0, 30, None), point(0.75, 60, None)], None),
+                ..note("E3", 3.5, 1.0)
+            },
+            note("G3", 0.0, 1.0),
+        ];
+        let clip = clip_from_notes(&notes, Some(4.0), BAR, None).unwrap();
+        let read = notes_from_clip(&clip);
+        let rewritten = written_back(&read);
+        let written: Vec<_> = rewritten
+            .iter()
+            .map(|spec| {
+                let points = spec.pressure.as_ref().map_or_else(Vec::new, |lane| {
+                    lane.points
+                        .iter()
+                        .map(|point| (point.at, point.value, point.ramp))
+                        .collect()
+                });
+                (spec.start, spec.release, points)
+            })
+            .collect();
+        assert_eq!(
+            written,
+            [
+                (
+                    0.0,
+                    Some(20),
+                    vec![
+                        (0.0, 0, None),
+                        (1.0, 100, Some(Ramp::Smooth)),
+                        (2.0, 0, Some(Ramp::Linear)),
+                    ]
+                ),
+                (0.0, Some(64), vec![]),
+                (
+                    2.0,
+                    Some(64),
+                    vec![(0.0, 10, None), (0.5, 20, None), (0.5, 90, None)]
+                ),
+                (3.5, Some(64), vec![(0.0, 30, None), (0.75, 60, None)]),
+            ]
+        );
+        assert_eq!(clip_from_notes(&rewritten, Some(4.0), BAR, None), Ok(clip));
+    }
+
+    #[test]
+    fn repeated_pressure_reads_back_as_every_pass() {
+        let wobble = NoteSpec {
+            pressure: pressure(
+                vec![
+                    point(0.0, 0, None),
+                    point(0.25, 64, Some(Ramp::Linear)),
+                    point(0.5, 0, Some(Ramp::Linear)),
+                ],
+                Some(0.5),
+            ),
+            ..note("C3", 1.0, 2.0)
+        };
+        let clip = clip_from_notes(&[wobble], None, BAR, None).unwrap();
+        let read = notes_from_clip(&clip);
+        assert!(read[0].pressure.len() > 3, "{:?}", read[0].pressure);
+        assert_eq!(
+            clip_from_notes(&written_back(&read), None, BAR, None),
+            Ok(clip)
         );
     }
 }

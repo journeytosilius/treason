@@ -597,7 +597,8 @@ impl TreasonServer {
     }
 
     /// Replaces a track's notes with a step pattern: one step string per
-    /// voice, the usual way to write drums. The track's controls stay where
+    /// voice, the usual way to write drums, with digits for ghost notes and
+    /// other velocities. The track's controls stay where
     /// they are, cut off by a shorter loop; to fill a longer one, set them
     /// again with set_controls. While playing, the new pattern starts at the
     /// next bar. Returns the track with its pattern as it will play.
@@ -618,9 +619,11 @@ impl TreasonServer {
     /// note number, or by a voice of the track's device, and time it in
     /// beats from the start of the loop. For example, a bass figure:
     /// {"track": 2, "notes": [{"note": "C2", "start": 0, "length": 0.5},
-    /// {"note": "Eb2", "start": 1.5, "length": 0.5}]}. The track's controls
-    /// stay where they are, cut off by a shorter loop; to fill a longer one,
-    /// set them again with set_controls. While playing, the new clip starts
+    /// {"note": "Eb2", "start": 1.5, "length": 0.5}]}. A note can also give
+    /// its release velocity, and its key's pressure (polyphonic aftertouch)
+    /// as points through the note, as set_controls takes them. The track's
+    /// controls stay where they are, cut off by a shorter loop; to fill a
+    /// longer one, set them again with set_controls. While playing, the new clip starts
     /// at the next bar. Returns the track as it will play: as step strings
     /// if the notes fit a step grid, otherwise as notes.
     #[tool]
@@ -1187,6 +1190,8 @@ mod tests {
                     start,
                     length,
                     velocity: None,
+                    release: None,
+                    pressure: None,
                 })
                 .collect(),
             loop_beats: None,
