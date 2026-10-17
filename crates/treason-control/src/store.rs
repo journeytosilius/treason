@@ -343,6 +343,14 @@ impl ExportStore {
             Published::Exists => Err(ProjectError::ExportExists(name.clone())),
         }
     }
+
+    /// Writes `bytes`, a MIDI file, to an explicit path, atomically
+    /// replacing any earlier file. The parent directory must exist. A
+    /// failed write or flush leaves the old file as it was.
+    pub fn save_to(path: &Path, bytes: &[u8]) -> Result<(), ProjectError> {
+        publish_file(path, true, |temporary| write_new(temporary, bytes))?;
+        Ok(())
+    }
 }
 
 /// What [`publish`] did.
@@ -369,7 +377,18 @@ fn publish(
         path: dir.to_owned(),
         error,
     })?;
-    let temporary = dir.join(format!(
+    publish_file(path, overwrite, |temporary| write_new(temporary, bytes))
+}
+
+/// Writes and flushes a temporary sibling of `path` with `write`, then
+/// publishes it. A write failure removes the temporary file and leaves
+/// `path` as it was.
+fn publish_file(
+    path: &Path,
+    overwrite: bool,
+    write: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<Published, ProjectError> {
+    let temporary = path.with_file_name(format!(
         ".{}.{}-{}.tmp",
         path.file_name().unwrap_or_default().display(),
         std::process::id(),
@@ -379,7 +398,7 @@ fn publish(
         path: path.to_owned(),
         error,
     };
-    let published = write_new(&temporary, bytes).map_err(io).and_then(|()| {
+    let published = write(&temporary).map_err(io).and_then(|()| {
         let placed = if overwrite {
             fs::rename(&temporary, path)
         } else {
@@ -717,5 +736,41 @@ mod tests {
         let error = exports.save(&name("blocked"), b"third", true).unwrap_err();
         assert!(matches!(error, ProjectError::Io { .. }), "{error}");
         assert_eq!(files(exports.dir()), ["blocked.mid", "jam.mid"]);
+    }
+
+    #[test]
+    fn explicit_exports_replace_the_requested_file() {
+        let dir = TestDir::new("explicit-export");
+        let path = dir.path().join("a.custom-midi-file");
+        ExportStore::save_to(&path, b"first").unwrap();
+        ExportStore::save_to(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        assert_eq!(files(dir.path()), ["a.custom-midi-file"]);
+
+        // An explicit path keeps requiring an existing parent directory.
+        let missing = dir.path().join("missing").join("jam.mid");
+        let error = ExportStore::save_to(&missing, b"third").unwrap_err();
+        assert!(matches!(error, ProjectError::Io { .. }), "{error}");
+        assert!(!missing.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn a_failed_replacement_preserves_the_previous_file() {
+        let dir = TestDir::new("failed-replacement");
+        let path = dir.path().join("jam.mid");
+        ExportStore::save_to(&path, b"previous complete MIDI file").unwrap();
+
+        // Fail after writing part of the replacement, as a full disk can.
+        let result = publish_file(&path, true, |temporary| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temporary)?;
+            file.write_all(b"partial replacement")?;
+            Err(io::Error::other("simulated write failure"))
+        });
+        assert!(matches!(result, Err(ProjectError::Io { .. })));
+        assert_eq!(fs::read(&path).unwrap(), b"previous complete MIDI file");
+        assert_eq!(files(dir.path()), ["jam.mid"]);
     }
 }

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use treason_control::ProjectName;
+use treason_control::{ExportStore, ProjectName};
 use treason_core::export::{self, ExportError, MAX_EVENTS, MidiExport};
 use treason_core::model::Project;
 use treason_core::time::Ticks;
@@ -89,7 +89,8 @@ pub fn run(config: &Config, args: &ExportArgs) -> anyhow::Result<()> {
     let file = SmfExport.export(&project, name.as_str(), bars)?;
     let path = match &args.output {
         Some(path) => {
-            std::fs::write(path, &file).with_context(|| format!("writing {}", path.display()))?;
+            ExportStore::save_to(path, &file)
+                .with_context(|| format!("writing {}", path.display()))?;
             path.clone()
         }
         None => config.export_store().save(name, &file, true)?,
@@ -101,6 +102,7 @@ pub fn run(config: &Config, args: &ExportArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -291,6 +293,16 @@ mod tests {
         let output = dir.join("elsewhere.mid");
         run(&config, &args(Some(2), Some(output.clone()))).unwrap();
         assert_eq!(tracks(&std::fs::read(&output).unwrap())[0][3], "7680 end");
+
+        // Replacing --output publishes a new file. A reader of the earlier
+        // export still sees its complete two bars.
+        let mut previous = std::fs::File::open(&output).unwrap();
+        run(&config, &args(Some(1), Some(output.clone()))).unwrap();
+        let mut before = Vec::new();
+        previous.read_to_end(&mut before).unwrap();
+        assert_eq!(tracks(&before)[0][3], "7680 end");
+        assert_eq!(tracks(&std::fs::read(&output).unwrap())[0][3], "3840 end");
+        drop(previous);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

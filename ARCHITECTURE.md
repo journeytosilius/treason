@@ -364,7 +364,8 @@ saved project. A DAW opens it with each part on its own track.
 - The file is written like a saved project: flushed under a temporary
   name, then linked or renamed into place. Exporting under the project's
   own name replaces the old file, and replacing any other file needs
-  `overwrite`. `treason export` always replaces its project's file.
+  `overwrite`. `treason export` always replaces its project's file, and
+  uses the same atomic replacement for an explicit `--output` path.
 
 The MCP server takes a snapshot of the project and renders it on a thread
 that may block, so a long song doesn't hold up the session or other tools.
