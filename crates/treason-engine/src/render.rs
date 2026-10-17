@@ -447,13 +447,10 @@ fn visit(
     }
     for (index, track) in project.tracks.iter().enumerate() {
         if !track.muted && wanted(track.target.port) {
-            render_track(
-                index,
-                track,
-                channel_bend_range(project, track),
-                window.clone(),
-                &mut emit,
-            );
+            // Looked up only for a clip program change, so the tracks
+            // without one cost no pass over the others.
+            let bend_range = || channel_bend_range(project, track);
+            render_track(index, track, bend_range, window.clone(), &mut emit);
         }
     }
 }
@@ -635,11 +632,12 @@ pub fn clock_pulses(window: Range<Ticks>) -> impl Iterator<Item = Ticks> {
         .take_while(move |tick| *tick < window.end)
 }
 
-/// Visits one track's events in a non-empty `window`, unsorted.
+/// Visits one track's events in a non-empty `window`, unsorted. A clip
+/// program change is followed by the channel's `bend_range`, if it has one.
 fn render_track(
     track_index: usize,
     track: &Track,
-    bend_range: Option<U7>,
+    bend_range: impl Fn() -> Option<U7>,
     window: Range<Ticks>,
     mut emit: impl FnMut(RenderedEvent),
 ) {
@@ -711,7 +709,7 @@ fn render_track(
                     if let Some(message) = channel_message(kind, channel).filter(|_| at >= start) {
                         emit(at, message, 0);
                         if matches!(kind, EventKind::Program { .. })
-                            && let Some(range) = bend_range
+                            && let Some(range) = bend_range()
                         {
                             for (slot, message) in bend_range_messages(channel, range) {
                                 emit(at, message, slot);
