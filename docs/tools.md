@@ -10,8 +10,8 @@ explains how the tools fit together, with examples.
 
 | Tool | What it does |
 |---|---|
-| [`add_track`](#add_track) | Adds a track that loops one empty bar, with a program to set the sound of its channel if you like. |
-| [`edit_track`](#edit_track) | Renames a track, moves it to another port, channel or device, or changes its program, as one edit. |
+| [`add_track`](#add_track) | Adds a track that loops one empty bar, with a program to set the sound of its channel, and a bend range for its pitch bend, if you like. |
+| [`edit_track`](#edit_track) | Renames a track, moves it to another port, channel or device, or changes its program or bend range, as one edit. |
 | [`export_midi`](#export_midi) | Exports the project as a Standard MIDI File that a DAW can open: a track for each unmuted track, named after it, with the tempo and time signature. |
 | [`get_guide`](#get_guide) | The guide to driving treason: how projects, tracks and loops work, what each tool is for, the names and notations, the limits, what the errors mean and how to connect gear, with examples of every call. Read it once before you start. |
 | [`get_project`](#get_project) | Shows the project: tempo, time signature and every track, with each clip as step strings or notes, in the form set_steps or set_notes takes, and its controls in the form set_controls takes. |
@@ -19,24 +19,24 @@ explains how the tools fit together, with examples.
 | [`list_ports`](#list_ports) | Lists the MIDI output ports that tracks can play on. |
 | [`list_projects`](#list_projects) | Lists the saved projects, newest first, for load_project. |
 | [`load_project`](#load_project) | Loads a project saved with save_project. |
-| [`panic`](#panic) | Ends every sounding note on every port at once, for stuck notes. |
+| [`panic`](#panic) | Ends every sounding note on every port at once, and puts the pedals, pitch bend and pressure back at rest on every channel, for stuck notes and bends. |
 | [`play`](#play) | Starts playing from bar 1, or from `from_bar`. |
 | [`redo`](#redo) | Redoes the last undone edit. |
 | [`remove_track`](#remove_track) | Removes a track. |
 | [`save_project`](#save_project) | Saves the project under a name, so that load_project can bring it back, even after treason restarts. |
-| [`set_controls`](#set_controls) | Sets how a track moves its synth's controls, such as the mod wheel or a filter's cutoff, by sending MIDI control changes (CC) through the loop. |
+| [`set_controls`](#set_controls) | Sets how a track moves its synth's controls, such as the mod wheel or a filter's cutoff, by sending MIDI control changes (CC) through the loop, and how it bends pitch (pitch_bend) and presses on the keys (pressure, channel aftertouch). |
 | [`set_muted`](#set_muted) | Mutes or unmutes a track, at the next bar while playing. |
 | [`set_notes`](#set_notes) | Replaces a track's notes, for basslines, chords and melodies. |
 | [`set_steps`](#set_steps) | Replaces a track's notes with a step pattern: one step string per voice, the usual way to write drums. |
 | [`set_tempo`](#set_tempo) | Sets the tempo. |
 | [`set_time_signature`](#set_time_signature) | Sets the time signature, and with it the bar length. |
 | [`status`](#status) | Shows whether the sequencer is playing, where, and how fast, and the project's name and whether it has unsaved changes. |
-| [`stop`](#stop) | Stops playing and ends every sounding note. |
+| [`stop`](#stop) | Stops playing and ends every sounding note, releasing pedals, recentring pitch bend and lifting pressure. |
 | [`undo`](#undo) | Undoes the last edit. |
 
 ## add_track
 
-Adds a track that loops one empty bar, with a program to set the sound of its channel if you like. Returns the track: pass its id to the other tools.
+Adds a track that loops one empty bar, with a program to set the sound of its channel, and a bend range for its pitch bend, if you like. Returns the track: pass its id to the other tools.
 
 Input:
 
@@ -45,6 +45,7 @@ Input:
 | `name` | string | A name for the track, such as "drums" or "bass". |
 | `bank_lsb` | integer, optional | Bank select LSB (controller 32), 0-127, sent before a program given by number, on gear with banks. |
 | `bank_msb` | integer, optional | Bank select MSB (controller 0), 0-127, sent before a program given by number, on gear with banks. |
+| `bend_range` | integer, optional | How many semitones pitch_bend reaches either way, 0-127, so 8191 bends up this far and -8192 down: sent to the track's channel as RPN 0, pitch bend sensitivity, along with its program. Tracks on the same port and channel share one. Without it, the device keeps its own, often 2. Most synths take up to 24. |
 | `channel` | integer, optional | The MIDI channel, 1-16. Defaults to the device's channel, or 1. |
 | `device` | string, optional | A device profile id, from list_devices. It lets set_steps and set_notes use the device's voice names. |
 | `port` | string, optional | The output port, from list_ports. Defaults to the first port. |
@@ -54,7 +55,7 @@ Returns [`TrackView`](#trackview).
 
 ## edit_track
 
-Renames a track, moves it to another port, channel or device, or changes its program, as one edit. Its clip stays as it is. While playing, the change takes effect at the next bar. Returns the track.
+Renames a track, moves it to another port, channel or device, or changes its program or bend range, as one edit. Its clip stays as it is. While playing, the change takes effect at the next bar. Returns the track.
 
 Input:
 
@@ -63,6 +64,7 @@ Input:
 | `track` | integer | The track's id. |
 | `bank_lsb` | integer, optional | Bank select LSB (controller 32), 0-127, for the program. |
 | `bank_msb` | integer, optional | Bank select MSB (controller 0), 0-127, for the program. |
+| `bend_range` | integer, optional | Another bend range, as in add_track, or null to stop sending one. |
 | `channel` | integer, optional | Another MIDI channel, 1-16. Without it the channel stays, even when the device changes. |
 | `device` | string, optional | Another device profile id, from list_devices. Later set_steps calls use its voice names; the notes already in the clip stay as they are. |
 | `name` | string, optional | A new name. |
@@ -169,7 +171,7 @@ Returns the same as [`get_project`](#get_project).
 
 ## panic
 
-Ends every sounding note on every port at once, for stuck notes.
+Ends every sounding note on every port at once, and puts the pedals, pitch bend and pressure back at rest on every channel, for stuck notes and bends. Playback carries on.
 
 No input: call it with `{}`.
 
@@ -222,13 +224,13 @@ Returns text.
 
 ## set_controls
 
-Sets how a track moves its synth's controls, such as the mod wheel or a filter's cutoff, by sending MIDI control changes (CC) through the loop. A track can send controls alone, with no notes: modulation for a synth that plays its own notes, for example. Each control is a list of points, values at times in beats, that it jumps to or ramps to from the point before. A two-bar mod-wheel swell: {"track": 3, "controls": {"modulation": {"points": [{"at": 0, "value": 0}, {"at": 8, "value": 127, "ramp": "linear"}]}}}. A sine-wave LFO on the cutoff, once a beat: {"track": 3, "controls": {"cutoff": {"points": [{"at": 0, "value": 32}, {"at": 0.5, "value": 96, "ramp": "smooth"}, {"at": 1, "value": 32, "ramp": "smooth"}], "repeat_beats": 1}}}. The track's notes stay, and so do the controls the call leaves out; a control with no points is removed. While playing, the change takes effect at the next bar. Returns the track as it will play.
+Sets how a track moves its synth's controls, such as the mod wheel or a filter's cutoff, by sending MIDI control changes (CC) through the loop, and how it bends pitch (pitch_bend) and presses on the keys (pressure, channel aftertouch). A track can send controls alone, with no notes: modulation for a synth that plays its own notes, for example. Each control is a list of points, values at times in beats, that it jumps to or ramps to from the point before. A two-bar mod-wheel swell: {"track": 3, "controls": {"modulation": {"points": [{"at": 0, "value": 0}, {"at": 8, "value": 127, "ramp": "linear"}]}}}. A sine-wave LFO on the cutoff, once a beat: {"track": 3, "controls": {"cutoff": {"points": [{"at": 0, "value": 32}, {"at": 0.5, "value": 96, "ramp": "smooth"}, {"at": 1, "value": 32, "ramp": "smooth"}], "repeat_beats": 1}}}. A bend up to the top of the bend range over beat 4, back at the centre for the next bar: {"track": 3, "controls": {"pitch_bend": {"points": [{"at": 0, "value": 0}, {"at": 3, "value": 0}, {"at": 4, "value": 8191, "ramp": "smooth"}]}}}. The track's notes stay, and so do the controls the call leaves out; a control with no points is removed. While playing, the change takes effect at the next bar. Returns the track as it will play.
 
 Input:
 
 | Field | Type | Description |
 |---|---|---|
-| `controls` | map of names to [`ControlLane`](#controllane) | The controls to set, keyed by a parameter of the track's device (see list_devices), a standard name, or a controller number, 0-119. The standard names, with their numbers: modulation (1, the mod wheel), breath (2), foot (4), portamento_time (5), volume (7), balance (8), pan (10), expression (11), sustain (64), portamento (65), sostenuto (66), soft_pedal (67), legato (68), resonance (71), release (72), attack (73), cutoff (74), decay (75), vibrato_rate (76), vibrato_depth (77), vibrato_delay (78), reverb (91), tremolo (92), chorus (93), detune (94) and phaser (95). |
+| `controls` | map of names to [`ControlLane`](#controllane) | The controls to set, keyed by a parameter of the track's device (see list_devices), a standard name, or a controller number, 0-119; or pitch_bend, for pitch bend, or pressure, for channel pressure (aftertouch). The standard names, with their numbers: modulation (1, the mod wheel), breath (2), foot (4), portamento_time (5), volume (7), balance (8), pan (10), expression (11), sustain (64), portamento (65), sostenuto (66), soft_pedal (67), legato (68), resonance (71), release (72), attack (73), cutoff (74), decay (75), vibrato_rate (76), vibrato_depth (77), vibrato_delay (78), reverb (91), tremolo (92), chorus (93), detune (94) and phaser (95). |
 | `track` | integer | The track's id. |
 | `loop_beats` | number, optional | The loop length in beats, at most 1024, on a track without notes: on a track with notes, they set the loop. Defaults to the track's loop, or on a track with nothing else, to the end of the last point or repeat, rounded up to a whole bar. A shorter loop cuts off the track's other controls at its end. |
 
@@ -321,7 +323,7 @@ Returns:
 
 ## stop
 
-Stops playing and ends every sounding note. The position stays. Gear on ports that get MIDI clock stops too.
+Stops playing and ends every sounding note, releasing pedals, recentring pitch bend and lifting pressure. The position stays. Gear on ports that get MIDI clock stops too.
 
 No input: call it with `{}`.
 
@@ -355,7 +357,7 @@ A control's value at a point in the loop.
 | Field | Type | Description |
 |---|---|---|
 | `at` | number | When, in beats from the start of the loop, or of each repeat: 0 is the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of a beat. A ramp can end at the end of the loop or repeat, which is where the next pass starts again from the first point. |
-| `value` | integer | The value, 0-127. |
+| `value` | integer | The value, 0-127. For pitch_bend, -8192 to 8191: 0 is the centre, 8191 bends up by the track's bend_range and -8192 down by it, so with a range of 2, a whole tone up is 8191 and a semitone 4096. |
 | `ramp` | [`Ramp`](#ramp), optional | How the value gets here from the point before: "linear" ramps evenly, and "smooth" eases out and in, so smooth ramps between a low and a high make a sine wave. Without it, the value jumps here. The first point can't ramp, since nothing comes before it. A ramp must end later than the point before; same-time points must jump. |
 
 ### ControlView
@@ -428,7 +430,7 @@ A control's value at a point in the loop.
 | Field | Type | Description |
 |---|---|---|
 | `at` | number | When, in beats from the start of the loop. |
-| `value` | integer | The value, 0-127. |
+| `value` | integer | The value: 0-127, or for pitch_bend, -8192 to 8191 around the centre at 0. |
 | `ramp` | [`Ramp`](#ramp), optional | How the value gets here from the point before. Missing where it jumps. |
 
 ### ProgramRef
@@ -474,7 +476,8 @@ A track.
 | `port` | string | The output port. |
 | `bank_lsb` | integer, optional | Bank select LSB, sent before a program shown by number. |
 | `bank_msb` | integer, optional | Bank select MSB, sent before a program shown by number. |
-| `controls` | map of names to [`ControlView`](#controlview), optional | The loop's controls (MIDI CC) in the form set_controls takes, by name. Missing when it sends none. |
+| `bend_range` | integer, optional | How many semitones pitch_bend reaches either way on its channel. Missing when the track sets none, leaving the device's own. |
+| `controls` | map of names to [`ControlView`](#controlview), optional | The loop's controls (MIDI CC), pitch bend and pressure in the form set_controls takes, by name. Missing when it sends none. |
 | `device` | string, optional | The device profile that names its voices and parameters, if any. |
 | `notes` | list of [`NoteView`](#noteview), optional | The loop's notes in the form set_notes takes, by start. Shown for clips that aren't step patterns, such as melodies. |
 | `pattern` | [`PatternView`](#patternview), optional | The loop's notes as step strings, in the form set_steps takes. Shown when every note sits on a step grid at set_steps' velocities; missing for other clips, such as melodies. |

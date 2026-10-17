@@ -255,6 +255,7 @@ mod tests {
                 },
                 muted: false,
                 program: None,
+                bend_range: None,
                 clip: Clip::new(
                     Ticks::quarters(1),
                     vec![ClipEvent {

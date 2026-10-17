@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use toml::ser::ValueSerializer;
-use treason_core::midi::{Channel, U7};
+use treason_core::midi::{Channel, U7, U14};
 use treason_core::model::{
     Clip, ClipError, ClipEvent, EventKind, OutputTarget, PortId, Program, Project, Track, TrackId,
 };
@@ -67,6 +67,9 @@ pub enum FileError {
     /// Two tracks set different programs on the same port and channel.
     #[error("tracks {0} and {1} set different programs on the same port and channel")]
     ProgramClash(TrackId, TrackId),
+    /// Two tracks set different bend ranges on the same port and channel.
+    #[error("tracks {0} and {1} set different bend ranges on the same port and channel")]
+    BendRangeClash(TrackId, TrackId),
     /// A track's clip is invalid.
     #[error("track {track}: {error}")]
     Clip {
@@ -115,6 +118,8 @@ struct TrackFile {
     bank_msb: Option<U7>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bank_lsb: Option<U7>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bend_range: Option<U7>,
     #[serde(default)]
     muted: bool,
     loop_length: Ticks,
@@ -141,6 +146,39 @@ enum EventFile {
         start: Ticks,
         program: U7,
     },
+    PitchBend {
+        start: Ticks,
+        value: Bend,
+    },
+    Pressure {
+        start: Ticks,
+        value: U7,
+    },
+}
+
+/// Pitch bend as files write it: from -8192 to 8191, with 0 at rest, as
+/// the agent writes it too, rather than as sent.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(try_from = "i32", into = "i32")]
+struct Bend(U14);
+
+impl TryFrom<i32> for Bend {
+    type Error = String;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        value
+            .checked_add(i32::from(U14::CENTER.get()))
+            .and_then(|sent| u16::try_from(sent).ok())
+            .and_then(U14::new)
+            .map(Self)
+            .ok_or_else(|| format!("pitch bend must be -8192 to 8191, not {value}"))
+    }
+}
+
+impl From<Bend> for i32 {
+    fn from(Bend(value): Bend) -> Self {
+        Self::from(value.get()) - Self::from(U14::CENTER.get())
+    }
 }
 
 impl From<&ClipEvent> for EventFile {
@@ -163,6 +201,11 @@ impl From<&ClipEvent> for EventFile {
                 value,
             },
             EventKind::Program { program } => Self::Program { start, program },
+            EventKind::PitchBend { value } => Self::PitchBend {
+                start,
+                value: Bend(value),
+            },
+            EventKind::Pressure { value } => Self::Pressure { start, value },
         }
     }
 }
@@ -195,6 +238,17 @@ impl From<EventFile> for ClipEvent {
                 start,
                 kind: EventKind::Program { program },
             },
+            EventFile::PitchBend {
+                start,
+                value: Bend(value),
+            } => Self {
+                start,
+                kind: EventKind::PitchBend { value },
+            },
+            EventFile::Pressure { start, value } => Self {
+                start,
+                kind: EventKind::Pressure { value },
+            },
         }
     }
 }
@@ -226,6 +280,7 @@ pub fn write(project: &Project, ports: &[String]) -> Result<String, FileError> {
             program: track.program.map(|program| program.number),
             bank_msb: track.program.and_then(|program| program.bank_msb),
             bank_lsb: track.program.and_then(|program| program.bank_lsb),
+            bend_range: track.bend_range,
             muted: track.muted,
             loop_length: track.clip.length(),
             events: Vec::new(),
@@ -287,6 +342,9 @@ pub fn read(text: &str, ports: &[String], devices: &DeviceRegistry) -> Result<Pr
     if let Some((first, second)) = project.program_clash() {
         return Err(FileError::ProgramClash(first, second));
     }
+    if let Some((first, second)) = project.bend_range_clash() {
+        return Err(FileError::BendRangeClash(first, second));
+    }
     Ok(project)
 }
 
@@ -337,6 +395,7 @@ fn read_track(
         },
         muted: track.muted,
         program,
+        bend_range: track.bend_range,
         clip,
     })
 }
@@ -403,7 +462,24 @@ mod tests {
             },
             muted: false,
             program: None,
+            bend_range: None,
             clip: Clip::new(Ticks::quarters(4), events).unwrap(),
+        }
+    }
+
+    fn bend(start: u64, value: u16) -> ClipEvent {
+        ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::PitchBend {
+                value: U14::new(value).unwrap(),
+            },
+        }
+    }
+
+    fn pressure(start: u64, value: u8) -> ClipEvent {
+        ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Pressure { value: u7(value) },
         }
     }
 
@@ -452,6 +528,11 @@ mod tests {
                 control(0, 100, 0),
                 control(0, 6, 12),
                 note(3600, 33, 90, 480),
+                // Bends at both extremes and at rest, and pressure.
+                bend(0, 0),
+                bend(480, 16383),
+                bend(960, 8192),
+                pressure(960, 100),
             ],
         );
         bass.target.channel = Channel::from_number(2).unwrap();
@@ -461,6 +542,7 @@ mod tests {
             bank_msb: Some(u7(121)),
             bank_lsb: Some(u7(0)),
         });
+        bass.bend_range = Some(u7(12));
         drums.program = Some(Program::new(u7(25)));
         let mut empty = track(7, 0, vec![]);
         empty.clip = Clip::new(Ticks(3360), vec![]).unwrap();
@@ -498,7 +580,16 @@ mod tests {
 
     #[test]
     fn files_look_like_this() {
-        let mut drums = track(1, 0, vec![note(0, 36, 100, 240), control(480, 74, 64)]);
+        let mut drums = track(
+            1,
+            0,
+            vec![
+                note(0, 36, 100, 240),
+                control(480, 74, 64),
+                bend(480, 4096),
+                pressure(720, 90),
+            ],
+        );
         drums.name = "drums".into();
         drums.device = Some("kit".into());
         let mut lead = track(2, 1, vec![program(0, 5)]);
@@ -510,6 +601,7 @@ mod tests {
             bank_msb: None,
             bank_lsb: Some(u7(2)),
         });
+        lead.bend_range = Some(u7(12));
         let project = Project {
             tempo: Bpm::new(124.0).unwrap(),
             tracks: vec![Arc::new(drums), Arc::new(lead)],
@@ -537,6 +629,8 @@ loop_length = 3840
 events = [
     { type = "note", start = 0, note = 36, velocity = 100, length = 240 },
     { type = "control", start = 480, controller = 74, value = 64 },
+    { type = "pitch_bend", start = 480, value = -4096 },
+    { type = "pressure", start = 720, value = 90 },
 ]
 
 [[tracks]]
@@ -546,6 +640,7 @@ port = "synth"
 channel = 1
 program = 80
 bank_lsb = 2
+bend_range = 12
 muted = true
 loop_length = 3840
 events = [
@@ -636,9 +731,10 @@ events = []
                 track.device.as_deref(),
                 track.muted,
                 track.program,
+                track.bend_range,
                 track.clip.events().len()
             ),
-            (None, false, None, 0)
+            (None, false, None, None, 0)
         );
         assert_eq!(track.target.channel.number(), 16);
 
@@ -730,6 +826,41 @@ events = []
                     + "[[tracks]]\nid = 2\nname = \"u\"\nport = \"out\"\nchannel = 1\n\
                        program = 5\nbank_msb = 1\nloop_length = 960\n",
                 "tracks 1 and 2 set different programs on the same port and channel",
+            ),
+            (file("", "bend_range = 128", ""), "128"),
+            (
+                file("", "bend_range = 2", "")
+                    + "[[tracks]]\nid = 2\nname = \"u\"\nport = \"out\"\nchannel = 1\n\
+                       bend_range = 12\nloop_length = 960\n",
+                "tracks 1 and 2 set different bend ranges on the same port and channel",
+            ),
+            (
+                file(
+                    "",
+                    "",
+                    r#"{ type = "pitch_bend", start = 0, value = 8192 }"#,
+                ),
+                "pitch bend must be -8192 to 8191, not 8192",
+            ),
+            (
+                file(
+                    "",
+                    "",
+                    r#"{ type = "pitch_bend", start = 0, value = -8193 }"#,
+                ),
+                "pitch bend must be -8192 to 8191, not -8193",
+            ),
+            (
+                file(
+                    "",
+                    "",
+                    r#"{ type = "pitch_bend", start = 0, value = 4294967296 }"#,
+                ),
+                "4294967296",
+            ),
+            (
+                file("", "", r#"{ type = "pressure", start = 0, value = 128 }"#),
+                "128",
             ),
         ];
         for (text, expected) in cases {

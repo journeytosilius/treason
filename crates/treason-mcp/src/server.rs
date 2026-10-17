@@ -9,7 +9,7 @@ use treason_control::{
     ControlError, Edit, ExportStore, ProjectError, ProjectName, ProjectStore, Session,
 };
 use treason_core::export::{self, ExportError, MAX_BARS, MidiExport};
-use treason_core::midi::Channel;
+use treason_core::midi::{Channel, U7};
 use treason_core::model::{Clip, OutputTarget, PortId, Project, Track, TrackId};
 use treason_core::playback::{Playback, TransportCommand};
 use treason_core::time::{Bpm, Ticks, TimeSignature};
@@ -190,6 +190,11 @@ fn describe(error: ControlError) -> String {
              program: give them the same one, leave it out of one (program null in edit_track \
              clears it), or move one to another channel"
         ),
+        ControlError::BendRangeClash(first, second) => format!(
+            "tracks {first} and {second} play on the same port and channel, which has one bend \
+             range: give them the same one, leave it out of one (bend_range null in edit_track \
+             clears it), or move one to another channel"
+        ),
         other => other.to_string(),
     }
 }
@@ -220,6 +225,12 @@ fn find_track(session: &Session<Box<dyn Playback + Send>>, id: u32) -> Result<Tr
 /// The channel numbered `number`, 1-16.
 fn parse_channel(number: u8) -> Result<Channel, String> {
     Channel::from_number(number).ok_or_else(|| format!("MIDI channel must be 1-16, got {number}"))
+}
+
+fn parse_bend_range(semitones: u8) -> Result<U7, String> {
+    U7::new(semitones).ok_or_else(|| {
+        format!("bend_range must be 0-127 semitones, not {semitones}; most synths take up to 24")
+    })
 }
 
 #[tool_router]
@@ -438,8 +449,8 @@ impl TreasonServer {
     }
 
     /// Adds a track that loops one empty bar, with a program to set the
-    /// sound of its channel if you like. Returns the track: pass its id to
-    /// the other tools.
+    /// sound of its channel, and a bend range for its pitch bend, if you
+    /// like. Returns the track: pass its id to the other tools.
     #[tool]
     fn add_track(
         &self,
@@ -461,6 +472,7 @@ impl TreasonServer {
             device,
         )
         .map_err(|error| error.to_string())?;
+        let bend_range = request.bend_range.map(parse_bend_range).transpose()?;
         let bar = session.project().time_signature.bar_length();
         let track = Track {
             id: session.project().next_track_id(),
@@ -469,6 +481,7 @@ impl TreasonServer {
             target: OutputTarget { port, channel },
             muted: false,
             program,
+            bend_range,
             clip: Clip::new(bar, Vec::new()).map_err(|error| error.to_string())?,
         };
         let view = TrackView::new(&track, &self.ports, session.devices());
@@ -477,8 +490,9 @@ impl TreasonServer {
     }
 
     /// Renames a track, moves it to another port, channel or device, or
-    /// changes its program, as one edit. Its clip stays as it is. While
-    /// playing, the change takes effect at the next bar. Returns the track.
+    /// changes its program or bend range, as one edit. Its clip stays as it
+    /// is. While playing, the change takes effect at the next bar. Returns
+    /// the track.
     #[tool]
     fn edit_track(
         &self,
@@ -493,6 +507,7 @@ impl TreasonServer {
             program,
             bank_msb,
             bank_lsb,
+            bend_range,
         } = request;
         let banked = bank_msb.is_some() || bank_lsb.is_some();
         let unchanged = [
@@ -500,10 +515,14 @@ impl TreasonServer {
             port.is_none(),
             channel.is_none(),
             device.is_none(),
+            program.is_none() && !banked,
+            bend_range.is_none(),
         ];
-        if unchanged.into_iter().all(|unchanged| unchanged) && program.is_none() && !banked {
+        if unchanged.into_iter().all(|unchanged| unchanged) {
             return Err(
-                "give at least one of name, port, channel, device or program to change".into(),
+                "give at least one of name, port, channel, device, program or \
+                 bend_range to change"
+                    .into(),
             );
         }
         let port = port
@@ -511,6 +530,9 @@ impl TreasonServer {
             .map(|port| self.port_id(Some(port)))
             .transpose()?;
         let channel = channel.map(parse_channel).transpose()?;
+        let bend_range = bend_range
+            .map(|range| range.map(parse_bend_range).transpose())
+            .transpose()?;
         let mut session = self.session();
         let mut edited = find_track(&session, track)?;
         if let Some(name) = name {
@@ -534,9 +556,12 @@ impl TreasonServer {
             profile,
         )
         .map_err(|error| error.to_string())?;
-        // Missing keeps the program; null clears it.
+        // Missing keeps the program and the bend range; null clears them.
         if program.is_some() {
             edited.program = requested;
+        }
+        if let Some(bend_range) = bend_range {
+            edited.bend_range = bend_range;
         }
         let view = TrackView::new(&edited, &self.ports, session.devices());
         session
@@ -613,18 +638,23 @@ impl TreasonServer {
 
     /// Sets how a track moves its synth's controls, such as the mod wheel or
     /// a filter's cutoff, by sending MIDI control changes (CC) through the
-    /// loop. A track can send controls alone, with no notes: modulation for
-    /// a synth that plays its own notes, for example. Each control is a
-    /// list of points, values at times in beats, that it jumps to or ramps
-    /// to from the point before. A two-bar mod-wheel swell: {"track": 3,
-    /// "controls": {"modulation": {"points": [{"at": 0, "value": 0}, {"at":
-    /// 8, "value": 127, "ramp": "linear"}]}}}. A sine-wave LFO on the
-    /// cutoff, once a beat: {"track": 3, "controls": {"cutoff": {"points":
-    /// [{"at": 0, "value": 32}, {"at": 0.5, "value": 96, "ramp": "smooth"},
-    /// {"at": 1, "value": 32, "ramp": "smooth"}], "repeat_beats": 1}}}. The
-    /// track's notes stay, and so do the controls the call leaves out; a
-    /// control with no points is removed. While playing, the change takes
-    /// effect at the next bar. Returns the track as it will play.
+    /// loop, and how it bends pitch (pitch_bend) and presses on the keys
+    /// (pressure, channel aftertouch). A track can send controls alone,
+    /// with no notes: modulation for a synth that plays its own notes, for
+    /// example. Each control is a list of points, values at times in beats,
+    /// that it jumps to or ramps to from the point before. A two-bar
+    /// mod-wheel swell: {"track": 3, "controls": {"modulation": {"points":
+    /// [{"at": 0, "value": 0}, {"at": 8, "value": 127, "ramp": "linear"}]}}}.
+    /// A sine-wave LFO on the cutoff, once a beat: {"track": 3, "controls":
+    /// {"cutoff": {"points": [{"at": 0, "value": 32}, {"at": 0.5, "value":
+    /// 96, "ramp": "smooth"}, {"at": 1, "value": 32, "ramp": "smooth"}],
+    /// "repeat_beats": 1}}}. A bend up to the top of the bend range over
+    /// beat 4, back at the centre for the next bar: {"track": 3, "controls":
+    /// {"pitch_bend": {"points": [{"at": 0, "value": 0}, {"at": 3, "value":
+    /// 0}, {"at": 4, "value": 8191, "ramp": "smooth"}]}}}. The track's notes
+    /// stay, and so do the controls the call leaves out; a control with no
+    /// points is removed. While playing, the change takes effect at the next
+    /// bar. Returns the track as it will play.
     #[tool]
     fn set_controls(
         &self,
@@ -659,7 +689,8 @@ impl TreasonServer {
         Ok(format!("Playing from bar {bar}."))
     }
 
-    /// Stops playing and ends every sounding note. The position stays. Gear
+    /// Stops playing and ends every sounding note, releasing pedals,
+    /// recentring pitch bend and lifting pressure. The position stays. Gear
     /// on ports that get MIDI clock stops too.
     #[tool]
     fn stop(&self) -> Result<String, String> {
@@ -667,11 +698,17 @@ impl TreasonServer {
         Ok("Stopped.".into())
     }
 
-    /// Ends every sounding note on every port at once, for stuck notes.
+    /// Ends every sounding note on every port at once, and puts the pedals,
+    /// pitch bend and pressure back at rest on every channel, for stuck
+    /// notes and bends. Playback carries on.
     #[tool]
     fn panic(&self) -> Result<String, String> {
         self.command(TransportCommand::Panic)?;
-        Ok("Sent note-offs, then pedal releases, All Sound Off and All Notes Off on every channel.".into())
+        Ok(
+            "Sent note-offs, then pedal releases, pitch bend and pressure at rest, All Sound Off \
+            and All Notes Off on every channel."
+                .into(),
+        )
     }
 
     /// Undoes the last edit.
@@ -992,6 +1029,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         let Json(track) = server.add_track(Parameters(request)).unwrap();
         assert_eq!(
@@ -1022,6 +1060,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         let Err(error) = server.add_track(Parameters(request)) else {
             panic!("added a track on a port that doesn't exist");
@@ -1051,6 +1090,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         server.add_track(Parameters(request)).unwrap().0.id
     }
@@ -1409,6 +1449,53 @@ mod tests {
     }
 
     #[test]
+    fn pitch_bend_and_pressure_read_back_in_the_form_set_controls_takes() {
+        let server = server();
+        let track = add(&server, None);
+        // The tool's own bend, and pressure swelling over the bar.
+        let expression = r#"{"pitch_bend": {"points": [{"at": 0, "value": 0},
+            {"at": 3, "value": 0}, {"at": 4, "value": 8191, "ramp": "smooth"}]},
+            "pressure": {"points": [{"at": 0, "value": 0},
+            {"at": 2, "value": 127, "ramp": "linear"}, {"at": 3, "value": 0}]}}"#;
+        let Json(view) = server
+            .set_controls(set_controls(track, expression, None))
+            .unwrap();
+        assert_eq!(view.loop_beats, 4.0);
+        let controls = view.controls.as_ref().expect("controls read back");
+        let points = |name: &str| {
+            controls[name]
+                .points
+                .iter()
+                .map(|point| (point.at, point.value, point.ramp))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            points("pitch_bend"),
+            [
+                (0.0, 0, None),
+                (3.0, 0, None),
+                (4.0, 8191, Some(Ramp::Smooth))
+            ]
+        );
+        assert_eq!(
+            points("pressure"),
+            [
+                (0.0, 0, None),
+                (2.0, 127, Some(Ramp::Linear)),
+                (3.0, 0, None)
+            ]
+        );
+        let original = server.session().project().tracks[0].clip.clone();
+        let written = serde_json::to_string(controls).unwrap();
+        let Json(rewritten) = server
+            .set_controls(set_controls(track, &written, Some(view.loop_beats)))
+            .unwrap();
+        assert_eq!(server.session().project().tracks[0].clip, original);
+        assert_eq!(rewritten, view);
+        assert_eq!(server.get_project().0.tracks, [view]);
+    }
+
+    #[test]
     fn existing_same_tick_controls_round_trip_through_get_project_and_set_controls() {
         use treason_core::midi::U7;
         use treason_core::model::{ClipEvent, EventKind};
@@ -1510,6 +1597,12 @@ mod tests {
                 "leave out loop_beats, or change the loop with set_notes or set_steps",
             ),
             (track, "{}".to_owned(), None, "give at least one control"),
+            (
+                track,
+                r#"{"pitch_bend": {"points": [{"at": 0, "value": 16383}]}}"#.to_owned(),
+                None,
+                "`pitch_bend`: point 1: value must be -8192 to 8191, with 0 the centre, not 16383",
+            ),
         ];
         for (track, controls, loop_beats, expected) in cases {
             let error = rejected(server.set_controls(set_controls(track, &controls, loop_beats)));
@@ -1554,6 +1647,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         let Json(view) = server.edit_track(Parameters(request)).unwrap();
         assert_eq!(
@@ -1584,6 +1678,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         let cases = [
             (unchanged(track), "give at least one"),
@@ -1633,6 +1728,7 @@ mod tests {
             program: Some(program),
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         server.add_track(Parameters(request)).unwrap().0.id
     }
@@ -1652,6 +1748,7 @@ mod tests {
             program,
             bank_msb,
             bank_lsb: None,
+            bend_range: None,
         }
     }
 
@@ -1710,6 +1807,7 @@ mod tests {
             program: None,
             bank_msb: None,
             bank_lsb: None,
+            bend_range: None,
         };
         assert!(server.add_track(Parameters(double)).is_ok());
 
@@ -1746,6 +1844,7 @@ mod tests {
                     program: Some(ProgramRef::Number(81)),
                     bank_msb: None,
                     bank_lsb: None,
+                    bend_range: None,
                 },
                 "tracks 1 and 3 play on the same port and channel",
             ),
@@ -1758,6 +1857,7 @@ mod tests {
                     program: Some(ProgramRef::Name("electric_bass".into())),
                     bank_msb: None,
                     bank_lsb: None,
+                    bend_range: None,
                 },
                 "gm has no program `electric_bass`; similar ones are",
             ),
@@ -1770,6 +1870,7 @@ mod tests {
                     program: None,
                     bank_msb: Some(1),
                     bank_lsb: None,
+                    bend_range: None,
                 },
                 "give the program too",
             ),
@@ -1833,8 +1934,138 @@ mod tests {
         );
     }
 
+    /// A new track on `channel` with this bend range.
+    fn ranged(name: &str, channel: u8, bend_range: Option<u8>) -> AddTrack {
+        AddTrack {
+            name: name.into(),
+            port: None,
+            device: None,
+            channel: Some(channel),
+            program: None,
+            bank_msb: None,
+            bank_lsb: None,
+            bend_range,
+        }
+    }
+
+    /// An edit of `track`'s bend range, and nothing else.
+    fn rerange(track: u32, bend_range: Option<Option<u8>>) -> EditTrack {
+        EditTrack {
+            bend_range,
+            ..reprogram(track, None, None)
+        }
+    }
+
     #[test]
-    fn edit_track_tells_a_null_program_from_a_missing_one() {
+    fn tracks_set_their_bend_range_and_null_clears_it() {
+        let server = server();
+        let Json(view) = server
+            .add_track(Parameters(ranged("lead", 1, Some(12))))
+            .unwrap();
+        assert_eq!(view.bend_range, Some(12));
+        let lead = view.id;
+        let shown = |server: &TreasonServer| server.get_project().0.tracks[0].bend_range;
+        assert_eq!(shown(&server), Some(12));
+        let cases = [
+            (rerange(lead, Some(Some(2))), Some(2)),
+            // Leaving it out keeps it.
+            (
+                EditTrack {
+                    name: Some("solo".into()),
+                    ..rerange(lead, None)
+                },
+                Some(2),
+            ),
+            (rerange(lead, Some(None)), None),
+            (rerange(lead, Some(Some(48))), Some(48)),
+        ];
+        for (request, expected) in cases {
+            let Json(view) = server.edit_track(Parameters(request)).unwrap();
+            assert_eq!(view.bend_range, expected);
+            assert_eq!(shown(&server), expected);
+        }
+        server.undo();
+        assert_eq!(shown(&server), None);
+
+        // Tracks on the same channel can leave the range to one of them, or
+        // give the same one.
+        server
+            .edit_track(Parameters(rerange(lead, Some(Some(12)))))
+            .unwrap();
+        for range in [None, Some(12)] {
+            assert!(
+                server
+                    .add_track(Parameters(ranged("double", 1, range)))
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn bad_bend_ranges_say_how_to_fix_the_call() {
+        let server = server();
+        let lead = server
+            .add_track(Parameters(ranged("lead", 1, Some(12))))
+            .unwrap()
+            .0
+            .id;
+        let pad = server
+            .add_track(Parameters(ranged("pad", 2, Some(2))))
+            .unwrap()
+            .0
+            .id;
+        let clash = |first, second| {
+            format!(
+                "tracks {first} and {second} play on the same port and channel, which has one \
+                 bend range: give them the same one, leave it out of one (bend_range null in \
+                 edit_track clears it), or move one to another channel"
+            )
+        };
+        let cases = [
+            (
+                ranged("other", 3, Some(128)),
+                "bend_range must be 0-127 semitones, not 128; most synths take up to 24".to_owned(),
+            ),
+            (ranged("other", 1, Some(24)), clash(lead, 3)),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.add_track(Parameters(request)));
+            assert!(error.contains(&expected), "expected {expected:?}: {error}");
+        }
+        let cases = [
+            (
+                rerange(lead, Some(Some(200))),
+                "bend_range must be 0-127 semitones, not 200".to_owned(),
+            ),
+            // Moving onto a channel with another range clashes too.
+            (
+                EditTrack {
+                    channel: Some(1),
+                    ..rerange(pad, None)
+                },
+                clash(lead, pad),
+            ),
+        ];
+        for (request, expected) in cases {
+            let error = rejected(server.edit_track(Parameters(request)));
+            assert!(error.contains(&expected), "expected {expected:?}: {error}");
+        }
+        let ranges: Vec<_> = server
+            .get_project()
+            .0
+            .tracks
+            .iter()
+            .map(|track| track.bend_range)
+            .collect();
+        assert_eq!(ranges, [Some(12), Some(2)], "nothing changed");
+    }
+
+    #[test]
+    fn edit_track_tells_null_from_a_missing_program_or_bend_range() {
+        let range = |json: &str| serde_json::from_str::<EditTrack>(json).unwrap().bend_range;
+        assert_eq!(range(r#"{"track": 1}"#), None);
+        assert_eq!(range(r#"{"track": 1, "bend_range": null}"#), Some(None));
+        assert_eq!(range(r#"{"track": 1, "bend_range": 12}"#), Some(Some(12)));
         let edit = |json: &str| serde_json::from_str::<EditTrack>(json).unwrap().program;
         assert_eq!(edit(r#"{"track": 1}"#), None);
         assert_eq!(edit(r#"{"track": 1, "program": null}"#), Some(None));
@@ -1847,11 +2078,13 @@ mod tests {
             Some(Some(ProgramRef::Name("pad_2_warm".into())))
         );
         let schema = serde_json::to_value(schemars::schema_for!(EditTrack)).unwrap();
-        let program = schema["properties"]["program"].to_string();
-        assert!(
-            program.contains("null"),
-            "agents must see that null is allowed: {program}"
-        );
+        for field in ["program", "bend_range"] {
+            let property = schema["properties"][field].to_string();
+            assert!(
+                property.contains("null"),
+                "agents must see that {field} can be null: {property}"
+            );
+        }
     }
 
     fn save(name: Option<&str>, overwrite: bool) -> Parameters<SaveProject> {
@@ -1887,6 +2120,7 @@ mod tests {
             program: Some(ProgramRef::Number(38)),
             bank_msb: Some(121),
             bank_lsb: Some(1),
+            bend_range: None,
         };
         let bass = server.add_track(Parameters(request)).unwrap().0.id;
         server

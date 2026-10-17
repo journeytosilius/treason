@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::midi::{Channel, U7};
+use crate::midi::{Channel, U7, U14};
 use crate::time::{Bpm, Ticks, TimeSignature};
 
 /// An output port: an index into the engine's table of open outputs.
@@ -77,13 +77,28 @@ impl Project {
     /// in project order, if any. A channel plays one program at a time, so
     /// tracks that share one must agree on it, or leave it to the others.
     pub fn program_clash(&self) -> Option<(TrackId, TrackId)> {
-        let mut programs = HashMap::new();
+        self.clash(|track| track.program)
+    }
+
+    /// Two tracks that set different bend ranges on the same port and
+    /// channel, in project order, if any. Like a program, a channel has one.
+    pub fn bend_range_clash(&self) -> Option<(TrackId, TrackId)> {
+        self.clash(|track| track.bend_range)
+    }
+
+    /// Two tracks on one port and channel that set it up differently, by
+    /// `setting`: the first to set it there, and the first to disagree.
+    fn clash<T: Copy + PartialEq>(
+        &self,
+        setting: impl Fn(&Track) -> Option<T>,
+    ) -> Option<(TrackId, TrackId)> {
+        let mut set = HashMap::new();
         for track in &self.tracks {
-            let Some(program) = track.program else {
+            let Some(value) = setting(track) else {
                 continue;
             };
-            let (first, set) = *programs.entry(track.target).or_insert((track.id, program));
-            if set != program {
+            let (first, first_value) = *set.entry(track.target).or_insert((track.id, value));
+            if first_value != value {
                 return Some((first, track.id));
             }
         }
@@ -109,6 +124,11 @@ pub struct Track {
     /// jump, and at the bar line where it changes, muted or not. `None`
     /// leaves the device's sound as it is.
     pub program: Option<Program>,
+    /// How far its channel's pitch bend reaches, in semitones either way:
+    /// sent as RPN 0, pitch bend sensitivity, along with the program, and
+    /// after it, since some devices reset it on a program change. `None`
+    /// leaves the device's range as it is.
+    pub bend_range: Option<U7>,
     /// What the track loops.
     pub clip: Clip,
 }
@@ -289,6 +309,11 @@ pub enum EventKind {
     Control { controller: U7, value: U7 },
     /// A program change.
     Program { program: U7 },
+    /// Pitch bend, from 0 to 16383, with [`U14::CENTER`] at rest.
+    PitchBend { value: U14 },
+    /// Channel pressure, or aftertouch: how hard every key on the channel
+    /// is pressed, 0 at rest.
+    Pressure { value: U7 },
 }
 
 #[cfg(test)]
@@ -372,6 +397,7 @@ mod tests {
                 },
                 muted: false,
                 program: None,
+                bend_range: None,
                 clip: Clip::default(),
             })
         };
@@ -405,6 +431,7 @@ mod tests {
                 },
                 muted: false,
                 program,
+                bend_range: None,
                 clip: Clip::default(),
             })
         };
@@ -448,6 +475,50 @@ mod tests {
                 ..Project::default()
             };
             assert_eq!(project.program_clash(), clash);
+        }
+    }
+
+    #[test]
+    fn tracks_on_one_channel_agree_on_its_bend_range() {
+        let track = |id, channel, bend_range: Option<u8>| {
+            Arc::new(Track {
+                id: TrackId(id),
+                name: format!("track {id}"),
+                device: None,
+                target: OutputTarget {
+                    port: PortId(0),
+                    channel: Channel::from_number(channel).unwrap(),
+                },
+                muted: false,
+                program: None,
+                bend_range: bend_range.and_then(U7::new),
+                clip: Clip::default(),
+            })
+        };
+        for (tracks, clash) in [
+            (vec![track(1, 1, Some(2)), track(2, 1, Some(2))], None),
+            (vec![track(1, 1, Some(2)), track(2, 1, None)], None),
+            (vec![track(1, 1, Some(2)), track(2, 2, Some(12))], None),
+            (
+                vec![
+                    track(3, 1, None),
+                    track(1, 1, Some(12)),
+                    track(2, 1, Some(2)),
+                ],
+                Some((TrackId(1), TrackId(2))),
+            ),
+            // Zero is a range: none at all.
+            (
+                vec![track(1, 1, Some(2)), track(2, 1, Some(0))],
+                Some((TrackId(1), TrackId(2))),
+            ),
+        ] {
+            let project = Project {
+                tracks,
+                ..Project::default()
+            };
+            assert_eq!(project.bend_range_clash(), clash);
+            assert_eq!(project.program_clash(), None);
         }
     }
 }

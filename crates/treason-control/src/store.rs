@@ -488,6 +488,7 @@ mod tests {
                 },
                 muted: false,
                 program: None,
+                bend_range: None,
                 clip: Clip::default(),
             })],
             ..Project::default()
