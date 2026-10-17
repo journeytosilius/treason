@@ -38,6 +38,8 @@ enum Command {
     Ports,
     /// List the device profiles.
     Devices,
+    /// List the saved projects, newest first.
+    Projects,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -55,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve::run(&config, &args),
         Command::Ports => list_ports(),
         Command::Devices => list_devices(&config),
+        Command::Projects => list_projects(&config),
     }
 }
 
@@ -65,6 +68,21 @@ fn list_ports() -> anyhow::Result<()> {
     }
     for name in names {
         println!("{name}");
+    }
+    Ok(())
+}
+
+fn list_projects(config: &Config) -> anyhow::Result<()> {
+    let projects = config.project_store();
+    let list = projects.list().context("listing the saved projects")?;
+    if list.names.is_empty() {
+        println!("No saved projects in {}.", projects.dir().display());
+    }
+    for name in &list.names {
+        println!("{name}");
+    }
+    if list.more > 0 {
+        println!("...and {} older.", list.more);
     }
     Ok(())
 }

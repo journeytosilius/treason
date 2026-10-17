@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use treason_control::Session;
+use treason_control::{ProjectName, Session};
 use treason_core::model::Project;
 use treason_core::output::MidiOutput;
 use treason_core::playback::Playback;
@@ -32,48 +32,76 @@ pub struct ServeArgs {
     /// Serve MCP over HTTP at this address instead of the configured one.
     #[arg(long, value_name = "ADDR", conflicts_with = "stdio")]
     http: Option<SocketAddr>,
+    /// Start with this saved project, as load_project would load it.
+    #[arg(long, value_name = "NAME")]
+    project: Option<ProjectName>,
 }
+
+/// The project to start with, and its name if it was saved.
+type Start = (Project, Option<ProjectName>);
 
 /// Opens the ports, starts the engine and serves MCP until Ctrl-C or
 /// SIGTERM, or with `--stdio` until the agent disconnects. Then stops the
 /// engine, which ends every sounding note, and waits for it.
 pub fn run(config: &Config, args: &ServeArgs) -> anyhow::Result<()> {
     let devices = config.load_devices()?;
+    let start = starting_project(config, args, &devices)?;
     let ports = config.port_specs();
     match config.engine.backend {
         Backend::Midir => {
             let output = MidirOutput::open(CLIENT_NAME, &ports).context("opening MIDI ports")?;
-            serve(config, args, devices, output)
+            serve(config, args, devices, start, output)
         }
         #[cfg(target_os = "linux")]
         Backend::AlsaSeq => {
             let lookahead = config.engine_config().lookahead;
             let output = AlsaSeqOutput::open(CLIENT_NAME, &ports, lookahead)
                 .context("opening MIDI ports on the ALSA sequencer")?;
-            serve(config, args, devices, output)
+            serve(config, args, devices, start, output)
         }
         #[cfg(not(target_os = "linux"))]
         Backend::AlsaSeq => anyhow::bail!("engine.backend = \"alsa-seq\" needs Linux"),
     }
 }
 
-/// Plays through `output` and serves MCP until shutdown.
+/// The project `--project` names, or an empty one.
+fn starting_project(
+    config: &Config,
+    args: &ServeArgs,
+    devices: &DeviceRegistry,
+) -> anyhow::Result<Start> {
+    let Some(name) = &args.project else {
+        return Ok((Project::default(), None));
+    };
+    let projects = config.project_store();
+    let project = projects
+        .load(name, &config.port_names(), devices)
+        .with_context(|| format!("loading project `{name}` from {}", projects.dir().display()))?;
+    tracing::info!(project = %name, "loaded the project");
+    Ok((project, Some(name.clone())))
+}
+
+/// Plays `start` through `output` and serves MCP until shutdown.
 fn serve<O: MidiOutput + 'static>(
     config: &Config,
     args: &ServeArgs,
     devices: DeviceRegistry,
+    (project, name): Start,
     output: O,
 ) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    let project = Arc::new(Project::default());
+    let project = Arc::new(project);
     let (playback, link) = treason_engine::link(Arc::clone(&project));
     let engine = Engine::new(link, output, SystemClock, config.engine_config())
         .spawn()
         .context("starting the engine thread")?;
 
     let playback: Box<dyn Playback + Send> = Box::new(playback);
-    let session = Session::new(project, devices, playback);
-    let server = TreasonServer::new(session, config.port_names());
+    let mut session = Session::new(project, devices, playback);
+    if let Some(name) = name {
+        session = session.with_name(name);
+    }
+    let server = TreasonServer::new(session, config.port_names(), config.project_store());
 
     let served = runtime.block_on(async {
         if args.stdio {
@@ -141,6 +169,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    use treason_control::ProjectStore;
     use treason_core::midi::{Channel, MidiMessage, U7};
     use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
     use treason_core::output::{Delivery, MidiOutput, TimedMessage};
@@ -260,6 +289,7 @@ mod tests {
         let server = TreasonServer::new(
             Session::new(project, DeviceRegistry::new(), playback),
             vec!["test".into()],
+            ProjectStore::new(std::env::temp_dir().join("treason-serve-unsaved")),
         );
         playing.blocking_recv().unwrap();
 
@@ -317,6 +347,44 @@ mod tests {
         assert!(ons > 0);
         assert_eq!(ons, offs);
         assert!(!sounding, "shutdown left a note sounding");
+    }
+
+    #[test]
+    fn serve_starts_with_the_project_it_is_given() {
+        let dir = std::env::temp_dir().join(format!("treason-serve-{}-start", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = Config {
+            projects: dir.clone(),
+            ..Config::default()
+        };
+        let args = |project: Option<&str>| ServeArgs {
+            stdio: false,
+            http: None,
+            project: project.map(|name| name.parse().unwrap()),
+        };
+        let devices = DeviceRegistry::new();
+        let (project, name) = starting_project(&config, &args(None), &devices).unwrap();
+        assert_eq!((project, name), (Project::default(), None));
+
+        let error = starting_project(&config, &args(Some("jam")), &devices).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no project `jam`") && message.contains(&dir.display().to_string()),
+            "{message}"
+        );
+
+        let saved = Project {
+            tempo: treason_core::time::Bpm::new(90.0).unwrap(),
+            ..Project::default()
+        };
+        let name: ProjectName = "jam".parse().unwrap();
+        config
+            .project_store()
+            .save(&name, &saved, &config.port_names())
+            .unwrap();
+        let start = starting_project(&config, &args(Some("jam")), &devices).unwrap();
+        assert_eq!(start, (saved, Some(name)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

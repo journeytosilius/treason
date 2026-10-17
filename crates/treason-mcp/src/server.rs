@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use treason_control::{ControlError, Edit, Session};
+use treason_control::{ControlError, Edit, ProjectError, ProjectName, ProjectStore, Session};
 use treason_core::midi::Channel;
 use treason_core::model::{Clip, OutputTarget, PortId, Project, Track, TrackId};
 use treason_core::playback::{Playback, TransportCommand};
@@ -13,8 +13,9 @@ use treason_core::time::{Bpm, Ticks, TimeSignature};
 use treason_devices::DeviceProfile;
 
 use crate::dto::{
-    AddTrack, DeviceList, DeviceView, EditTrack, Play, PortList, ProjectView, SetMuted, SetNotes,
-    SetSteps, SetTempo, SetTimeSignature, StatusView, TrackRef, TrackView,
+    AddTrack, DeviceList, DeviceView, EditTrack, LoadProject, Play, PortList, ProjectList,
+    ProjectView, SaveProject, SetMuted, SetNotes, SetSteps, SetTempo, SetTimeSignature, StatusView,
+    TrackRef, TrackView,
 };
 use crate::{notes, pattern};
 
@@ -29,23 +30,45 @@ pub type SharedSession = Arc<Mutex<Session<Box<dyn Playback + Send>>>>;
 pub struct TreasonServer {
     session: SharedSession,
     ports: Arc<[String]>,
+    projects: Arc<ProjectStore>,
     tool_router: ToolRouter<Self>,
 }
 
 impl TreasonServer {
-    /// Serves `session`. `ports` names the output ports, in `PortId` order.
-    pub fn new(session: Session<Box<dyn Playback + Send>>, ports: Vec<String>) -> Self {
+    /// Serves `session`. `ports` names the output ports, in `PortId` order,
+    /// and `projects` is where the project is saved.
+    pub fn new(
+        session: Session<Box<dyn Playback + Send>>,
+        ports: Vec<String>,
+        projects: ProjectStore,
+    ) -> Self {
         Self {
             session: Arc::new(Mutex::new(session)),
             ports: ports.into(),
+            projects: Arc::new(projects),
             tool_router: Self::tool_router(),
         }
     }
 
     fn session(&self) -> MutexGuard<'_, Session<Box<dyn Playback + Send>>> {
-        // An edit swaps in a whole new project, so a panic while the lock was
-        // held can't have left the session half-changed.
-        self.session.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.session)
+    }
+
+    /// Runs `work` with the session, the project store and the port names
+    /// on a thread that may block, since saving and loading wait for the
+    /// disk.
+    async fn on_disk<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Session<Box<dyn Playback + Send>>, &ProjectStore, &[String]) -> T
+        + Send
+        + 'static,
+    ) -> Result<T, String> {
+        let session = Arc::clone(&self.session);
+        let projects = Arc::clone(&self.projects);
+        let ports = Arc::clone(&self.ports);
+        tokio::task::spawn_blocking(move || work(&mut lock(&session), &projects, &ports))
+            .await
+            .map_err(|error| format!("the project store failed: {error}"))
     }
 
     fn apply(&self, edit: Edit) -> Result<(), String> {
@@ -94,6 +117,28 @@ impl TreasonServer {
         u16::try_from(index)
             .map(PortId)
             .map_err(|_| "too many ports".into())
+    }
+}
+
+fn lock(session: &SharedSession) -> MutexGuard<'_, Session<Box<dyn Playback + Send>>> {
+    // An edit swaps in a whole new project, so a panic while the lock was
+    // held can't have left the session half-changed.
+    session.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A failed save or load, worded so the agent can fix the call.
+fn describe_project(error: ProjectError) -> String {
+    match error {
+        ProjectError::Unnamed => "the project has no name yet; give save_project a name".into(),
+        ProjectError::Exists(name) => format!(
+            "there is already a project `{name}`; choose another name, or pass overwrite: true \
+             to replace it"
+        ),
+        ProjectError::NotFound(name) => format!("there is no project `{name}`; see list_projects"),
+        ProjectError::UnsavedChanges => "the project has unsaved changes, which loading would \
+            lose; save them first with save_project, or pass discard_changes: true to load anyway"
+            .into(),
+        other => other.to_string(),
     }
 }
 
@@ -156,11 +201,81 @@ impl TreasonServer {
         })
     }
 
-    /// Shows whether the sequencer is playing, where, and how fast.
+    /// Shows whether the sequencer is playing, where, and how fast, and the
+    /// project's name and whether it has unsaved changes.
     #[tool(annotations(read_only_hint = true))]
     fn status(&self) -> Json<StatusView> {
         let session = self.session();
-        Json(StatusView::new(session.status(), session.project()))
+        Json(StatusView::new(
+            session.status(),
+            session.project(),
+            session.name().map(ProjectName::as_str),
+            session.has_unsaved_changes(),
+        ))
+    }
+
+    /// Lists the saved projects, newest first, for load_project.
+    #[tool(annotations(read_only_hint = true))]
+    async fn list_projects(&self) -> Result<Json<ProjectList>, String> {
+        let projects = Arc::clone(&self.projects);
+        let list = tokio::task::spawn_blocking(move || projects.list())
+            .await
+            .map_err(|error| format!("the project store failed: {error}"))?
+            .map_err(describe_project)?;
+        Ok(Json(ProjectList {
+            projects: list.names.iter().map(ToString::to_string).collect(),
+            more: list.more,
+        }))
+    }
+
+    /// Saves the project under a name, so that load_project can bring it
+    /// back, even after treason restarts. It keeps everything: the tempo,
+    /// the time signature, and every track with its clip, port, channel,
+    /// device and mute. Without a name, saves under the project's own name,
+    /// the one it was last saved as or loaded from. Saving over a different
+    /// saved project needs overwrite: true.
+    #[tool]
+    async fn save_project(
+        &self,
+        Parameters(SaveProject { name, overwrite }): Parameters<SaveProject>,
+    ) -> Result<String, String> {
+        let name = name
+            .map(ProjectName::new)
+            .transpose()
+            .map_err(describe_project)?;
+        let saved = self
+            .on_disk(move |session, projects, ports| session.save(projects, ports, name, overwrite))
+            .await?
+            .map_err(describe_project)?;
+        Ok(format!("Saved the project as `{saved}`."))
+    }
+
+    /// Loads a project saved with save_project. It replaces the current
+    /// project and its undo history, so it refuses while the current
+    /// project has unsaved changes, unless discard_changes is true. While
+    /// playing, the loaded project takes over like an edit: its tempo at
+    /// once, its tracks at the next bar. Returns the project, as get_project
+    /// shows it.
+    #[tool]
+    async fn load_project(
+        &self,
+        Parameters(LoadProject {
+            name,
+            discard_changes,
+        }): Parameters<LoadProject>,
+    ) -> Result<Json<ProjectView>, String> {
+        let name = ProjectName::new(name).map_err(describe_project)?;
+        self.on_disk(move |session, projects, ports| {
+            session
+                .load(projects, ports, name, discard_changes)
+                .map_err(describe_project)?;
+            Ok(Json(ProjectView::new(
+                session.project(),
+                ports,
+                session.devices(),
+            )))
+        })
+        .await?
     }
 
     /// Sets the tempo. It changes at once, even while playing.
@@ -403,14 +518,15 @@ it makes no sound itself. A project has a tempo, a time signature and tracks. Ea
 its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
 Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
 set_notes for melodic parts, then play. Edits apply while playing: tempo at once, everything \
-else at the next bar. undo reverts an edit."
+else at the next bar. undo reverts an edit. save_project keeps the work under a name, and \
+load_project brings it back; status says whether there are unsaved changes."
 )]
 impl ServerHandler for TreasonServer {}
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use treason_core::midi::U7;
     use treason_core::model::Project;
@@ -435,12 +551,40 @@ mod tests {
         }
     }
 
-    fn server() -> TreasonServer {
+    /// A directory for one test, removed when the test ends.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(test: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("treason-mcp-{}-{test}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A server that saves projects in `dir`.
+    fn server_in(dir: &Path) -> TreasonServer {
         let devices_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices");
         let devices = DeviceRegistry::load_dir(&devices_dir).unwrap();
         let playback: Box<dyn Playback + Send> = Box::new(Silent);
         let session = Session::new(Arc::new(Project::default()), devices, playback);
-        TreasonServer::new(session, vec!["out".into(), "synth".into()])
+        TreasonServer::new(
+            session,
+            vec!["out".into(), "synth".into()],
+            ProjectStore::new(dir),
+        )
+    }
+
+    /// A server for tests that don't save.
+    fn server() -> TreasonServer {
+        server_in(&std::env::temp_dir().join("treason-mcp-unsaved"))
     }
 
     #[test]
@@ -456,10 +600,13 @@ mod tests {
                 "get_project",
                 "list_devices",
                 "list_ports",
+                "list_projects",
+                "load_project",
                 "panic",
                 "play",
                 "redo",
                 "remove_track",
+                "save_project",
                 "set_muted",
                 "set_notes",
                 "set_steps",
@@ -731,7 +878,8 @@ mod tests {
             devices.insert(device);
             let playback: Box<dyn Playback + Send> = Box::new(Silent);
             let session = Session::new(Arc::new(Project::default()), devices, playback);
-            let server = TreasonServer::new(session, vec!["out".into()]);
+            let projects = ProjectStore::new(std::env::temp_dir().join("treason-mcp-unsaved"));
+            let server = TreasonServer::new(session, vec!["out".into()], projects);
             let track = add(&server, Some("pitched"));
             let mut request = notes(
                 track,
@@ -889,5 +1037,128 @@ mod tests {
             assert!(error.contains(expected), "expected {expected:?}: {error}");
         }
         assert_eq!(server.get_project().0.tracks[0].name, "drums");
+    }
+
+    fn save(name: Option<&str>, overwrite: bool) -> Parameters<SaveProject> {
+        Parameters(SaveProject {
+            name: name.map(str::to_owned),
+            overwrite,
+        })
+    }
+
+    fn load(name: &str, discard_changes: bool) -> Parameters<LoadProject> {
+        Parameters(LoadProject {
+            name: name.to_owned(),
+            discard_changes,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_saved_project_loads_back_as_it_was() {
+        let dir = TestDir::new("save-load");
+        let server = server_in(&dir.0);
+        let drums = add(&server, Some("gm-drums"));
+        server
+            .set_steps(steps(
+                drums,
+                &[("kick", "x...x...x...x..."), ("snare", "....X...")],
+            ))
+            .unwrap();
+        let request = AddTrack {
+            name: "bass".into(),
+            port: Some("synth".into()),
+            device: None,
+            channel: Some(2),
+        };
+        let bass = server.add_track(Parameters(request)).unwrap().0.id;
+        server
+            .set_notes(notes(
+                bass,
+                &[("C2", 0.0, 0.75), ("Eb2", 1.5, 0.5), ("G1", 3.25, 0.5)],
+            ))
+            .unwrap();
+        server
+            .set_muted(Parameters(SetMuted {
+                track: bass,
+                muted: true,
+            }))
+            .unwrap();
+        server
+            .set_tempo(Parameters(SetTempo { bpm: 124.5 }))
+            .unwrap();
+        let status = server.status().0;
+        assert_eq!((status.project, status.unsaved_changes), (None, true));
+
+        let saved = server
+            .save_project(save(Some("acid jam"), false))
+            .await
+            .unwrap();
+        assert_eq!(saved, "Saved the project as `acid jam`.");
+        let status = server.status().0;
+        assert_eq!(
+            (status.project.as_deref(), status.unsaved_changes),
+            (Some("acid jam"), false)
+        );
+        let Json(project) = server.get_project();
+
+        server
+            .remove_track(Parameters(TrackRef { track: drums }))
+            .unwrap();
+        let error = rejected(server.load_project(load("acid jam", false)).await);
+        assert!(
+            error.contains("save_project") && error.contains("discard_changes: true"),
+            "{error}"
+        );
+        let Json(loaded) = server.load_project(load("acid jam", true)).await.unwrap();
+        assert_eq!(loaded, project);
+        assert_eq!(server.get_project().0, project);
+        assert!(!server.status().0.unsaved_changes);
+        assert_eq!(server.undo(), "Nothing to undo.");
+
+        let Json(list) = server.list_projects().await.unwrap();
+        assert_eq!((list.projects, list.more), (vec!["acid jam".to_owned()], 0));
+    }
+
+    #[tokio::test]
+    async fn saving_and_loading_say_how_to_fix_the_call() {
+        let dir = TestDir::new("save-load-errors");
+        let server = server_in(&dir.0);
+        add(&server, None);
+        let cases = [
+            (
+                server.save_project(save(None, false)).await,
+                "give save_project a name",
+            ),
+            (
+                server.save_project(save(Some("a/b"), false)).await,
+                "letters, digits",
+            ),
+        ];
+        for (result, expected) in cases {
+            let error = rejected(result);
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        let error = rejected(server.load_project(load("nothing", true)).await);
+        assert!(error.contains("see list_projects"), "{error}");
+        let error = rejected(server.load_project(load("../escape", true)).await);
+        assert!(error.contains("letters, digits"), "{error}");
+
+        server
+            .save_project(save(Some("first"), false))
+            .await
+            .unwrap();
+        server
+            .save_project(save(Some("second"), false))
+            .await
+            .unwrap();
+        let error = rejected(server.save_project(save(Some("first"), false)).await);
+        assert!(error.contains("overwrite: true"), "{error}");
+        server
+            .save_project(save(Some("first"), true))
+            .await
+            .unwrap();
+        assert_eq!(server.status().0.project.as_deref(), Some("first"));
+        // Saving under the project's own name needs nothing more.
+        server.save_project(save(None, false)).await.unwrap();
     }
 }

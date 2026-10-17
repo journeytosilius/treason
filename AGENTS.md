@@ -35,7 +35,7 @@ read it before you change code.
   - real-time playback: engine
   - MIDI backends: io, behind a Cargo feature if they link a system
     library
-  - edits, undo and publishing: control
+  - edits, undo, publishing and saved projects: control
   - the agent's tools, their inputs and outputs, notations: mcp
   - CLI, configuration and wiring: the binary
 - Add a trait for a second implementation or a test fake, not in case one
@@ -61,7 +61,7 @@ floating-point time.
 ## Types and boundaries
 
 - Use typed structs and enums at every boundary: MCP, configuration,
-  device files, MIDI files. No `serde_json::Value`. A map is fine where
+  device files, project files, MIDI files. No `serde_json::Value`. A map is fine where
   its keys are open-ended names, such as the voices in `set_steps`.
 - The agent's inputs and outputs live in `treason-mcp`'s `dto` module and
   convert explicitly to core types. Inputs reject unknown fields with

@@ -226,7 +226,7 @@ pub struct PortList {
     pub ports: Vec<String>,
 }
 
-/// Where playback is.
+/// Where playback is, and whether the project is saved.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 pub struct StatusView {
     /// Whether the sequencer is playing.
@@ -237,11 +237,24 @@ pub struct StatusView {
     pub beat: u64,
     /// Beats per minute.
     pub tempo: f64,
+    /// The name the project was last saved as or loaded from, which
+    /// save_project uses when given no name. Missing until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Whether the project has changed since it was last saved or loaded.
+    pub unsaved_changes: bool,
 }
 
 impl StatusView {
-    /// Describes `status` in `project`'s bars and beats.
-    pub fn new(status: PlaybackStatus, project: &Project) -> Self {
+    /// Describes `status` in `project`'s bars and beats. `name` is what the
+    /// project was last saved as or loaded from, and `unsaved_changes` says
+    /// whether it has changed since.
+    pub fn new(
+        status: PlaybackStatus,
+        project: &Project,
+        name: Option<&str>,
+        unsaved_changes: bool,
+    ) -> Self {
         let bar = project.time_signature.bar_length().0;
         let beat = PPQN * 4 / u64::from(project.time_signature.denominator());
         let position = status.position.0;
@@ -250,8 +263,19 @@ impl StatusView {
             bar: position / bar + 1,
             beat: position % bar / beat + 1,
             tempo: project.tempo.get(),
+            project: name.map(str::to_owned),
+            unsaved_changes,
         }
     }
+}
+
+/// The saved projects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ProjectList {
+    /// Project names for load_project, newest first.
+    pub projects: Vec<String>,
+    /// How many older projects there are beyond the list.
+    pub more: usize,
 }
 
 /// Input for set_tempo.
@@ -394,6 +418,33 @@ pub struct Play {
     pub from_bar: Option<u32>,
 }
 
+/// Input for save_project.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SaveProject {
+    /// The name to save under, such as "acid jam" or "dub-techno_2": up to
+    /// 64 letters, digits, spaces, dashes and underscores, beginning with a
+    /// letter or digit. Defaults to the project's own name, which status
+    /// shows.
+    pub name: Option<String>,
+    /// Replace the saved project of that name. Not needed to save again
+    /// under the project's own name.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// Input for load_project.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoadProject {
+    /// The saved project's name, from list_projects.
+    pub name: String,
+    /// Load even if the current project has unsaved changes, which are
+    /// then lost.
+    #[serde(default)]
+    pub discard_changes: bool,
+}
+
 /// The name of a port, falling back to its number.
 fn port_name(ports: &[String], port: PortId) -> String {
     ports
@@ -423,8 +474,12 @@ mod tests {
             // Bar 3 (two 7/8 bars are 6720 ticks), plus five eighth notes.
             position: Ticks(6720 + 5 * 480),
         };
-        let view = StatusView::new(status, &project);
+        let view = StatusView::new(status, &project, Some("jam"), true);
         assert_eq!((view.bar, view.beat), (3, 6));
         assert!(view.playing);
+        assert_eq!(
+            (view.project.as_deref(), view.unsaved_changes),
+            (Some("jam"), true)
+        );
     }
 }

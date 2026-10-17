@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::ops::{Add, Sub};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -174,6 +175,20 @@ impl fmt::Display for TimeSignature {
     }
 }
 
+impl FromStr for TimeSignature {
+    type Err = ParseTimeSignatureError;
+
+    /// Reads a time signature as [`Display`](fmt::Display) writes it, such as
+    /// "7/8".
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let error = || ParseTimeSignatureError(text.to_owned());
+        let (numerator, denominator) = text.split_once('/').ok_or_else(error)?;
+        let numerator = numerator.parse().map_err(|_| error())?;
+        let denominator = denominator.parse().map_err(|_| error())?;
+        Self::new(numerator, denominator).ok_or_else(error)
+    }
+}
+
 #[derive(Deserialize)]
 struct RawTimeSignature {
     numerator: u8,
@@ -190,6 +205,14 @@ impl TryFrom<RawTimeSignature> for TimeSignature {
         })
     }
 }
+
+/// Text that isn't a time signature [`TimeSignature::new`] accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "`{0}` is not a time signature such as 4/4 or 7/8: beats per bar must be 1-32 and the \
+     beat 1, 2, 4, 8, 16 or 32"
+)]
+pub struct ParseTimeSignatureError(pub String);
 
 /// A time signature [`TimeSignature::new`] rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -217,6 +240,24 @@ mod tests {
         assert_eq!(TimeSignature::COMMON.bar_length(), Ticks::quarters(4));
         assert_eq!(TimeSignature::new(7, 8).unwrap().bar_length(), Ticks(3360));
         assert_eq!(TimeSignature::new(4, 3), None);
+    }
+
+    #[test]
+    fn time_signatures_read_back_what_they_write() {
+        for time_signature in [TimeSignature::COMMON, TimeSignature::new(7, 8).unwrap()] {
+            let text = time_signature.to_string();
+            assert_eq!(text.parse(), Ok(time_signature));
+        }
+        assert_eq!("32/32".parse(), Ok(TimeSignature::new(32, 32).unwrap()));
+        for text in [
+            "", "4", "4/", "/4", "4/3", "0/4", "33/4", "4/4/4", " 4/4", "4 / 4", "-4/4",
+        ] {
+            assert_eq!(
+                text.parse::<TimeSignature>(),
+                Err(ParseTimeSignatureError(text.to_owned())),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
