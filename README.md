@@ -6,16 +6,17 @@ sequencer's tools. treason plays it as MIDI to external gear: drum machines,
 synths and other sequencers. It makes no sound itself.
 
 Status: early. `treason serve` plays what an agent writes on the MIDI ports
-in `treason.toml`: drum parts as step patterns, and melodic parts as notes
-with pitch names such as `C4`. Ports with `clock = true` get MIDI clock and
-Start, Stop and Continue, so their gear plays along. A port's `latency_ms`
-makes up for its gear's delay, so everything sounds together. On Linux,
-`backend = "alsa-seq"` hands messages to the kernel's sequencer ahead of
-time, which keeps the timing within a millisecond even when the computer is
-busy. An agent saves the project by name and loads it back later, with
-everything it holds, and exports it as a MIDI file that opens in a DAW. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the design and for what's still a
-stub.
+in `treason.toml`: drum parts as step patterns, melodic parts as notes with
+pitch names such as `C4`, and controls such as a synth's mod wheel or
+filter cutoff as values that jump or ramp. Ports with `clock = true` get
+MIDI clock and Start, Stop and Continue, so their gear plays along. A
+port's `latency_ms` makes up for its gear's delay, so everything sounds
+together. On Linux, `backend = "alsa-seq"` hands messages to the kernel's
+sequencer ahead of time, which keeps the timing within a millisecond even
+when the computer is busy. An agent saves the project by name and loads it
+back later, with everything it holds, and exports it as a MIDI file that
+opens in a DAW. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
+for what's still a stub.
 
 ## Requirements
 
@@ -59,6 +60,12 @@ before you stop: `save_project` writes it to `projects/<name>.toml`, and
 `load_project` or `serve --project` brings it back with its tempo, time
 signature and tracks, each with its clip, port, channel, device and mute.
 `status` says whether there are unsaved changes.
+
+A track can also move its gear's controls (MIDI CC) with `set_controls`,
+alongside its notes or on its own, such as modulation for a synth that
+plays its own notes. The agent names a control by the device's parameter,
+by a standard name such as `modulation`, `volume` or `cutoff`, or by its
+number, and gives it points that jump or ramp, smoothly enough for an LFO.
 
 `export_midi` writes the project as a MIDI file, `exports/<name>.mid`, with
 the tempo, the time signature and a track for each unmuted track, and

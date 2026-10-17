@@ -7,7 +7,7 @@ name = "General MIDI drums"
 manufacturer = "Generic"
 default_channel = 10
 
-# Names need a letter: tools read a bare number as a MIDI note.
+# Names need a letter: tools read a bare number as a MIDI note or controller.
 [voices]
 acoustic_kick = 35
 kick = 36
@@ -74,6 +74,8 @@ cy = "crash"
 rd = "ride"
 cb = "cowbell"
 
+# Parameters name controllers (CC). On this device's tracks they come first,
+# and the standard names, such as modulation (1) or cutoff (74), work too.
 [params]
 volume = { cc = 7 }
 pan = { cc = 10 }

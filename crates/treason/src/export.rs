@@ -180,6 +180,10 @@ mod tests {
                                 channel,
                                 message: MidiMessage::NoteOff { key, .. },
                             } => format!("off {key} ch{}", channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::Controller { controller, value },
+                            } => format!("cc{controller} {value} ch{}", channel.as_int() + 1),
                             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                                 format!("name {}", String::from_utf8_lossy(name))
                             }
@@ -237,6 +241,36 @@ mod tests {
                 "4800 off 60 ch1",
                 "6720 on 60 ch1",
                 "7680 off 60 ch1",
+                "7680 end",
+            ]
+        );
+    }
+
+    #[test]
+    fn tracks_of_controls_alone_export_their_control_changes() {
+        let control = |start, value| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Control {
+                controller: U7::new(1).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        };
+        let mut modulation = track(1, "modulation", 3, 3840, &[]);
+        modulation.clip = Clip::new(Ticks(3840), vec![control(0, 0), control(1920, 127)]).unwrap();
+        let project = Project {
+            tracks: vec![Arc::new(modulation)],
+            ..Project::default()
+        };
+        assert_eq!(export::bars(&project, None), Ok(1));
+        let file = SmfExport.export(&project, "wheel", 2).unwrap();
+        assert_eq!(
+            tracks(&file)[1],
+            [
+                "0 name modulation",
+                "0 cc1 0 ch3",
+                "1920 cc1 127 ch3",
+                "3840 cc1 0 ch3",
+                "5760 cc1 127 ch3",
                 "7680 end",
             ]
         );

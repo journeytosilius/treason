@@ -17,10 +17,10 @@ use treason_devices::DeviceProfile;
 
 use crate::dto::{
     AddTrack, DeviceList, DeviceView, EditTrack, ExportMidi, LoadProject, Play, PortList,
-    ProjectList, ProjectView, SaveProject, SetMuted, SetNotes, SetSteps, SetTempo,
+    ProjectList, ProjectView, SaveProject, SetControls, SetMuted, SetNotes, SetSteps, SetTempo,
     SetTimeSignature, StatusView, TrackRef, TrackView,
 };
-use crate::{notes, pattern};
+use crate::{controls, notes, pattern};
 
 /// The session behind the server: one project, shared by every agent.
 pub type SharedSession = Arc<Mutex<Session<Box<dyn Playback + Send>>>>;
@@ -89,12 +89,13 @@ impl TreasonServer {
         self.session().command(command).map_err(describe)
     }
 
-    /// Replaces a track's clip with the one `clip` makes from the track's
-    /// device and the project, and describes the track as it will play.
+    /// Replaces a track's clip with the one `clip` makes from the clip it
+    /// has, the track's device and the project, and describes the track as
+    /// it will play.
     fn replace_clip(
         &self,
         track: u32,
-        clip: impl FnOnce(Option<&DeviceProfile>, &Project) -> Result<Clip, String>,
+        clip: impl FnOnce(&Clip, Option<&DeviceProfile>, &Project) -> Result<Clip, String>,
     ) -> Result<Json<TrackView>, String> {
         let mut session = self.session();
         let mut track = find_track(&session, track)?;
@@ -102,7 +103,7 @@ impl TreasonServer {
             .device
             .as_deref()
             .and_then(|id| session.devices().get(id));
-        track.clip = clip(device, session.project())?;
+        track.clip = clip(&track.clip, device, session.project())?;
         let view = TrackView::new(&track, &self.ports, session.devices());
         session
             .apply(Edit::SetClip {
@@ -203,7 +204,7 @@ fn parse_channel(number: u8) -> Result<Channel, String> {
 impl TreasonServer {
     /// Shows the project: tempo, time signature and every track, with each
     /// clip as step strings or notes, in the form set_steps or set_notes
-    /// takes.
+    /// takes, and its controls in the form set_controls takes.
     #[tool(annotations(read_only_hint = true))]
     fn get_project(&self) -> Json<ProjectView> {
         let session = self.session();
@@ -215,7 +216,8 @@ impl TreasonServer {
     }
 
     /// Lists the device profiles. A track with a device names its notes by
-    /// voice, such as "kick" or "closed_hat".
+    /// voice, such as "kick" or "closed_hat", and its controls by parameter,
+    /// such as "cutoff".
     #[tool(annotations(read_only_hint = true))]
     fn list_devices(&self) -> Json<DeviceList> {
         let devices = self
@@ -510,38 +512,68 @@ impl TreasonServer {
         Ok(format!("Track {track} is {state}."))
     }
 
-    /// Replaces a track's clip with a step pattern: one step string per
-    /// voice, the usual way to write drums. While playing, the new pattern
-    /// starts at the next bar. Returns the track with its pattern as it will
-    /// play.
+    /// Replaces a track's notes with a step pattern: one step string per
+    /// voice, the usual way to write drums. The track's controls stay where
+    /// they are, cut off by a shorter loop; to fill a longer one, set them
+    /// again with set_controls. While playing, the new pattern starts at the
+    /// next bar. Returns the track with its pattern as it will play.
     #[tool]
     fn set_steps(
         &self,
         Parameters(request): Parameters<SetSteps>,
     ) -> Result<Json<TrackView>, String> {
-        self.replace_clip(request.track, |device, _| {
-            pattern::clip_from_steps(&request.steps, request.steps_per_beat, device)
-                .map_err(|error| error.to_string())
+        self.replace_clip(request.track, |clip, device, _| {
+            let notes = pattern::clip_from_steps(&request.steps, request.steps_per_beat, device)
+                .map_err(|error| error.to_string())?;
+            controls::keep_controls(clip, notes).map_err(|error| error.to_string())
         })
     }
 
-    /// Replaces a track's clip with notes, for basslines, chords and
-    /// melodies. Name each note by pitch, such as "C4" (middle C), "F#2" or
-    /// "Bb3", by MIDI note number, or by a voice of the track's device, and
-    /// time it in beats from the start of the loop. For example, a bass
-    /// figure: {"track": 2, "notes": [{"note": "C2", "start": 0, "length":
-    /// 0.5}, {"note": "Eb2", "start": 1.5, "length": 0.5}]}. While playing,
-    /// the new clip starts at the next bar. Returns the track as it will
-    /// play: as step strings if the notes fit a step grid, otherwise as
-    /// notes.
+    /// Replaces a track's notes, for basslines, chords and melodies. Name
+    /// each note by pitch, such as "C4" (middle C), "F#2" or "Bb3", by MIDI
+    /// note number, or by a voice of the track's device, and time it in
+    /// beats from the start of the loop. For example, a bass figure:
+    /// {"track": 2, "notes": [{"note": "C2", "start": 0, "length": 0.5},
+    /// {"note": "Eb2", "start": 1.5, "length": 0.5}]}. The track's controls
+    /// stay where they are, cut off by a shorter loop; to fill a longer one,
+    /// set them again with set_controls. While playing, the new clip starts
+    /// at the next bar. Returns the track as it will play: as step strings
+    /// if the notes fit a step grid, otherwise as notes.
     #[tool]
     fn set_notes(
         &self,
         Parameters(request): Parameters<SetNotes>,
     ) -> Result<Json<TrackView>, String> {
-        self.replace_clip(request.track, |device, project| {
+        self.replace_clip(request.track, |clip, device, project| {
             let bar = project.time_signature.bar_length();
-            notes::clip_from_notes(&request.notes, request.loop_beats, bar, device)
+            let notes = notes::clip_from_notes(&request.notes, request.loop_beats, bar, device)
+                .map_err(|error| error.to_string())?;
+            controls::keep_controls(clip, notes).map_err(|error| error.to_string())
+        })
+    }
+
+    /// Sets how a track moves its synth's controls, such as the mod wheel or
+    /// a filter's cutoff, by sending MIDI control changes (CC) through the
+    /// loop. A track can send controls alone, with no notes: modulation for
+    /// a synth that plays its own notes, for example. Each control is a
+    /// list of points, values at times in beats, that it jumps to or ramps
+    /// to from the point before. A two-bar mod-wheel swell: {"track": 3,
+    /// "controls": {"modulation": {"points": [{"at": 0, "value": 0}, {"at":
+    /// 8, "value": 127, "ramp": "linear"}]}}}. A sine-wave LFO on the
+    /// cutoff, once a beat: {"track": 3, "controls": {"cutoff": {"points":
+    /// [{"at": 0, "value": 32}, {"at": 0.5, "value": 96, "ramp": "smooth"},
+    /// {"at": 1, "value": 32, "ramp": "smooth"}], "repeat_beats": 1}}}. The
+    /// track's notes stay, and so do the controls the call leaves out; a
+    /// control with no points is removed. While playing, the change takes
+    /// effect at the next bar. Returns the track as it will play.
+    #[tool]
+    fn set_controls(
+        &self,
+        Parameters(request): Parameters<SetControls>,
+    ) -> Result<Json<TrackView>, String> {
+        self.replace_clip(request.track, |clip, device, project| {
+            let bar = project.time_signature.bar_length();
+            controls::clip_with_controls(clip, &request.controls, request.loop_beats, bar, device)
                 .map_err(|error| error.to_string())
         })
     }
@@ -611,10 +643,10 @@ impl TreasonServer {
 it makes no sound itself. A project has a tempo, a time signature and tracks. Each track loops \
 its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
 Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
-set_notes for melodic parts, then play. Edits apply while playing: tempo at once, everything \
-else at the next bar. undo reverts an edit. save_project keeps the work under a name, and \
-load_project brings it back; status says whether there are unsaved changes. export_midi writes \
-a MIDI file that a DAW can open."
+set_notes for melodic parts, set_controls for modulation and other controls (MIDI CC), then \
+play. Edits apply while playing: tempo at once, everything else at the next bar. undo reverts \
+an edit. save_project keeps the work under a name, and load_project brings it back; status \
+says whether there are unsaved changes. export_midi writes a MIDI file that a DAW can open."
 )]
 impl ServerHandler for TreasonServer {}
 
@@ -629,7 +661,7 @@ mod tests {
     use treason_devices::DeviceRegistry;
 
     use super::*;
-    use crate::dto::{NoteRef, NoteSpec};
+    use crate::dto::{NoteRef, NoteSpec, Ramp};
 
     /// Accepts everything and plays nothing.
     struct Silent;
@@ -724,6 +756,7 @@ mod tests {
                 "redo",
                 "remove_track",
                 "save_project",
+                "set_controls",
                 "set_muted",
                 "set_notes",
                 "set_steps",
@@ -1082,6 +1115,164 @@ mod tests {
             0,
             "nothing changed"
         );
+    }
+
+    fn set_controls(
+        track: u32,
+        controls: &str,
+        loop_beats: Option<f64>,
+    ) -> Parameters<SetControls> {
+        Parameters(SetControls {
+            track,
+            controls: serde_json::from_str(controls).unwrap(),
+            loop_beats,
+        })
+    }
+
+    #[test]
+    fn a_track_can_send_controls_alone() {
+        let server = server();
+        let track = add(&server, None);
+        // The tool's own examples: a two-bar swell, then a sine-wave LFO.
+        let swell = r#"{"modulation": {"points": [{"at": 0, "value": 0},
+            {"at": 8, "value": 127, "ramp": "linear"}]}}"#;
+        let Json(view) = server
+            .set_controls(set_controls(track, swell, None))
+            .unwrap();
+        assert_eq!(view.loop_beats, 8.0);
+        assert!(view.pattern.is_none() && view.notes.is_none());
+        let controls = view.controls.as_ref().expect("controls read back");
+        let points: Vec<_> = controls["modulation"]
+            .points
+            .iter()
+            .map(|point| (point.at, point.value, point.ramp))
+            .collect();
+        assert_eq!(points, [(0.0, 0, None), (8.0, 127, Some(Ramp::Linear))]);
+        assert_eq!(view.events, 128, "a change for each value of the swell");
+        assert_eq!(server.get_project().0.tracks, [view]);
+
+        let lfo = r#"{"cutoff": {"points": [{"at": 0, "value": 32},
+            {"at": 0.5, "value": 96, "ramp": "smooth"},
+            {"at": 1, "value": 32, "ramp": "smooth"}], "repeat_beats": 1}}"#;
+        let Json(view) = server.set_controls(set_controls(track, lfo, None)).unwrap();
+        // The swell's loop stays, and the LFO cycles through it.
+        assert_eq!(view.loop_beats, 8.0);
+        let controls = view.controls.unwrap();
+        assert_eq!(controls.len(), 2);
+        assert_eq!(controls["cutoff"].points.len(), 17);
+
+        server.undo();
+        server.undo();
+        let empty = &server.get_project().0.tracks[0];
+        assert_eq!((empty.events, empty.controls.is_none()), (0, true));
+    }
+
+    #[test]
+    fn controls_read_back_in_the_form_set_controls_takes() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        server
+            .set_steps(steps(track, &[("kick", "x...x...x...x...")]))
+            .unwrap();
+        let wobble = r#"{"volume": {"points": [{"at": 0, "value": 100},
+            {"at": 0.75, "value": 40, "ramp": "smooth"}, {"at": 1, "value": 80},
+            {"at": 2, "value": 100, "ramp": "linear"}], "repeat_beats": 2},
+            "1": {"points": [{"at": 0.5, "value": 3}]}}"#;
+        server
+            .set_controls(set_controls(track, wobble, None))
+            .unwrap();
+        let original = server.session().project().tracks[0].clip.clone();
+        let view = server.get_project().0.tracks.remove(0);
+        let controls = view.controls.as_ref().expect("controls read back");
+        // Named by the kit's parameter, then the standard name.
+        assert_eq!(
+            controls.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["modulation", "volume"]
+        );
+        let written = serde_json::to_string(controls).unwrap();
+        let Json(rewritten) = server
+            .set_controls(set_controls(track, &written, Some(view.loop_beats)))
+            .unwrap();
+        assert_eq!(server.session().project().tracks[0].clip, original);
+        assert_eq!(rewritten, view);
+        assert_eq!(view.pattern.unwrap().steps["kick"], "x... x... x... x...");
+    }
+
+    #[test]
+    fn writing_notes_or_steps_keeps_the_controls() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        let pan = r#"{"pan": {"points": [{"at": 0, "value": 0}, {"at": 3, "value": 127}]}}"#;
+        server.set_controls(set_controls(track, pan, None)).unwrap();
+        let pans = |view: &TrackView| {
+            view.controls
+                .as_ref()
+                .map_or(0, |controls| controls["pan"].points.len())
+        };
+        let Json(view) = server
+            .set_steps(steps(track, &[("kick", "x...x...x...x...")]))
+            .unwrap();
+        assert_eq!((pans(&view), view.events), (2, 6));
+        // Two beats of notes cut off the change at beat 3.
+        let mut melody = notes(track, &[("C2", 0.0, 1.0)]);
+        melody.0.loop_beats = Some(2.0);
+        let Json(view) = server.set_notes(melody).unwrap();
+        assert_eq!((pans(&view), view.events), (1, 2));
+    }
+
+    #[test]
+    fn bad_controls_say_how_to_fix_them() {
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        server.set_steps(steps(track, &[("kick", "x...")])).unwrap();
+        let point = r#"{"points": [{"at": 0, "value": 64}]}"#;
+        let cases = [
+            (
+                99,
+                format!(r#"{{"pan": {point}}}"#),
+                None,
+                "see get_project",
+            ),
+            (
+                track,
+                format!(r#"{{"wobble": {point}}}"#),
+                None,
+                "not a parameter of gm-drums (chorus, pan, reverb, volume)",
+            ),
+            (
+                track,
+                format!(r#"{{"pan": {point}}}"#),
+                Some(8.0),
+                "leave out loop_beats, or change the loop with set_notes or set_steps",
+            ),
+            (track, "{}".to_owned(), None, "give at least one control"),
+        ];
+        for (track, controls, loop_beats, expected) in cases {
+            let error = rejected(server.set_controls(set_controls(track, &controls, loop_beats)));
+            assert!(error.contains(expected), "expected {expected:?}: {error}");
+        }
+        assert_eq!(
+            server.get_project().0.tracks[0].events,
+            1,
+            "nothing changed"
+        );
+    }
+
+    #[test]
+    fn the_schema_lists_every_standard_control_name() {
+        let schema = serde_json::to_value(schemars::schema_for!(SetControls)).unwrap();
+        let description = schema["properties"]["controls"]["description"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (name, number) in treason_devices::controllers::STANDARD {
+            assert!(
+                description.contains(&format!("{name} ({number}")),
+                "{name} ({number}) is missing: {description}"
+            );
+        }
     }
 
     #[test]

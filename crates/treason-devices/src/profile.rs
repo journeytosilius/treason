@@ -49,17 +49,21 @@ pub enum ProfileError {
     /// A name is both a voice and an alias.
     #[error("`{0}` is both a voice and an alias")]
     AliasShadowsVoice(String),
-    /// A voice or alias named with digits alone.
-    #[error("`{0}` is a number, which tools read as a MIDI note: give it a name with a letter")]
+    /// A voice, alias or parameter named with digits alone.
+    #[error(
+        "`{0}` is a number, which tools read as a MIDI note or controller: give it a name with a letter"
+    )]
     NumericName(String),
 }
 
 impl DeviceProfile {
     /// Checks that every alias points to a voice, that no alias hides one,
-    /// and that no name is a number, since tools read numbers as MIDI notes.
+    /// and that no name is a number, since tools read numbers as MIDI notes
+    /// and controllers.
     pub fn validate(&self) -> Result<(), ProfileError> {
         let numeric = |name: &&String| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
-        if let Some(name) = self.voices.keys().chain(self.aliases.keys()).find(numeric) {
+        let names = self.voices.keys().chain(self.aliases.keys());
+        if let Some(name) = names.chain(self.params.keys()).find(numeric) {
             return Err(ProfileError::NumericName(name.clone()));
         }
         for (alias, voice) in &self.aliases {
@@ -93,6 +97,14 @@ impl DeviceProfile {
     pub fn param(&self, name: &str) -> Option<Param> {
         self.params.get(name).copied()
     }
+
+    /// The parameter name for a controller, to describe controls back to
+    /// the agent.
+    pub fn param_name(&self, controller: U7) -> Option<&str> {
+        self.params
+            .iter()
+            .find_map(|(name, param)| (param.cc == controller).then_some(name.as_str()))
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +134,11 @@ mod tests {
 
     #[test]
     fn rejects_names_that_are_numbers() {
-        for (extra, name) in [("16 = 40", "16"), ("[aliases]\n1 = \"kick\"", "1")] {
+        for (extra, name) in [
+            ("16 = 40", "16"),
+            ("[aliases]\n1 = \"kick\"", "1"),
+            ("[params]\n74 = { cc = 74 }", "74"),
+        ] {
             let profile: DeviceProfile = toml::from_str(&format!("{MINIMAL}\n{extra}")).unwrap();
             assert_eq!(
                 profile.validate(),
@@ -131,6 +147,19 @@ mod tests {
         }
         let named: DeviceProfile = toml::from_str(&format!("{MINIMAL}\nkick2 = 40")).unwrap();
         assert_eq!(named.validate(), Ok(()));
+    }
+
+    #[test]
+    fn parameters_are_found_by_name_and_by_controller() {
+        let profile: DeviceProfile = toml::from_str(&format!(
+            "{MINIMAL}\n[params]\nfilter = {{ cc = 74 }}\nwheel = {{ cc = 1 }}"
+        ))
+        .unwrap();
+        let cutoff = U7::new(74).unwrap();
+        assert_eq!(profile.param("filter"), Some(Param { cc: cutoff }));
+        assert_eq!(profile.param_name(cutoff), Some("filter"));
+        assert_eq!(profile.param_name(U7::new(1).unwrap()), Some("wheel"));
+        assert_eq!(profile.param_name(U7::new(7).unwrap()), None);
     }
 
     #[test]
