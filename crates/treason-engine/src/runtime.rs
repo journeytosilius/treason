@@ -16,7 +16,7 @@ use treason_core::time::Ticks;
 
 use crate::clock::Clock;
 use crate::link::EngineLink;
-use crate::notes::OwnedNotes;
+use crate::notes::{HOLD_PEDALS, OwnedNotes};
 use crate::render::{ClockPulses, RenderedEvent, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{self, Transport, TransportEffect};
@@ -34,6 +34,9 @@ const CLOCK_SETUP: Duration = Duration::from_millis(1);
 
 /// All Notes Off, which panic sends on every channel.
 const ALL_NOTES_OFF: U7 = U7::saturating(123);
+
+/// All Sound Off also silences voices that ignore All Notes Off.
+const ALL_SOUND_OFF: U7 = U7::saturating(120);
 
 /// A snapshot staged for a playback bar.
 struct SnapshotSwitch {
@@ -198,8 +201,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             sounding: vec![OwnedNotes::new(); config.ports.len()],
             delivered: vec![OwnedNotes::new(); config.ports.len()],
             delivered_pulses: vec![None; config.ports.len()],
-            // A full render batch plus one switch's note-offs on every port.
-            scheduled: Vec::with_capacity(RENDER_CAPACITY + config.ports.len() * 16 * 128),
+            // A full render batch plus one switch's note-offs and pedal
+            // releases on every port.
+            scheduled: Vec::with_capacity(
+                RENDER_CAPACITY + config.ports.len() * 16 * (128 + HOLD_PEDALS.len()),
+            ),
             streams: config.ports.iter().map(PortStream::new).collect(),
             max_latency,
             start_lead,
@@ -452,13 +458,45 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 };
                 self.emit(message, None)?;
             }
+            for channel in (0..16).filter_map(Channel::from_index) {
+                self.release_pedals(port, channel, at, tick, None)?;
+            }
         }
         Ok(())
     }
 
-    /// Ends every sounding note, then sends All Notes Off on every channel
-    /// of every port, for notes the engine doesn't know about. Playback
-    /// carries on.
+    /// Releases a channel's pedal holds, including when no keys remain.
+    /// Pedals affect the whole MIDI channel, including other tracks on it.
+    fn release_pedals(
+        &mut self,
+        port: PortId,
+        channel: Channel,
+        at: Instant,
+        tick: Ticks,
+        track: Option<TrackId>,
+    ) -> Result<(), O::Error> {
+        for controller in HOLD_PEDALS {
+            if self.sounding[usize::from(port.0)].pedal_is_down(channel, controller) {
+                self.emit(
+                    TimedMessage {
+                        at,
+                        tick,
+                        port,
+                        message: MidiMessage::ControlChange {
+                            channel,
+                            controller,
+                            value: U7::MIN,
+                        },
+                    },
+                    track,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends notes and releases pedals, then sends All Sound Off and All
+    /// Notes Off everywhere, including for untracked voices. Playback carries on.
     fn panic(&mut self, at: Instant, tick: Ticks) -> Result<(), O::Error> {
         // Playback continues: each port renders its cancelled future again,
         // including its note-offs, after ending the notes that really
@@ -467,17 +505,22 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         self.end_notes(at, tick)?;
         for port in (0..).map(PortId).take(self.sounding.len()) {
             for channel in (0..16).filter_map(Channel::from_index) {
-                let message = TimedMessage {
-                    at,
-                    tick,
-                    port,
-                    message: MidiMessage::ControlChange {
-                        channel,
-                        controller: ALL_NOTES_OFF,
-                        value: U7::MIN,
-                    },
-                };
-                self.emit(message, None)?;
+                for controller in HOLD_PEDALS
+                    .into_iter()
+                    .chain([ALL_SOUND_OFF, ALL_NOTES_OFF])
+                {
+                    let message = TimedMessage {
+                        at,
+                        tick,
+                        port,
+                        message: MidiMessage::ControlChange {
+                            channel,
+                            controller,
+                            value: U7::MIN,
+                        },
+                    };
+                    self.emit(message, None)?;
+                }
             }
         }
         Ok(())
@@ -609,6 +652,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 };
                 self.emit(message, Some(id))?;
             }
+            self.release_pedals(port, channel, at, line, Some(id))?;
         }
         self.streams[index].switched = true;
         Ok(())
@@ -722,9 +766,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Invalidates backend work and reconstructs projected notes. Delivery
-    /// can race cancellation: after it returns, any removed note-on due by
-    /// then might have sounded. Keep those notes until an off ends them;
-    /// never assume a removed note-off was delivered.
+    /// can race cancellation: any removed note-on or pedal-on due by then
+    /// might have sounded. Keep those notes and holds until cleanup;
+    /// never assume a removed note-off or pedal-off was delivered.
     fn cancel_scheduled(&mut self, from: Instant) -> Result<(), O::Error> {
         let scheduled = &mut self.scheduled;
         self.output.cancel_from(from, &mut |message| {
@@ -751,7 +795,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 // if it raced cancellation. Do not render it a second time.
                 remember_pulse(&mut self.delivered_pulses, message);
             } else if message.at <= now
-                && matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
+                && (matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
+                    || matches!(message.message, MidiMessage::ControlChange { controller, value, .. }
+                        if HOLD_PEDALS.contains(&controller) && value.get() >= 64))
             {
                 self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
             }
@@ -1551,6 +1597,125 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_releases_pedal_held_notes_after_the_keys_have_ended() {
+        // A one-key receiver that respects sustain and sostenuto: CC123
+        // leaves a pedal-held voice sounding, whereas pedal release or
+        // CC120 silences it. This deliberately differs from ActiveNotes.
+        fn sounding(messages: &[TimedMessage], pedal: U7) -> bool {
+            let (mut key, mut down, mut latched, mut voice) = (false, false, false, false);
+            for sent in messages {
+                if sent.port != PortId(0) {
+                    continue;
+                }
+                match sent.message {
+                    MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN => {
+                        key = true;
+                        voice = true;
+                    }
+                    MidiMessage::NoteOff { .. } => {
+                        key = false;
+                        voice &= down && (pedal.get() == 64 || latched);
+                    }
+                    MidiMessage::ControlChange {
+                        controller, value, ..
+                    } if controller == pedal => {
+                        down = value.get() >= 64;
+                        latched = down && key;
+                        if !down && !key {
+                            voice = false;
+                        }
+                    }
+                    MidiMessage::ControlChange {
+                        controller: ALL_SOUND_OFF,
+                        ..
+                    } => voice = false,
+                    _ => {}
+                }
+            }
+            voice
+        }
+
+        for scheduled in [false, true] {
+            for pedal in HOLD_PEDALS {
+                for cleanup in [
+                    "stop", "restart", "locate", "panic", "shutdown", "mute", "remove", "clip",
+                    "port", "channel",
+                ] {
+                    let mut held = (*track(1, 10, 7680, &[(0, 60, 960)])).clone();
+                    let mut events = held.clip.events().to_vec();
+                    for (tick, value) in [(480, U7::MAX), (6000, U7::MIN)] {
+                        events.push(ClipEvent {
+                            start: Ticks(tick),
+                            kind: EventKind::Control {
+                                controller: pedal,
+                                value,
+                            },
+                        });
+                    }
+                    held.clip = Clip::new(held.clip.length(), events).unwrap();
+                    let output = if scheduled {
+                        RecordingOutput::scheduled(ms(50))
+                    } else {
+                        RecordingOutput::new()
+                    };
+                    let (mut handle, mut engine) =
+                        engine(project(vec![Arc::new(held.clone())]), output);
+                    let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                    run_until(&mut engine, origin + ms(1000));
+                    assert!(engine.sounding[0].notes.is_empty());
+                    assert!(sounding(engine.output.messages(), pedal));
+                    match cleanup {
+                        "stop" => {
+                            apply(&mut handle, &mut engine, TransportCommand::Stop);
+                        }
+                        "restart" => {
+                            // Inspect cleanup before the next cycle plays
+                            // the new note at the top of the clip.
+                            engine
+                                .command(TransportCommand::Play, engine.clock.now())
+                                .unwrap();
+                        }
+                        "locate" => {
+                            apply(
+                                &mut handle,
+                                &mut engine,
+                                TransportCommand::Locate(Ticks(1920)),
+                            );
+                        }
+                        "panic" => {
+                            apply(&mut handle, &mut engine, TransportCommand::Panic);
+                        }
+                        "shutdown" => {
+                            drop(handle);
+                            assert!(!engine.cycle().unwrap());
+                        }
+                        _ => {
+                            match cleanup {
+                                "mute" => held.muted = true,
+                                "clip" => held.clip = Clip::new(Ticks(7680), Vec::new()).unwrap(),
+                                "port" => held.target.port = PortId(1),
+                                "channel" => held.target.channel = Channel::from_number(3).unwrap(),
+                                _ => {}
+                            }
+                            let tracks = if cleanup == "remove" {
+                                vec![]
+                            } else {
+                                vec![Arc::new(held)]
+                            };
+                            handle.publish(project(tracks));
+                            run_until(&mut engine, origin + ms(2100));
+                        }
+                    }
+                    assert!(
+                        !sounding(engine.output.messages(), pedal),
+                        "{cleanup}, pedal {pedal}, scheduled {scheduled}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn panic_ends_notes_and_sends_all_notes_off_everywhere() {
         let held = track(1, 10, 1920, &[(0, 60, 960)]);
         let (mut handle, mut engine) = engine(project(vec![held]), RecordingOutput::new());
@@ -1561,7 +1726,11 @@ mod tests {
         let sent_at_panic = sent(&mut engine, origin);
         let all_notes_off: Vec<String> = (0..2)
             .flat_map(|port| {
-                (1..=16).map(move |channel| format!("100ms port {port} channel {channel} cc 123=0"))
+                (1..=16).flat_map(move |channel| {
+                    [64, 66, 120, 123].map(move |controller| {
+                        format!("100ms port {port} channel {channel} cc {controller}=0")
+                    })
+                })
             })
             .collect();
         assert_eq!(sent_at_panic[..2], ["0ns on 60", "100ms off 60"]);

@@ -66,6 +66,9 @@ alongside its notes or on its own, such as modulation for a synth that
 plays its own notes. The agent names a control by the device's parameter,
 by a standard name such as `modulation`, `volume` or `cutoff`, or by its
 number, and gives it points that jump or ramp, smoothly enough for an LFO.
+Stop and track cleanup release sustain and sostenuto holds, even after a
+note's key has ended. Pedals affect a whole MIDI channel, so tracks sharing
+that channel share its pedal release. Panic also sends All Sound Off.
 
 `export_midi` writes the project as a MIDI file, `exports/<name>.mid`, with
 the tempo, the time signature and a track for each unmuted track, and

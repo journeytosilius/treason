@@ -3,6 +3,9 @@
 use treason_core::midi::{Channel, MidiMessage, U7};
 use treason_core::model::TrackId;
 
+/// Pedals that can hold a note after its key's note-off.
+pub(crate) const HOLD_PEDALS: [U7; 2] = [U7::saturating(64), U7::saturating(66)];
+
 /// The notes sounding on one output port, one bit per channel and note.
 ///
 /// 256 bytes, no allocation, constant-time updates. The engine keeps one per
@@ -72,6 +75,8 @@ impl ActiveNotes {
 pub(crate) struct OwnedNotes {
     pub(crate) notes: ActiveNotes,
     owners: [[TrackId; 128]; 16],
+    /// Channels with sustain or sostenuto down, even after all keys end.
+    pedals: [u16; 2],
 }
 
 impl OwnedNotes {
@@ -79,6 +84,7 @@ impl OwnedNotes {
         Self {
             notes: ActiveNotes::new(),
             owners: [[TrackId(0); 128]; 16],
+            pedals: [0; 2],
         }
     }
 
@@ -96,6 +102,27 @@ impl OwnedNotes {
                 track.expect("a rendered note-on has a track");
         }
         self.notes.observe(message);
+        if let MidiMessage::ControlChange {
+            channel,
+            controller,
+            value,
+        } = message
+            && let Some(index) = HOLD_PEDALS.iter().position(|&pedal| pedal == controller)
+        {
+            let bit = 1 << channel.index();
+            if value.get() >= 64 {
+                self.pedals[index] |= bit;
+            } else {
+                self.pedals[index] &= !bit;
+            }
+        }
+    }
+
+    pub(crate) fn pedal_is_down(&self, channel: Channel, controller: U7) -> bool {
+        HOLD_PEDALS
+            .iter()
+            .position(|&pedal| pedal == controller)
+            .is_some_and(|index| self.pedals[index] & (1 << channel.index()) != 0)
     }
 
     pub(crate) fn owns(&self, track: TrackId, channel: Channel, note: U7) -> bool {

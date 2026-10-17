@@ -243,6 +243,12 @@ and stops, and the transport tools report that it isn't running.
    note-offs on stop, panic, clip changes and shutdown. The engine adds
    fixed ownership tables (one track ID per MIDI key) to its projected and
    delivered sets, allocated before playback, for selective track cleanup.
+   Fixed bitsets also track sustain and sostenuto through delivery and
+   cancellation, even after normal note-offs have emptied the key set.
+   Cleanup releases active pedals on the affected channels; pedals are
+   channel-wide, so this also releases holds from other tracks sharing a
+   channel. Panic resets both pedals and sends All Sound Off and All Notes
+   Off on every channel, including for voices the engine did not start.
 
 ## Project model
 
