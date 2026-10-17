@@ -1199,6 +1199,60 @@ mod tests {
     }
 
     #[test]
+    fn existing_same_tick_controls_round_trip_through_get_project_and_set_controls() {
+        use treason_core::midi::U7;
+        use treason_core::model::{ClipEvent, EventKind};
+
+        let server = server();
+        let track = add(&server, Some("gm-drums"));
+        // A valid existing clip can interleave RPN sequences and repeat
+        // the same controller and value on one tick.
+        let original = Clip::new(
+            Ticks(3840),
+            [
+                (101, 0),
+                (100, 0),
+                (6, 12),
+                (7, 100),
+                (100, 2),
+                (6, 20),
+                (7, 20),
+                (7, 20),
+            ]
+            .map(|(controller, value)| ClipEvent {
+                start: Ticks::ZERO,
+                kind: EventKind::Control {
+                    controller: U7::new(controller).unwrap(),
+                    value: U7::new(value).unwrap(),
+                },
+            })
+            .to_vec(),
+        )
+        .unwrap();
+        server
+            .session()
+            .apply(Edit::SetClip {
+                track: TrackId(track),
+                clip: original.clone(),
+            })
+            .unwrap();
+        let view = server.get_project().0.tracks.remove(0);
+        let controls = view.controls.as_ref().unwrap();
+        let volume: Vec<_> = controls["volume"]
+            .points
+            .iter()
+            .map(|point| (point.at, point.value))
+            .collect();
+        assert_eq!(volume, [(0.0, 100), (0.0, 20), (0.0, 20)]);
+        let written = serde_json::to_string(controls).unwrap();
+        let Json(rewritten) = server
+            .set_controls(set_controls(track, &written, Some(view.loop_beats)))
+            .unwrap();
+        assert_eq!(server.session().project().tracks[0].clip, original);
+        assert_eq!(rewritten, view);
+    }
+
+    #[test]
     fn writing_notes_or_steps_keeps_the_controls() {
         let server = server();
         let track = add(&server, Some("gm-drums"));

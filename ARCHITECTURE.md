@@ -337,6 +337,9 @@ beats through the loop.
   changes fit one exactly, otherwise jumps. Written back over the same
   loop, they send the same changes, though a repeat comes back as every pass
   of it, so a control can have as many points as a clip holds changes.
+  Successive jumps at the same time keep their list order, including
+  duplicate values; ramps must advance time. This also lets loaded clips
+  with repeated same-tick controllers pass the public write validation.
   Controls go by the device's parameter name, then the standard name, then
   the number, checked to resolve to the same controller.
 

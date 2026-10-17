@@ -147,8 +147,10 @@ pub enum ControlError {
         /// How to make the loop longer.
         lengthen: &'static str,
     },
-    /// Two points at the same time.
-    #[error("points {first} and {second} are both at beat {at}: give each time one value")]
+    /// A ramp between points at the same time.
+    #[error(
+        "points {first} and {second} are both at beat {at}: use jumps for successive values at the same time, or move the ramp's end later"
+    )]
     SameTime {
         /// The earlier of the two in the list, counting from 1.
         first: usize,
@@ -218,7 +220,7 @@ struct Lane<'a> {
     /// The control as written.
     name: &'a str,
     controller: U7,
-    /// Sorted by time, none at the same time.
+    /// Sorted by time; successive jumps on one tick keep their input order.
     points: Vec<Point>,
     /// Where each point was in the agent's list, counting from 1.
     positions: Vec<usize>,
@@ -494,7 +496,7 @@ fn place<'a>(name: &'a str, controller: U7, lane: &ControlLane) -> Result<Lane<'
     points.sort_by_key(|&(position, point)| (point.at, position));
     for pair in points.windows(2) {
         let ((first, earlier), (second, later)) = (pair[0], pair[1]);
-        if earlier.at == later.at {
+        if earlier.at == later.at && later.ramp.is_some() {
             return Err(wrong(ControlError::SameTime {
                 first,
                 second,
@@ -1315,7 +1317,11 @@ mod tests {
             ),
             (
                 one(
-                    vec![at(1.0, 1, None), at(0.0, 2, None), at(1.0, 3, None)],
+                    vec![
+                        at(1.0, 1, None),
+                        at(0.0, 2, None),
+                        at(1.0, 3, Some(Ramp::Linear)),
+                    ],
                     None,
                 ),
                 None,
@@ -1447,21 +1453,9 @@ mod tests {
                 (controller.get().to_string(), lane(points, None))
             })
             .collect();
-        let rewritten = clip_with_controls(
-            &Clip::new(clip.length(), Vec::new()).unwrap(),
-            &lanes,
-            Some(beats(clip.length())),
-            BAR,
-            None,
-        )
-        .unwrap();
-        for controller in read.keys() {
-            assert_eq!(
-                changes(&rewritten, controller.get()),
-                changes(clip, controller.get()),
-                "controller {controller}"
-            );
-        }
+        let rewritten =
+            clip_with_controls(clip, &lanes, Some(beats(clip.length())), BAR, None).unwrap();
+        assert_eq!(rewritten, *clip);
         read
     }
 
@@ -1544,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn any_changes_read_back_as_points_that_send_them() {
+    fn arbitrary_changes_round_trip_through_public_write_validation() {
         // Changes no ramp makes, including two on one tick, off the grid,
         // and runs that look like a ramp for a while.
         let control = |start, value| ClipEvent {
@@ -1575,27 +1569,27 @@ mod tests {
             }
             let length = Ticks(tick + 1 + random(200));
             let clip = Clip::new(length, events.clone()).unwrap();
-            let read = controls_from_clip(&clip);
-            // Every change comes back, in order, from points that send it.
-            let Some(points) = read.get(&U7::new(7).unwrap()) else {
-                assert!(events.is_empty());
-                continue;
-            };
-            let mut resent = Vec::new();
-            let lane = Lane {
-                name: "7",
-                controller: U7::new(7).unwrap(),
-                points: points.clone(),
-                positions: (1..=points.len()).collect(),
-                repeat: None,
-            };
-            lane.send(length, |tick, value| {
-                resent.push((tick, value.get()));
-                Ok::<(), ()>(())
-            })
-            .unwrap();
-            assert_eq!(resent, changes(&clip, 7));
+            if !events.is_empty() {
+                round_trip(&clip);
+            }
         }
+    }
+
+    #[test]
+    fn same_tick_jumps_are_written_in_input_order_including_repeats() {
+        let points = vec![at(0.0, 100, None), at(0.0, 20, None), at(0.0, 20, None)];
+        let clip = set(
+            &empty(),
+            vec![("7", lane(points, Some(1.0)))],
+            Some(2.0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            changes(&clip, 7),
+            [(0, 100), (0, 20), (0, 20), (960, 100), (960, 20), (960, 20)]
+        );
+        round_trip(&clip);
     }
 
     #[test]

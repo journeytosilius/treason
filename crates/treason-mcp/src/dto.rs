@@ -491,7 +491,8 @@ pub struct SetControls {
 #[serde(deny_unknown_fields)]
 pub struct ControlLane {
     /// The control's values, in any order, at most 8192. An empty list
-    /// removes the control.
+    /// removes the control. Successive jumps at the same time are sent in
+    /// their list order, including repeated values.
     pub points: Vec<ControlPoint>,
     /// Repeat the points every this many beats through the loop, such as 1
     /// for an LFO that cycles once a beat. Defaults to the whole loop. A
@@ -513,7 +514,8 @@ pub struct ControlPoint {
     /// How the value gets here from the point before: "linear" ramps
     /// evenly, and "smooth" eases out and in, so smooth ramps between a low
     /// and a high make a sine wave. Without it, the value jumps here. The
-    /// first point can't ramp, since nothing comes before it.
+    /// first point can't ramp, since nothing comes before it. A ramp must
+    /// end later than the point before; same-time points must jump.
     pub ramp: Option<Ramp>,
 }
 
