@@ -226,7 +226,8 @@ its own notes, for example.
 - `repeat_beats` repeats the points through the loop: 1 cycles an LFO once
   a beat. A repeat that doesn't divide the loop starts again with it.
 - A ramp may end at the end of the loop, or of the repeat. A jump there
-  sends nothing, since the next pass starts again from the first point.
+  is refused, since it would send nothing: the next pass starts again from
+  the first point.
 - The call replaces only the controls it names. The track's notes and its
   other controls stay, and a control with no points is removed.
 - On a track with notes, the notes set the loop. On a track without,
