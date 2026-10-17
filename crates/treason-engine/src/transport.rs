@@ -31,7 +31,8 @@ pub enum TransportEffect {
     Stop,
     /// Move to a position while stopped.
     Locate(Ticks),
-    /// End every sounding note, then send All Notes Off on every channel.
+    /// End every sounding note, then release the sustain and sostenuto
+    /// pedals and send All Sound Off and All Notes Off on every channel.
     /// Playback carries on.
     Panic,
 }
