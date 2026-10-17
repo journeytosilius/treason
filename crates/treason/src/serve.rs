@@ -380,7 +380,7 @@ mod tests {
         let name: ProjectName = "jam".parse().unwrap();
         config
             .project_store()
-            .save(&name, &saved, &config.port_names())
+            .save(&name, &saved, &config.port_names(), false)
             .unwrap();
         let start = starting_project(&config, &args(Some("jam")), &devices).unwrap();
         assert_eq!(start, (saved, Some(name)));

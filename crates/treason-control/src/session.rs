@@ -114,10 +114,8 @@ impl<P: Playback> Session<P> {
         let Some(name) = name.or_else(|| self.name.clone()) else {
             return Err(ProjectError::Unnamed);
         };
-        if !overwrite && self.name.as_ref() != Some(&name) && store.exists(&name)? {
-            return Err(ProjectError::Exists(name));
-        }
-        store.save(&name, &self.project, ports)?;
+        let overwrite = overwrite || self.name.as_ref() == Some(&name);
+        store.save(&name, &self.project, ports, overwrite)?;
         self.saved = Arc::clone(&self.project);
         self.name = Some(name.clone());
         Ok(name)
@@ -455,7 +453,7 @@ mod tests {
             tempo: Bpm::new(90.0).unwrap(),
             ..Project::default()
         };
-        store.save(&name("other"), &other, &ports()).unwrap();
+        store.save(&name("other"), &other, &ports(), false).unwrap();
         let mut session = session(vec![track(1)]);
         session
             .save(&store, &ports(), Some(name("jam")), false)
@@ -484,6 +482,60 @@ mod tests {
     }
 
     #[test]
+    fn competing_first_saves_preserve_the_winners_project() {
+        let dir = TestDir::new("competing-first-saves");
+        let path = dir.path();
+        let ready = std::sync::Barrier::new(2);
+        let saves = std::thread::scope(|scope| {
+            let ready = &ready;
+            let saves = [90.0, 140.0].map(|bpm| {
+                scope.spawn(move || {
+                    // Independent stores and sessions, as in two servers
+                    // sharing a projects directory, with no common mutex.
+                    let store = ProjectStore::new(path);
+                    let mut session = session(vec![track(1)]);
+                    session.apply(tempo(bpm)).unwrap();
+                    assert!(!store.exists(&name("jam")).unwrap());
+                    ready.wait();
+                    let result = session.save(&store, &ports(), Some(name("jam")), false);
+                    (session, result)
+                })
+            });
+            saves.map(|save| save.join().unwrap())
+        });
+
+        let mut winner = None;
+        for (session, result) in saves {
+            match result {
+                Ok(saved) => {
+                    assert!(winner.is_none(), "only one first save may succeed");
+                    assert_eq!(saved, name("jam"));
+                    assert_eq!(session.name(), Some(&name("jam")));
+                    assert!(!session.has_unsaved_changes());
+                    winner = Some(Arc::clone(session.project()));
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(&error, ProjectError::Exists(taken) if *taken == name("jam")),
+                        "{error}"
+                    );
+                    assert_eq!(session.name(), None);
+                    assert!(session.has_unsaved_changes());
+                }
+            }
+        }
+        let winner = winner.expect("one first save must succeed");
+        let store = ProjectStore::new(path);
+        assert_eq!(
+            store
+                .load(&name("jam"), &ports(), &DeviceRegistry::new())
+                .unwrap(),
+            *winner
+        );
+        assert_eq!(std::fs::read_dir(path).unwrap().count(), 1);
+    }
+
+    #[test]
     fn a_failed_save_changes_nothing() {
         let dir = TestDir::new("session-failed-save");
         let store = ProjectStore::new(dir.path());
@@ -508,7 +560,7 @@ mod tests {
             tracks: vec![Arc::new(track(4)), Arc::new(track(2))],
             ..Project::default()
         };
-        store.save(&name("jam"), &saved, &ports()).unwrap();
+        store.save(&name("jam"), &saved, &ports(), false).unwrap();
         let mut session = session(vec![track(1)]);
         session.apply(tempo(140.0)).unwrap();
         let before = Arc::clone(session.project());
@@ -544,7 +596,9 @@ mod tests {
             tracks: vec![Arc::new(with_device)],
             ..Project::default()
         };
-        store.save(&name("tr8"), &unknown_device, &ports()).unwrap();
+        store
+            .save(&name("tr8"), &unknown_device, &ports(), false)
+            .unwrap();
         let mut session = session(vec![track(1)]).with_name(name("jam"));
         session.apply(tempo(140.0)).unwrap();
         let before = Arc::clone(session.project());

@@ -314,10 +314,12 @@ lists them.
   the clip's order, so events on the same tick keep their order.
 - Loading checks what an edit would: every port and device exists, track
   ids are unique and clips are valid. A file that fails changes nothing.
-- Saving writes a temporary file, flushes it to disk and renames it over
-  the old one, so a failed save leaves the old project as it was. A
-  project file holds at most 16 MiB, and saving refuses a bigger project,
-  so every saved project loads.
+- Saving writes a temporary file and flushes it to disk. A new name is
+  published with a hard link, which atomically refuses an existing name
+  even when another process saves it concurrently. Replacements rename
+  the temporary file over the old one. A failed save leaves the old
+  project as it was. A project file holds at most 16 MiB, and saving
+  refuses a bigger project, so every saved project loads.
 - Names hold letters, digits, spaces, dashes and underscores, so they can't
   reach outside the directory or hide a file.
 

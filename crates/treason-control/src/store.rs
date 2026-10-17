@@ -168,16 +168,19 @@ impl ProjectStore {
             .map_err(|error| ProjectError::Io { path, error })
     }
 
-    /// Saves `project` as `name`, replacing any project of that name.
-    /// `ports` names the output ports, in `PortId` order.
+    /// Saves `project` as `name`. Unless `overwrite`, atomically refuses an
+    /// existing name with [`ProjectError::Exists`]. `ports` names the output
+    /// ports, in `PortId` order.
     ///
     /// The file is written and flushed to disk under a temporary name, then
-    /// renamed into place, so a failed save leaves the old file as it was.
+    /// linked into place for a new name, or renamed for a replacement, so a
+    /// failed save leaves the old file as it was.
     pub fn save(
         &self,
         name: &ProjectName,
         project: &Project,
         ports: &[String],
+        overwrite: bool,
     ) -> Result<(), ProjectError> {
         let path = self.path(name);
         let text = file::write(project, ports).map_err(|error| ProjectError::File {
@@ -201,15 +204,33 @@ impl ProjectStore {
             std::process::id(),
             TEMPORARY_FILES.fetch_add(1, Ordering::Relaxed)
         ));
-        let saved =
-            write_new(&temporary, text.as_bytes()).and_then(|()| fs::rename(&temporary, &path));
-        if let Err(error) = saved {
-            // The rename failed or never happened, so the file is still
-            // there, unless it was never created.
-            let _ = fs::remove_file(&temporary);
-            return Err(ProjectError::Io { path, error });
-        }
-        Ok(())
+        let io = |error| ProjectError::Io {
+            path: path.clone(),
+            error,
+        };
+        let saved = write_new(&temporary, text.as_bytes())
+            .map_err(io)
+            .and_then(|()| {
+                let published = if overwrite {
+                    fs::rename(&temporary, &path)
+                } else {
+                    // Both names are in the same directory. A hard link
+                    // publishes the complete file without replacing a name
+                    // that another process may have saved in the meantime.
+                    fs::hard_link(&temporary, &path)
+                };
+                published.map_err(|error| {
+                    if !overwrite && error.kind() == io::ErrorKind::AlreadyExists {
+                        ProjectError::Exists(name.clone())
+                    } else {
+                        io(error)
+                    }
+                })
+            });
+        // A successful link leaves the temporary name too. Cleanup mustn't
+        // turn an already published save into a reported failure.
+        let _ = fs::remove_file(&temporary);
+        saved
     }
 
     /// Loads the project saved as `name`. `ports` names the output ports,
@@ -429,20 +450,35 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_project_loads_and_saving_again_replaces_it() {
+    fn saving_requires_overwrite_to_replace_an_existing_project() {
         let dir = TestDir::new("save-load");
         let store = ProjectStore::new(dir.path().join("projects"));
         let devices = DeviceRegistry::new();
         assert!(!store.exists(&name("jam")).unwrap());
 
-        store.save(&name("jam"), &project(100.0), &ports()).unwrap();
+        store
+            .save(&name("jam"), &project(100.0), &ports(), false)
+            .unwrap();
         assert!(store.exists(&name("jam")).unwrap());
         assert_eq!(
             store.load(&name("jam"), &ports(), &devices).unwrap(),
             project(100.0)
         );
 
-        store.save(&name("jam"), &project(140.0), &ports()).unwrap();
+        let before = fs::read(store.path(&name("jam"))).unwrap();
+        let error = store
+            .save(&name("jam"), &project(140.0), &ports(), false)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ProjectError::Exists(taken) if *taken == name("jam")),
+            "{error}"
+        );
+        assert_eq!(fs::read(store.path(&name("jam"))).unwrap(), before);
+        assert_eq!(files(store.dir()), ["jam.toml"]);
+
+        store
+            .save(&name("jam"), &project(140.0), &ports(), true)
+            .unwrap();
         assert_eq!(
             store.load(&name("jam"), &ports(), &devices).unwrap(),
             project(140.0)
@@ -455,11 +491,15 @@ mod tests {
     fn a_failed_save_leaves_the_old_file_as_it_was() {
         let dir = TestDir::new("failed-save");
         let store = ProjectStore::new(dir.path());
-        store.save(&name("jam"), &project(100.0), &ports()).unwrap();
+        store
+            .save(&name("jam"), &project(100.0), &ports(), false)
+            .unwrap();
         let before = fs::read_to_string(store.path(&name("jam"))).unwrap();
 
         // A track on a port with no name can't be written.
-        let error = store.save(&name("jam"), &project(140.0), &[]).unwrap_err();
+        let error = store
+            .save(&name("jam"), &project(140.0), &[], true)
+            .unwrap_err();
         assert!(matches!(
             error,
             ProjectError::File {
@@ -470,7 +510,7 @@ mod tests {
         // A directory where the file should go can't be replaced.
         fs::create_dir(store.path(&name("blocked"))).unwrap();
         let error = store
-            .save(&name("blocked"), &project(140.0), &ports())
+            .save(&name("blocked"), &project(140.0), &ports(), true)
             .unwrap_err();
         assert!(matches!(error, ProjectError::Io { .. }), "{error}");
 
@@ -509,7 +549,7 @@ mod tests {
         let dir = TestDir::new("too-large");
         let store = ProjectStore::new(dir.path());
         store
-            .save(&name("small"), &project(100.0), &ports())
+            .save(&name("small"), &project(100.0), &ports(), false)
             .unwrap();
         let size = fs::metadata(store.path(&name("small"))).unwrap().len();
         let limited = ProjectStore {
@@ -525,7 +565,7 @@ mod tests {
             "{error}"
         );
         let error = limited
-            .save(&name("other"), &project(100.0), &ports())
+            .save(&name("other"), &project(100.0), &ports(), false)
             .unwrap_err();
         assert!(matches!(error, ProjectError::TooLarge { .. }), "{error}");
         assert!(!store.exists(&name("other")).unwrap());
@@ -547,7 +587,9 @@ mod tests {
 
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         for (offset, saved) in [(1, "old"), (3, "newest"), (2, "tied b"), (2, "tied a")] {
-            store.save(&name(saved), &project(120.0), &ports()).unwrap();
+            store
+                .save(&name(saved), &project(120.0), &ports(), false)
+                .unwrap();
             File::options()
                 .write(true)
                 .open(store.path(&name(saved)))
