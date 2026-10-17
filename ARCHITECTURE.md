@@ -59,6 +59,7 @@ Cargo.toml             workspace: members, shared dependency versions, lints
 rust-toolchain.toml    Rust 1.95
 treason.toml           example configuration, read by `treason serve`
 devices/               device profiles (TOML)
+docs/                  the guide for agents (guide.md) and the tool reference (tools.md)
 crates/<crate>/src/    one directory per crate, modules below
 ```
 
@@ -87,13 +88,14 @@ seams between modules are fixed and compile-checked before the logic exists.
 | io | `smf` (feature `smf`) | `write`, `Song`: Standard MIDI Files, format 1 | done |
 | control | `edit`, `session` | `Edit`, `Session`: validation, undo and redo, publishing | done |
 | control | `file`, `store` | project files; `ProjectStore`: saving and loading by name; `ExportStore`: exported MIDI files | done |
-| mcp | `server` | `TreasonServer`: the tools | done |
+| mcp | `server` | `TreasonServer`: the tools, including `get_guide`, which serves `docs/guide.md` | done |
 | mcp | `dto` | tool inputs and outputs | done |
 | mcp | `notation` | step strings and pitch names | done |
 | mcp | `pattern` | step patterns to clips and back | done |
 | mcp | `notes` | lists of notes in beats to clips | done |
 | mcp | `controls` | controls as points that jump or ramp, to control changes and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
+| mcp | `reference` (tests only) | `docs/tools.md`, made from the tool list | done |
 | treason | `main`, `config`, `serve`, `export` | subcommands `serve`, `ports`, `devices`, `projects`, `export`; `treason.toml`; picks the backend; `SmfExport` | done |
 
 ## Runtime
@@ -289,7 +291,7 @@ breaking the other.
 
 | Tools | |
 |---|---|
-| `get_project`, `status`, `list_devices`, `list_ports`, `list_projects` | read only |
+| `get_guide`, `get_project`, `status`, `list_devices`, `list_ports`, `list_projects` | read only |
 | `add_track`, `edit_track`, `remove_track`, `set_muted` | tracks |
 | `set_steps`, `set_notes`, `set_controls` | clips |
 | `set_tempo`, `set_time_signature` | project |
@@ -302,6 +304,15 @@ Tool descriptions and parameter schemas come from the Rust doc comments
 (through schemars), so the code documents the agent's interface. A rejected
 call comes back as a tool error whose message says how to fix it, such as
 "there is no port `x`; see list_ports", so the agent can correct itself.
+
+The schemas describe each tool on its own. `docs/guide.md` explains how
+they fit together: the model, the names and notations, the limits, the
+errors and connecting gear, with examples. `get_guide` returns it, compiled
+into the server, so an agent anywhere learns treason in one call, and the
+server's instructions say to call it first. A test runs the guide's
+example calls in order over an MCP session, and another makes
+`docs/tools.md`, the reference for every tool, from the tool list and fails
+while the committed file differs, so neither drifts from the code.
 
 `get_project` shows a clip whose notes fit a step grid as step strings, in
 the form `set_steps` takes, and any other clip as a list of notes, in the

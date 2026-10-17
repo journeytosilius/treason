@@ -255,6 +255,27 @@ mod tests {
     }
 
     #[test]
+    fn the_guides_configuration_and_profile_load() {
+        // docs/guide.md's ```toml blocks say what they hold.
+        let guide = include_str!("../../../docs/guide.md");
+        let mut kinds = Vec::new();
+        for block in guide.split("```toml ").skip(1) {
+            let (kind, rest) = block.split_once('\n').unwrap();
+            let toml = &rest[..rest.find("```").unwrap()];
+            match kind {
+                "treason.toml" => toml::from_str::<Config>(toml).unwrap().validate().unwrap(),
+                "device" => {
+                    let profile: treason_devices::DeviceProfile = toml::from_str(toml).unwrap();
+                    profile.validate().unwrap();
+                }
+                other => panic!("the guide has a ```toml block of `{other}`"),
+            }
+            kinds.push(kind);
+        }
+        assert_eq!(kinds, ["treason.toml", "device"]);
+    }
+
+    #[test]
     fn rejects_duplicate_ports() {
         let config: Config = toml::from_str(
             r#"

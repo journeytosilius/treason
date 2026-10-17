@@ -18,6 +18,17 @@ back later, with everything it holds, and exports it as a MIDI file that
 opens in a DAW. See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
 for what's still a stub.
 
+## Docs
+
+- [docs/guide.md](docs/guide.md): how to drive treason, for agents and
+  people alike. It covers projects, tracks and loops, every tool, the
+  notations and limits, and connecting gear, with examples of every call.
+  Agents read it over MCP with `get_guide`.
+- [docs/tools.md](docs/tools.md): every tool's inputs and outputs, made
+  from the tools themselves.
+- [ARCHITECTURE.md](ARCHITECTURE.md): the design and what comes next.
+- [AGENTS.md](AGENTS.md): the rules for contributing.
+
 ## Requirements
 
 - Rust 1.95, pinned in `rust-toolchain.toml`. With
