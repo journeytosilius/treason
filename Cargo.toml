@@ -24,7 +24,8 @@ arc-swap = "1.9.2"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 midir = "0.11.1"
-midly = "0.5.3"
+# Without its default "parallel" feature, which brings in rayon.
+midly = { version = "0.5.3", default-features = false, features = ["std"] }
 rmcp = { version = "3.5.1", features = ["transport-io", "transport-streamable-http-server"] }
 rtrb = "0.4.0"
 schemars = "1.2.3"

@@ -10,8 +10,8 @@
 //! - `alsa-seq`: `AlsaSeqOutput`, an ALSA sequencer queue on Linux. Scheduled
 //!   delivery: the engine hands messages over up to the lookahead early, and
 //!   the kernel sends each at its time, within a millisecond.
-//! - `smf`: `smf::write`, Standard MIDI Files through `midly`. Not
-//!   implemented yet.
+//! - `smf`: `smf::write`, Standard MIDI Files through `midly`, for opening
+//!   a project in a DAW.
 //!
 //! Always available: [`RecordingOutput`], which keeps messages in memory for
 //! tests and offline rendering, and [`PortSpec`], which says which ports to

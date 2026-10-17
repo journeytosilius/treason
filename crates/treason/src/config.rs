@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use treason_control::ProjectStore;
+use treason_control::{ExportStore, ProjectStore};
 use treason_devices::DeviceRegistry;
 use treason_engine::{EngineConfig, PortSettings};
 use treason_io::PortSpec;
@@ -23,6 +23,8 @@ pub struct Config {
     pub devices: PathBuf,
     /// Where projects are saved. Relative to the config file.
     pub projects: PathBuf,
+    /// Where exported MIDI files go. Relative to the config file.
+    pub exports: PathBuf,
     /// The MCP server.
     pub mcp: McpOptions,
     /// The engine.
@@ -97,6 +99,7 @@ impl Config {
         if let Some(dir) = path.parent() {
             config.devices = dir.join(&config.devices);
             config.projects = dir.join(&config.projects);
+            config.exports = dir.join(&config.exports);
         }
         config
             .validate()
@@ -113,6 +116,11 @@ impl Config {
     /// The saved projects.
     pub fn project_store(&self) -> ProjectStore {
         ProjectStore::new(&self.projects)
+    }
+
+    /// The exported MIDI files.
+    pub fn export_store(&self) -> ExportStore {
+        ExportStore::new(&self.exports)
     }
 
     /// The ports' names, in `PortId` order.
@@ -176,6 +184,7 @@ impl Default for Config {
         Self {
             devices: PathBuf::from("devices"),
             projects: PathBuf::from("projects"),
+            exports: PathBuf::from("exports"),
             mcp: McpOptions::default(),
             engine: EngineOptions::default(),
             ports: vec![PortOptions {
@@ -218,6 +227,10 @@ mod tests {
         assert_eq!(
             config.project_store().dir(),
             path.parent().unwrap().join("projects")
+        );
+        assert_eq!(
+            config.export_store().dir(),
+            path.parent().unwrap().join("exports")
         );
         assert_eq!(config.port_names(), ["out"]);
         assert_eq!(config.engine_config().lookahead, Duration::from_millis(20));

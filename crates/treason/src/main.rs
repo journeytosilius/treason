@@ -3,8 +3,10 @@
 //! The only crate that knows all the others. It reads the configuration,
 //! loads device profiles, opens the MIDI ports, starts the engine thread and
 //! serves MCP, connecting the pieces through the traits in `treason-core`.
+//! It also exports saved projects as MIDI files.
 
 mod config;
+mod export;
 mod serve;
 
 use std::path::PathBuf;
@@ -40,6 +42,8 @@ enum Command {
     Devices,
     /// List the saved projects, newest first.
     Projects,
+    /// Export a saved project as a MIDI file.
+    Export(export::ExportArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -58,6 +62,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ports => list_ports(),
         Command::Devices => list_devices(&config),
         Command::Projects => list_projects(&config),
+        Command::Export(args) => export::run(&config, &args),
     }
 }
 

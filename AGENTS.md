@@ -26,16 +26,17 @@ read it before you change code.
   `treason-mcp` on control, devices and core. Only the `treason` binary
   wires them all together. A new dependency between crates needs a
   reason in the PR.
-- The engine never sees a MIDI backend, and the control layer never sees
-  the engine. They meet through the `MidiOutput` and `Playback` traits,
-  which is also what lets tests swap in fakes. Keep it that way.
+- The engine never sees a MIDI backend, and neither the control layer
+  nor the MCP server sees the engine. They meet through the `MidiOutput`,
+  `Playback` and `MidiExport` traits, which is also what lets tests swap
+  in fakes. Keep it that way.
 - Put code where it belongs:
   - MIDI, musical time and the project model: core
   - names for a device's notes and controls: devices
   - real-time playback: engine
-  - MIDI backends: io, behind a Cargo feature if they link a system
-    library
-  - edits, undo, publishing and saved projects: control
+  - MIDI backends and the MIDI file writer: io, behind a Cargo feature
+    if they link a system library
+  - edits, undo, publishing, saved projects and exported files: control
   - the agent's tools, their inputs and outputs, notations: mcp
   - CLI, configuration and wiring: the binary
 - Add a trait for a second implementation or a test fake, not in case one

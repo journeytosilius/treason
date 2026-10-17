@@ -8,6 +8,8 @@
 //!
 //! A session also saves its project to a [`ProjectStore`] by name and loads
 //! it back, as a [`file`](mod@file) that keeps everything the project holds.
+//! An [`ExportStore`] keeps MIDI files exported from projects, written the
+//! same way.
 
 pub mod edit;
 pub mod file;
@@ -17,4 +19,4 @@ pub mod store;
 pub use edit::Edit;
 pub use file::FileError;
 pub use session::{ControlError, Session};
-pub use store::{ProjectError, ProjectList, ProjectName, ProjectStore};
+pub use store::{ExportStore, ProjectError, ProjectList, ProjectName, ProjectStore};

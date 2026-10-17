@@ -1,8 +1,10 @@
 //! Turning clips into MIDI events.
 
+use std::collections::BTreeMap;
 use std::ops::Range;
 
-use treason_core::midi::{MidiMessage, U7};
+use thiserror::Error;
+use treason_core::midi::{Channel, MidiMessage, U7};
 use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
@@ -67,6 +69,96 @@ pub fn render(
     let first = out.len();
     visit(project, clock, None, window, |event| out.push(event));
     out[first..].sort_unstable_by_key(send_order);
+}
+
+/// A song with more events than [`render_song`] may give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the song holds {events} MIDI events, more than the limit of {limit}")]
+pub struct SongTooLarge {
+    /// How many events the song holds.
+    pub events: u64,
+    /// The most it may hold.
+    pub limit: u64,
+}
+
+/// Everything `project` plays from tick 0 until `end`, for a file rather
+/// than a port: [`render`]'s events for that span, without MIDI clock, then
+/// a note-off at `end` for each note still sounding there, by track, then
+/// channel and note. Every note-on gets its own note-off, even where a
+/// track starts a note that is already sounding.
+///
+/// Counts the events first, and renders nothing if there would be more
+/// than `limit`.
+pub fn render_song(
+    project: &Project,
+    end: Ticks,
+    limit: u64,
+) -> Result<Vec<RenderedEvent>, SongTooLarge> {
+    let events = song_size(project, end);
+    if events > limit {
+        return Err(SongTooLarge { events, limit });
+    }
+    // Only a hint, so a count that doesn't fit leaves it to the vector.
+    let mut out = Vec::with_capacity(usize::try_from(events).unwrap_or(0));
+    render(project, ClockPulses::default(), Ticks::ZERO..end, &mut out);
+
+    // How many times each track's notes are sounding. A note-off ends one
+    // of them, so a note started twice needs two.
+    let mut sounding = BTreeMap::<(usize, Channel, U7), u32>::new();
+    for event in &out {
+        let track = event.sequence.0;
+        match event.message {
+            MidiMessage::NoteOn {
+                channel,
+                note,
+                velocity,
+            } if velocity != U7::MIN => *sounding.entry((track, channel, note)).or_default() += 1,
+            MidiMessage::NoteOn { channel, note, .. }
+            | MidiMessage::NoteOff { channel, note, .. } => {
+                if let Some(count) = sounding.get_mut(&(track, channel, note)) {
+                    *count = count.saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    for ((index, channel, note), count) in sounding {
+        let track = &project.tracks[index];
+        let off = RenderedEvent {
+            tick: end,
+            port: track.target.port,
+            track: Some(track.id),
+            message: MidiMessage::NoteOff {
+                channel,
+                note,
+                velocity: U7::MIN,
+            },
+            // After every pass, as the last word on each note.
+            sequence: (index, u64::MAX, usize::from(note.get())),
+        };
+        out.extend(std::iter::repeat_n(off, count as usize));
+    }
+    Ok(out)
+}
+
+/// How many events [`render_song`] gives for `project` until `end`: two for
+/// each note, its note-on and note-off, and one for each other event, for
+/// every pass through the loop that starts the event before `end`.
+fn song_size(project: &Project, end: Ticks) -> u64 {
+    let mut events = 0_u64;
+    for track in project.tracks.iter().filter(|track| !track.muted) {
+        let length = track.clip.length().0;
+        for event in track.clip.events() {
+            let messages = match event.kind {
+                EventKind::Note { velocity, .. } if velocity == U7::MIN => 0,
+                EventKind::Note { .. } => 2,
+                EventKind::Control { .. } | EventKind::Program { .. } => 1,
+            };
+            let passes = end.0.saturating_sub(event.start.0).div_ceil(length);
+            events = events.saturating_add(passes.saturating_mul(messages));
+        }
+    }
+    events
 }
 
 /// Appends the earliest events for `port` that fit in the remaining
@@ -350,7 +442,13 @@ mod tests {
             Ticks(window.start)..Ticks(window.end),
             &mut out,
         );
-        out.iter()
+        describe(&out)
+    }
+
+    /// One line per event, such as "240 off 36".
+    fn describe(events: &[RenderedEvent]) -> Vec<String> {
+        events
+            .iter()
             .map(|event| {
                 let what = match event.message {
                     MidiMessage::TimingClock => format!("clock {}", event.port.0),
@@ -367,6 +465,11 @@ mod tests {
                 format!("{} {what}", event.tick.0)
             })
             .collect()
+    }
+
+    /// The song `project` plays until `end`, one line per event.
+    fn song(project: &Project, end: u64) -> Vec<String> {
+        describe(&render_song(project, Ticks(end), u64::MAX).unwrap())
     }
 
     /// A beat with a kick on the downbeat and a snare on the off-beat, each
@@ -717,5 +820,156 @@ mod tests {
         let pulses: Vec<u64> = clock_pulses(Ticks(41)..Ticks(121)).map(|t| t.0).collect();
         assert_eq!(pulses, [80, 120]);
         assert_eq!(clock_pulses(Ticks(1)..Ticks(40)).count(), 0);
+    }
+
+    #[test]
+    fn songs_end_the_notes_still_sounding_at_their_end() {
+        // A kick on the downbeat, and a snare held over the loop point.
+        let project = project(vec![track(
+            1,
+            960,
+            vec![note(0, 36, 240), note(720, 38, 480)],
+        )]);
+        assert_eq!(
+            song(&project, 1920),
+            [
+                "0 on 36",
+                "240 off 36",
+                "720 on 38",
+                "960 on 36",
+                // The first snare ends in the next pass, as it does live.
+                "1200 off 38",
+                "1200 off 36",
+                "1680 on 38",
+                // The second would end at 2160, so it ends with the song.
+                "1920 off 38",
+            ]
+        );
+        // Notes that would end exactly at the end still get their note-offs.
+        assert_eq!(
+            song(&project, 1200),
+            [
+                "0 on 36",
+                "240 off 36",
+                "720 on 38",
+                "960 on 36",
+                "1200 off 36",
+                "1200 off 38",
+            ]
+        );
+        assert!(song(&project, 0).is_empty());
+    }
+
+    #[test]
+    fn a_note_started_twice_ends_twice() {
+        let project = project(vec![track(
+            1,
+            960,
+            vec![note(0, 36, 960), note(480, 36, 960)],
+        )]);
+        assert_eq!(
+            song(&project, 960),
+            ["0 on 36", "480 on 36", "960 off 36", "960 off 36"]
+        );
+    }
+
+    #[test]
+    fn notes_end_with_the_song_track_by_track() {
+        let project = project(vec![
+            track(1, 960, vec![note(0, 50, 960), note(0, 40, 960)]),
+            track(2, 960, vec![note(0, 30, 960)]),
+        ]);
+        assert_eq!(
+            song(&project, 480),
+            [
+                "0 on 50",
+                "0 on 40",
+                "0 on 30",
+                "480 off 40",
+                "480 off 50",
+                "480 off 30",
+            ]
+        );
+    }
+
+    #[test]
+    fn songs_leave_out_muted_tracks_and_silent_notes() {
+        let silent = ClipEvent {
+            start: Ticks(480),
+            kind: EventKind::Note {
+                note: U7::new(42).unwrap(),
+                velocity: U7::MIN,
+                length: Ticks(240),
+            },
+        };
+        let mut muted = track(2, 960, vec![note(0, 40, 240)]);
+        muted.muted = true;
+        let project = project(vec![track(1, 960, vec![note(0, 36, 240), silent]), muted]);
+        assert_eq!(song(&project, 960), ["0 on 36", "240 off 36"]);
+    }
+
+    #[test]
+    fn songs_are_counted_exactly_before_they_are_rendered() {
+        let silent = ClipEvent {
+            start: Ticks(240),
+            kind: EventKind::Note {
+                note: U7::new(42).unwrap(),
+                velocity: U7::MIN,
+                length: Ticks(240),
+            },
+        };
+        let mut muted = track(3, 700, vec![note(0, 40, 700)]);
+        muted.muted = true;
+        let project = project(vec![
+            track(
+                1,
+                960,
+                vec![
+                    note(0, 36, 240),
+                    note(720, 38, 480),
+                    control(0, 74, 64),
+                    program(480, 5),
+                    silent,
+                ],
+            ),
+            track(2, 1440, vec![note(1000, 50, 1440), control(1439, 1, 2)]),
+            muted,
+        ]);
+        for end in [
+            0, 1, 239, 240, 241, 959, 960, 1199, 1200, 1439, 1440, 2880, 10_000,
+        ] {
+            let events = render_song(&project, Ticks(end), u64::MAX).unwrap();
+            assert_eq!(
+                song_size(&project, Ticks(end)),
+                events.len() as u64,
+                "{end}"
+            );
+            let count = |off: bool| {
+                events
+                    .iter()
+                    .filter(|event| match event.message {
+                        MidiMessage::NoteOn { .. } => !off,
+                        MidiMessage::NoteOff { .. } => off,
+                        _ => false,
+                    })
+                    .count()
+            };
+            assert_eq!(count(false), count(true), "{end}");
+            assert!(events.windows(2).all(|pair| pair[0].tick <= pair[1].tick));
+            assert!(events.iter().all(|event| event.tick <= Ticks(end)));
+        }
+
+        let size = song_size(&project, Ticks(2880));
+        assert_eq!(
+            render_song(&project, Ticks(2880), size - 1),
+            Err(SongTooLarge {
+                events: size,
+                limit: size - 1
+            })
+        );
+        assert_eq!(
+            render_song(&project, Ticks(2880), size).unwrap().len() as u64,
+            size
+        );
     }
 }

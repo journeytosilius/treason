@@ -18,6 +18,7 @@ use treason_mcp::TreasonServer;
 
 use crate::CLIENT_NAME;
 use crate::config::{Backend, Config};
+use crate::export::SmfExport;
 
 /// How long shutting down waits for work that can't be cancelled, such as a
 /// pending read from stdin, before leaving it behind.
@@ -101,7 +102,13 @@ fn serve<O: MidiOutput + 'static>(
     if let Some(name) = name {
         session = session.with_name(name);
     }
-    let server = TreasonServer::new(session, config.port_names(), config.project_store());
+    let server = TreasonServer::new(
+        session,
+        config.port_names(),
+        config.project_store(),
+        config.export_store(),
+        Arc::new(SmfExport),
+    );
 
     let served = runtime.block_on(async {
         if args.stdio {
@@ -169,7 +176,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
-    use treason_control::ProjectStore;
+    use treason_control::{ExportStore, ProjectStore};
     use treason_core::midi::{Channel, MidiMessage, U7};
     use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
     use treason_core::output::{Delivery, MidiOutput, TimedMessage};
@@ -290,6 +297,8 @@ mod tests {
             Session::new(project, DeviceRegistry::new(), playback),
             vec!["test".into()],
             ProjectStore::new(std::env::temp_dir().join("treason-serve-unsaved")),
+            ExportStore::new(std::env::temp_dir().join("treason-serve-exports")),
+            Arc::new(SmfExport),
         );
         playing.blocking_recv().unwrap();
 
