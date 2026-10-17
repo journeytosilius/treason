@@ -401,7 +401,10 @@ saved project. A DAW opens it with each part on its own track.
 - The engine's `render_song` renders the song with the same code that
   plays it, so the file holds what `play` would send. Notes still sounding
   at the end stop there, and a note started again before it ended gets a
-  note-off for each start.
+  note-off for each start. Active sustain and sostenuto pedals are then
+  released at the export boundary, even when all keys ended earlier.
+  Pedal state is shared by tracks on the same port and channel, and these
+  final releases count toward the export's event limit.
 - An export is counted before it is rendered, and one of more than
   1,000,000 events is refused, which bounds the memory and the file.
 - The file is written like a saved project: flushed under a temporary

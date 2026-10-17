@@ -277,6 +277,53 @@ mod tests {
     }
 
     #[test]
+    fn exports_release_pedal_holds_even_after_the_normal_note_off() {
+        for pedal in [64, 66] {
+            for note_length in [960, 5760] {
+                let mut synth = track(1, "synth", 3, 7680, &[(0, 60, note_length)]);
+                let mut events = synth.clip.events().to_vec();
+                // Sostenuto captures keys already down. Sustain can be
+                // pressed before the note starts.
+                let pedal_at = if pedal == 64 { 0 } else { 240 };
+                for (at, value) in [(pedal_at, 127), (6720, 0)] {
+                    events.push(ClipEvent {
+                        start: Ticks(at),
+                        kind: EventKind::Control {
+                            controller: U7::new(pedal).unwrap(),
+                            value: U7::new(value).unwrap(),
+                        },
+                    });
+                }
+                synth.clip = Clip::new(Ticks(7680), events).unwrap();
+                let project = Project {
+                    tracks: vec![Arc::new(synth)],
+                    ..Project::default()
+                };
+                // Export only the first bar: the authored pedal-off is
+                // outside the file, and the short note's key is up well
+                // before the cutoff, while the pedal still holds it.
+                let file = SmfExport.export(&project, "pedals", 1).unwrap();
+                let mut expected = vec!["0 name synth".to_owned()];
+                if pedal == 64 {
+                    expected.extend(["0 cc64 127 ch3".into(), "0 on 60 ch3".into()]);
+                } else {
+                    expected.extend(["0 on 60 ch3".into(), "240 cc66 127 ch3".into()]);
+                }
+                expected.extend([
+                    format!("{} off 60 ch3", note_length.min(3840)),
+                    format!("3840 cc{pedal} 0 ch3"),
+                    "3840 end".into(),
+                ]);
+                assert_eq!(
+                    tracks(&file)[1],
+                    expected,
+                    "pedal {pedal}, note {note_length}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn partial_control_updates_preserve_the_rendered_rpn_sequence() {
         let mut synth = track(1, "synth", 3, 3840, &[]);
         synth.clip = Clip::new(

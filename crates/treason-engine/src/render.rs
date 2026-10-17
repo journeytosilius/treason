@@ -8,6 +8,8 @@ use treason_core::midi::{Channel, MidiMessage, U7};
 use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
+use crate::notes::HOLD_PEDALS;
+
 /// Bank select, the most and least significant bytes. A program change on
 /// the same tick uses them, so they go out before it.
 const BANK_SELECT: [u8; 2] = [0, 32];
@@ -85,7 +87,9 @@ pub struct SongTooLarge {
 /// than a port: [`render`]'s events for that span, without MIDI clock, then
 /// a note-off at `end` for each note still sounding there, by track, then
 /// channel and note. Every note-on gets its own note-off, even where a
-/// track starts a note that is already sounding.
+/// track starts a note that is already sounding. Active sustain and
+/// sostenuto pedals are released after those note-offs, including when
+/// earlier note-offs have already ended all keys.
 ///
 /// Counts the events first, and renders nothing if there would be more
 /// than `limit`.
@@ -94,7 +98,7 @@ pub fn render_song(
     end: Ticks,
     limit: u64,
 ) -> Result<Vec<RenderedEvent>, SongTooLarge> {
-    let events = song_size(project, end);
+    let (events, pedal_releases) = song_size(project, end);
     if events > limit {
         return Err(SongTooLarge { events, limit });
     }
@@ -138,17 +142,26 @@ pub fn render_song(
         };
         out.extend(std::iter::repeat_n(off, count as usize));
     }
+    out.extend(pedal_releases);
     Ok(out)
 }
 
 /// How many events [`render_song`] gives for `project` until `end`: two for
 /// each note, its note-on and note-off, and one for each other event, for
-/// every pass through the loop that starts the event before `end`.
-fn song_size(project: &Project, end: Ticks) -> u64 {
+/// every pass through the loop that starts the event before `end`, plus
+/// the pedal releases returned alongside the count.
+fn song_size(project: &Project, end: Ticks) -> (u64, Vec<RenderedEvent>) {
     let mut events = 0_u64;
-    for track in project.tracks.iter().filter(|track| !track.muted) {
+    // Only the last change on each port/channel/pedal matters. Find it
+    // arithmetically so even an oversized song needn't be rendered first.
+    // The map holds at most two entries per MIDI output target.
+    let mut pedals = BTreeMap::<(PortId, Channel, U7), RenderedEvent>::new();
+    for (index, track) in project.tracks.iter().enumerate() {
+        if track.muted {
+            continue;
+        }
         let length = track.clip.length().0;
-        for event in track.clip.events() {
+        for (event_index, event) in track.clip.events().iter().enumerate() {
             let messages = match event.kind {
                 EventKind::Note { velocity, .. } if velocity == U7::MIN => 0,
                 EventKind::Note { .. } => 2,
@@ -156,9 +169,44 @@ fn song_size(project: &Project, end: Ticks) -> u64 {
             };
             let passes = end.0.saturating_sub(event.start.0).div_ceil(length);
             events = events.saturating_add(passes.saturating_mul(messages));
+            if let EventKind::Control { controller, value } = event.kind
+                && HOLD_PEDALS.contains(&controller)
+                && passes != 0
+            {
+                let last = RenderedEvent {
+                    tick: Ticks(event.start.0 + (passes - 1) * length),
+                    port: track.target.port,
+                    track: Some(track.id),
+                    message: MidiMessage::ControlChange {
+                        channel: track.target.channel,
+                        controller,
+                        value,
+                    },
+                    sequence: (index, passes - 1, event_index),
+                };
+                let previous = pedals
+                    .entry((track.target.port, track.target.channel, controller))
+                    .or_insert(last);
+                // Different tracks can share a pedal. Respect the live
+                // renderer's order, including changes on the same tick.
+                if send_order(&last) > send_order(previous) {
+                    *previous = last;
+                }
+            }
         }
     }
-    events
+    let mut releases = Vec::new();
+    for mut event in pedals.into_values() {
+        if let MidiMessage::ControlChange { value, .. } = &mut event.message
+            && value.get() >= 64
+        {
+            *value = U7::MIN;
+            event.tick = end;
+            releases.push(event);
+        }
+    }
+    releases.sort_unstable_by_key(send_order);
+    (events.saturating_add(releases.len() as u64), releases)
 }
 
 /// Appends the earliest events for `port` that fit in the remaining
@@ -909,6 +957,94 @@ mod tests {
     }
 
     #[test]
+    fn song_pedal_cleanup_respects_loops_and_shared_channel_order() {
+        let project = project(vec![
+            track(1, 960, vec![control(0, 64, 127), control(0, 66, 64)]),
+            track(2, 1440, vec![control(0, 64, 0), control(800, 66, 63)]),
+        ]);
+        // Track 2's sustain release wins at tick 0. Later, the tracks'
+        // different loop lengths take turns changing that same channel.
+        for (end, expected) in [
+            (0, vec![]),
+            (1, vec![66]),
+            (800, vec![66]), // The release at the cutoff isn't rendered.
+            (801, vec![]),
+            (961, vec![64, 66]),
+            (1441, vec![66]),
+            (1920, vec![66]),
+            (1921, vec![64, 66]),
+        ] {
+            let events = render_song(&project, Ticks(end), u64::MAX).unwrap();
+            let released: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event.message {
+                    MidiMessage::ControlChange {
+                        controller, value, ..
+                    } if event.tick == Ticks(end) => {
+                        assert_eq!(value, U7::MIN);
+                        assert_eq!(event.track, Some(TrackId(1)));
+                        Some(controller.get())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(released, expected, "end {end}");
+            let count = events.len() as u64;
+            assert_eq!(song_size(&project, Ticks(end)).0, count);
+            assert!(render_song(&project, Ticks(end), count).is_ok());
+            if count > 0 {
+                assert_eq!(
+                    render_song(&project, Ticks(end), count - 1),
+                    Err(SongTooLarge {
+                        events: count,
+                        limit: count - 1,
+                    }),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn song_pedal_cleanup_keeps_ports_and_channels_separate_and_ignores_mutes() {
+        let first = track(1, 960, vec![control(0, 64, 127)]);
+        let mut other_port = track(2, 960, vec![control(0, 64, 0), control(0, 66, 127)]);
+        other_port.target.port = PortId(1);
+        let mut other_channel = track(3, 960, vec![control(0, 64, 0), control(0, 66, 127)]);
+        other_channel.target.channel = Channel::from_number(3).unwrap();
+        let mut muted = track(4, 960, vec![control(0, 64, 0), control(0, 66, 127)]);
+        muted.muted = true;
+        let project = project(vec![first, other_port, other_channel, muted]);
+        let events = render_song(&project, Ticks(480), 10).unwrap();
+        let released: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.message {
+                MidiMessage::ControlChange {
+                    channel,
+                    controller,
+                    value,
+                } if event.tick == Ticks(480) => {
+                    assert_eq!(value, U7::MIN);
+                    Some((
+                        event.port.0,
+                        channel.number(),
+                        controller.get(),
+                        event.track,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released,
+            [
+                (0, 10, 64, Some(TrackId(1))),
+                (1, 10, 66, Some(TrackId(2))),
+                (0, 3, 66, Some(TrackId(3))),
+            ]
+        );
+    }
+
+    #[test]
     fn songs_are_counted_exactly_before_they_are_rendered() {
         let silent = ClipEvent {
             start: Ticks(240),
@@ -940,7 +1076,7 @@ mod tests {
         ] {
             let events = render_song(&project, Ticks(end), u64::MAX).unwrap();
             assert_eq!(
-                song_size(&project, Ticks(end)),
+                song_size(&project, Ticks(end)).0,
                 events.len() as u64,
                 "{end}"
             );
@@ -959,7 +1095,7 @@ mod tests {
             assert!(events.iter().all(|event| event.tick <= Ticks(end)));
         }
 
-        let size = song_size(&project, Ticks(2880));
+        let size = song_size(&project, Ticks(2880)).0;
         assert_eq!(
             render_song(&project, Ticks(2880), size - 1),
             Err(SongTooLarge {
