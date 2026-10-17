@@ -7,7 +7,8 @@
 //! or ramping from the point before. [`clip_with_controls`] turns those
 //! into changes, a ramp sending its value at most every [`RAMP_STEP`].
 //! [`controls_from_clip`] reads a clip's changes back as points that send
-//! the same.
+//! the same. Points work the same way for a note's key pressure, which
+//! `notes` writes and reads with a `Curve`.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
@@ -43,10 +44,11 @@ const MODE_MESSAGES: u8 = 120;
 /// The longest loop, in ticks.
 const MAX_LOOP: u64 = MAX_LOOP_BEATS as u64 * PPQN;
 
-/// How many ramp values reading a clip's controls back may work out before
-/// it settles for jumps. Clips that set_controls writes need far fewer; this
-/// bounds the work for any clip.
-const READ_BUDGET: u64 = 1 << 22;
+/// How many ramp values reading a clip's controls, or its notes' key
+/// pressure, back may work out before it settles for jumps. Clips that
+/// set_controls and set_notes write need far fewer; this bounds the work
+/// for any clip.
+pub(crate) const READ_BUDGET: u64 = 1 << 22;
 
 /// Controls that can't be set. The messages tell the agent how to fix the
 /// call.
@@ -139,16 +141,18 @@ pub enum ControlError {
     /// A repeat length out of range.
     #[error("repeat_beats must be more than 0 and at most {MAX_LOOP_BEATS}, not {0}")]
     RepeatBeats(f64),
-    /// A repeat longer than the loop.
+    /// A repeat longer than the loop or note it repeats through.
     #[error(
-        "repeat_beats is {repeat}, longer than the {loop_beats}-beat loop: shorten it, or {lengthen}"
+        "repeat_beats is {repeat}, longer than the {length}-beat {span}: shorten it, or {lengthen}"
     )]
-    RepeatPastLoop {
+    RepeatPastEnd {
         /// The repeat, in beats.
         repeat: f64,
-        /// The loop, in beats.
-        loop_beats: f64,
-        /// How to make the loop longer.
+        /// What it repeats through.
+        span: Span,
+        /// How long that is, in beats.
+        length: f64,
+        /// How to make it longer.
         lengthen: &'static str,
     },
     /// A ramp between points at the same time.
@@ -192,25 +196,58 @@ pub enum PointError {
         "it ramps, but it's the first point, with none before it to ramp from: drop its ramp, or add a point before it"
     )]
     RampFromNothing,
-    /// A point after the end of the loop or the repeat.
+    /// A point after the end of the loop, the repeat or the note.
     #[error(
         "it's at beat {at}, after the {span} ends at beat {end}: move it earlier, or {lengthen}"
     )]
     PastEnd {
         /// The point's time, in beats.
         at: f64,
-        /// "loop" or "repeat".
-        span: &'static str,
-        /// Where the loop or repeat ends, in beats.
+        /// What it plays through.
+        span: Span,
+        /// Where that ends, in beats.
         end: f64,
         /// How to make it longer.
         lengthen: &'static str,
     },
-    /// A jump at the end of the loop or the repeat, which sends nothing.
+    /// A jump at the end of the loop, the repeat or the note, which sends
+    /// nothing.
     #[error(
-        "it jumps at the end of the {0}, where the next pass starts again from the first point, so it sends nothing: give it a ramp to end on, or move it earlier"
+        "it jumps at the end of the {0}, where {ending}, so it sends nothing: give it a ramp to end on, or move it earlier",
+        ending = .0.ending()
     )]
-    JumpAtEnd(&'static str),
+    JumpAtEnd(Span),
+}
+
+/// What points play through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Span {
+    /// The track's loop.
+    Loop,
+    /// One pass of a repeat.
+    Repeat,
+    /// The note whose key pressure they are.
+    Note,
+}
+
+impl Span {
+    /// What comes at its end, where a point sends nothing.
+    const fn ending(self) -> &'static str {
+        match self {
+            Self::Loop | Self::Repeat => "the next pass starts again from the first point",
+            Self::Note => "the key comes up",
+        }
+    }
+}
+
+impl fmt::Display for Span {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Loop => "loop",
+            Self::Repeat => "repeat",
+            Self::Note => "note",
+        })
+    }
 }
 
 /// What a control sends.
@@ -226,7 +263,7 @@ pub enum Control {
 
 impl Control {
     /// The control a clip event sends, and its value as sent, unless it's a
-    /// note or a program change.
+    /// note, a note's key pressure or a program change.
     pub fn of(kind: EventKind) -> Option<(Self, u16)> {
         match kind {
             EventKind::Control { controller, value } => {
@@ -234,7 +271,9 @@ impl Control {
             }
             EventKind::Pressure { value } => Some((Self::Pressure, value.get().into())),
             EventKind::PitchBend { value } => Some((Self::PitchBend, value.get())),
-            EventKind::Note { .. } | EventKind::Program { .. } => None,
+            EventKind::Note { .. } | EventKind::NotePressure { .. } | EventKind::Program { .. } => {
+                None
+            }
         }
     }
 
@@ -314,16 +353,23 @@ pub struct Point {
     pub ramp: Option<Ramp>,
 }
 
-/// One control, checked: its points by time, and how often they repeat.
-struct Lane<'a> {
-    /// The control as written.
-    name: &'a str,
-    control: Control,
+/// Points checked on their own and put in order, with how often they
+/// repeat: how a control moves through a loop, or a note's key pressure
+/// through the note.
+pub(crate) struct Curve {
     /// Sorted by time; successive jumps on one tick keep their input order.
     points: Vec<Point>,
     /// Where each point was in the agent's list, counting from 1.
     positions: Vec<usize>,
     repeat: Option<Ticks>,
+}
+
+/// One control, checked.
+struct Lane<'a> {
+    /// The control as written.
+    name: &'a str,
+    control: Control,
+    curve: Curve,
 }
 
 /// The clip `clip` becomes with `controls` set, on a track whose device is
@@ -356,7 +402,15 @@ pub fn clip_with_controls(
                 control,
             });
         }
-        lanes.push(place(name, control, lane)?);
+        let curve = Curve::new(lane, control).map_err(|error| ControlsError::Control {
+            control: name.clone(),
+            error,
+        })?;
+        lanes.push(Lane {
+            name,
+            control,
+            curve,
+        });
     }
 
     let replaced = |event: &ClipEvent| {
@@ -383,11 +437,11 @@ pub fn clip_with_controls(
             }
             length
         }
-        None if !kept.is_empty() || lanes.iter().all(|lane| lane.points.is_empty()) => {
+        None if !kept.is_empty() || lanes.iter().all(|lane| lane.curve.points.is_empty()) => {
             clip.length()
         }
         None => {
-            let end = lanes.iter().map(Lane::end).max().unwrap_or(0);
+            let end = lanes.iter().map(|lane| lane.curve.end()).max().unwrap_or(0);
             let length = end.div_ceil(bar.0) * bar.0;
             if length > MAX_LOOP {
                 return Err(ControlsError::PastLongestLoop(beats(Ticks(length))));
@@ -401,7 +455,12 @@ pub fn clip_with_controls(
         "pass a longer loop_beats"
     };
     for lane in &lanes {
-        lane.check(length, lengthen)?;
+        lane.curve
+            .check(Span::Loop, length, lengthen)
+            .map_err(|error| ControlsError::Control {
+                control: lane.name.to_owned(),
+                error,
+            })?;
     }
 
     let mut events: Vec<(usize, ClipEvent)> = kept
@@ -427,7 +486,7 @@ pub fn clip_with_controls(
         }
     }
     for lane in &lanes {
-        lane.send(length, |tick, value| {
+        lane.curve.send(length, |tick, value| {
             changes += 1;
             if changes > MAX_CONTROL_CHANGES {
                 return Err(ControlsError::TooManyChanges);
@@ -457,13 +516,17 @@ pub fn clip_with_controls(
 
 /// `notes`, a track's new clip of notes, with the controls and program
 /// changes of its `old` clip that start within it, so that writing notes
-/// leaves the controls as they are.
+/// leaves the controls as they are. The old notes' key pressure goes with
+/// them.
 pub fn keep_controls(old: &Clip, notes: Clip) -> Result<Clip, ClipError> {
     let length = notes.length();
-    let kept = old
-        .events()
-        .iter()
-        .filter(|event| !matches!(event.kind, EventKind::Note { .. }) && event.start < length);
+    let kept = old.events().iter().filter(|event| {
+        let notes = matches!(
+            event.kind,
+            EventKind::Note { .. } | EventKind::NotePressure { .. }
+        );
+        !notes && event.start < length
+    });
     let events = notes.events().iter().chain(kept).copied().collect();
     Clip::new(length, events)
 }
@@ -560,82 +623,70 @@ fn resolve(name: &str, device: Option<&DeviceProfile>) -> Result<Control, Contro
     Ok(Control::Controller(controller))
 }
 
-/// Checks one control on its own, and puts its points in order.
-fn place<'a>(
-    name: &'a str,
-    control: Control,
-    lane: &ControlLane,
-) -> Result<Lane<'a>, ControlsError> {
-    let wrong = |error| ControlsError::Control {
-        control: name.to_owned(),
-        error,
-    };
-    if lane.points.len() > MAX_POINTS {
-        return Err(wrong(ControlError::TooManyPoints(lane.points.len())));
-    }
-    let repeat = lane
-        .repeat_beats
-        .map(|beats| {
-            ticks(beats)
-                .filter(|&repeat| repeat > Ticks::ZERO)
-                .ok_or(ControlError::RepeatBeats(beats))
-        })
-        .transpose()
-        .map_err(wrong)?;
-    let mut points = Vec::with_capacity(lane.points.len());
-    for (index, spec) in lane.points.iter().enumerate() {
-        let point = match (ticks(spec.at), control.sent(spec.value)) {
-            (None, _) => Err(PointError::At(spec.at)),
-            (_, None) => Err(PointError::Value {
-                value: spec.value,
-                range: control.range(),
-            }),
-            (Some(at), Some(value)) => Ok(Point {
-                at,
-                value,
-                ramp: spec.ramp,
-            }),
-        };
-        let point = point.map_err(|error| {
-            wrong(ControlError::Point {
+impl Curve {
+    /// Checks `lane`'s points on their own, as values of `control`, and puts
+    /// them in order.
+    pub(crate) fn new(lane: &ControlLane, control: Control) -> Result<Self, ControlError> {
+        if lane.points.len() > MAX_POINTS {
+            return Err(ControlError::TooManyPoints(lane.points.len()));
+        }
+        let repeat = lane
+            .repeat_beats
+            .map(|beats| {
+                ticks(beats)
+                    .filter(|&repeat| repeat > Ticks::ZERO)
+                    .ok_or(ControlError::RepeatBeats(beats))
+            })
+            .transpose()?;
+        let mut points = Vec::with_capacity(lane.points.len());
+        for (index, spec) in lane.points.iter().enumerate() {
+            let point = match (ticks(spec.at), control.sent(spec.value)) {
+                (None, _) => Err(PointError::At(spec.at)),
+                (_, None) => Err(PointError::Value {
+                    value: spec.value,
+                    range: control.range(),
+                }),
+                (Some(at), Some(value)) => Ok(Point {
+                    at,
+                    value,
+                    ramp: spec.ramp,
+                }),
+            };
+            let point = point.map_err(|error| ControlError::Point {
                 position: index + 1,
                 error,
-            })
-        })?;
-        points.push((index + 1, point));
-    }
-    points.sort_by_key(|&(position, point)| (point.at, position));
-    for pair in points.windows(2) {
-        let ((first, earlier), (second, later)) = (pair[0], pair[1]);
-        if earlier.at == later.at && later.ramp.is_some() {
-            return Err(wrong(ControlError::SameTime {
-                first,
-                second,
-                at: beats(earlier.at),
-            }));
+            })?;
+            points.push((index + 1, point));
         }
+        points.sort_by_key(|&(position, point)| (point.at, position));
+        for pair in points.windows(2) {
+            let ((first, earlier), (second, later)) = (pair[0], pair[1]);
+            if earlier.at == later.at && later.ramp.is_some() {
+                return Err(ControlError::SameTime {
+                    first,
+                    second,
+                    at: beats(earlier.at),
+                });
+            }
+        }
+        if let Some(&(position, first)) = points.first()
+            && first.ramp.is_some()
+        {
+            return Err(ControlError::Point {
+                position,
+                error: PointError::RampFromNothing,
+            });
+        }
+        let (positions, points) = points.into_iter().unzip();
+        Ok(Self {
+            points,
+            positions,
+            repeat,
+        })
     }
-    if let Some(&(position, first)) = points.first()
-        && first.ramp.is_some()
-    {
-        return Err(wrong(ControlError::Point {
-            position,
-            error: PointError::RampFromNothing,
-        }));
-    }
-    let (positions, points) = points.into_iter().unzip();
-    Ok(Lane {
-        name,
-        control,
-        points,
-        positions,
-        repeat,
-    })
-}
 
-impl Lane<'_> {
-    /// How long a loop must be to hold this control: its repeat, or until
-    /// its last point. A ramp may end on the loop's end, but a jump must
+    /// How long a loop must be to hold these points: their repeat, or until
+    /// the last point. A ramp may end on the loop's end, but a jump must
     /// come before it.
     fn end(&self) -> u64 {
         match (self.repeat, self.points.last()) {
@@ -646,23 +697,26 @@ impl Lane<'_> {
         }
     }
 
-    /// Checks that the points fit in their repeat, or else in a loop of
-    /// `length`, which `lengthen` says how to make longer.
-    fn check(&self, length: Ticks, lengthen: &'static str) -> Result<(), ControlsError> {
-        let wrong = |error| ControlsError::Control {
-            control: self.name.to_owned(),
-            error,
-        };
+    /// Checks that the points fit in their repeat, or else in the `span`
+    /// they play through, `length` long, which `lengthen` says how to make
+    /// longer.
+    pub(crate) fn check(
+        &self,
+        span: Span,
+        length: Ticks,
+        lengthen: &'static str,
+    ) -> Result<(), ControlError> {
         let (end, span, lengthen) = match self.repeat {
             Some(repeat) if repeat > length => {
-                return Err(wrong(ControlError::RepeatPastLoop {
+                return Err(ControlError::RepeatPastEnd {
                     repeat: beats(repeat),
-                    loop_beats: beats(length),
+                    span,
+                    length: beats(length),
                     lengthen,
-                }));
+                });
             }
-            Some(repeat) => (repeat, "repeat", "make repeat_beats longer"),
-            None => (length, "loop", lengthen),
+            Some(repeat) => (repeat, Span::Repeat, "make repeat_beats longer"),
+            None => (length, span, lengthen),
         };
         for (&position, point) in self.positions.iter().zip(&self.points) {
             let error = if point.at > end {
@@ -677,17 +731,17 @@ impl Lane<'_> {
             } else {
                 continue;
             };
-            return Err(wrong(ControlError::Point { position, error }));
+            return Err(ControlError::Point { position, error });
         }
         Ok(())
     }
 
-    /// Sends the control's changes through a loop of `length`, in time
-    /// order: each pass of the repeat sends its points, and between them
-    /// the values of the ramps. A point at the end of a pass sends nothing,
-    /// since the next pass starts there, and the loop's end cuts off the
-    /// last pass.
-    fn send<E>(
+    /// Sends the changes through a span of `length`, such as the loop, in
+    /// time order: each pass of the repeat sends its points, and between
+    /// them the values of the ramps. A point at the end of a pass sends
+    /// nothing, since the next pass starts there, and the span's end cuts
+    /// off the last pass.
+    pub(crate) fn send<E>(
         &self,
         length: Ticks,
         mut send: impl FnMut(u64, u16) -> Result<(), E>,
@@ -787,12 +841,12 @@ fn value_at(ramp: Ramp, (start, from): (u64, u16), (end, to): (u64, u16), tick: 
 }
 
 /// Points that send `changes`, the changes one control makes through a
-/// loop `length` long, in time order, its values at most `max`. Starting
-/// from the first change, each point reaches as far as one ramp can: to the
-/// last change a linear or smooth ramp sends exactly the changes up to, or
-/// failing that, a jump to the next change. Working out ramps spends
-/// `budget`.
-fn read(changes: &[(u64, u16)], length: u64, max: u16, budget: &mut u64) -> Vec<Point> {
+/// loop `length` long, or a note's key pressure through the note, in time
+/// order, its values at most `max`. Starting from the first change, each
+/// point reaches as far as one ramp can: to the last change a linear or
+/// smooth ramp sends exactly the changes up to, or failing that, a jump to
+/// the next change. Working out ramps spends `budget`.
+pub(crate) fn read(changes: &[(u64, u16)], length: u64, max: u16, budget: &mut u64) -> Vec<Point> {
     let point = |(tick, value): (u64, u16), ramp| Point {
         at: Ticks(tick),
         value,
@@ -918,6 +972,7 @@ mod tests {
     use std::path::Path;
 
     use treason_core::midi::Channel;
+    use treason_core::model::DEFAULT_RELEASE;
     use treason_core::time::TimeSignature;
     use treason_devices::{DeviceRegistry, Param};
 
@@ -999,6 +1054,7 @@ mod tests {
                 note: U7::new(48).unwrap(),
                 velocity: U7::new(100).unwrap(),
                 length: Ticks(length),
+                release: DEFAULT_RELEASE,
             },
         }
     }
@@ -1394,6 +1450,38 @@ mod tests {
         assert_eq!(changes(&clip, 1), [(960, 5)]);
         let starts: Vec<u64> = clip.events().iter().map(|event| event.start.0).collect();
         assert_eq!(starts, [480, 960], "the old note is gone");
+    }
+
+    #[test]
+    fn key_pressure_stays_with_its_notes() {
+        let key = |start, value| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::NotePressure {
+                note: U7::new(48).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        };
+        let keys = |clip: &Clip| -> Vec<(u64, u8)> {
+            clip.events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    EventKind::NotePressure { value, .. } => Some((event.start.0, value.get())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let pressed = Clip::new(BAR, vec![note(0, 960), key(0, 10), key(480, 90)]).unwrap();
+        // The channel's pressure is a control; the keys' aren't.
+        let channel = vec![("pressure", lane(vec![at(0.0, 5, None)], None))];
+        let controlled = set(&pressed, channel, None, None).unwrap();
+        assert_eq!(keys(&controlled), [(0, 10), (480, 90)]);
+        let controls: Vec<Control> = controls_from_clip(&controlled).into_keys().collect();
+        assert_eq!(controls, [Control::Pressure]);
+        // New notes bring their own.
+        let notes = Clip::new(BAR, vec![note(0, 240)]).unwrap();
+        let rewritten = keep_controls(&controlled, notes).unwrap();
+        assert_eq!(keys(&rewritten), []);
+        assert_eq!(controls_from_clip(&rewritten).len(), 1);
     }
 
     #[test]

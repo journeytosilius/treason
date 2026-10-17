@@ -58,7 +58,7 @@ gear: see [Ports and gear](#ports-and-gear).
   device's names, and set a program, the sound its channel plays, and a
   bend range. It can be muted.
 - **A loop** holds notes, control changes (MIDI CC), pitch bend and
-  pressure, and repeats until `stop`. Each track's loop has its own length, `loop_beats`. Loops count
+  pressure, on the channel or on each note's key, and repeats until `stop`. Each track's loop has its own length, `loop_beats`. Loops count
   from the start of bar 1, so a two-bar loop plays its first bar on bars 1,
   3, 5 and so on, even if you set it during bar 4. Loops of different
   lengths give polymeter: a 3-beat loop against a 4-beat one lines up again
@@ -137,7 +137,9 @@ reads back as a number, so writing it back keeps the note.
 `set_steps` writes a track's notes as one step string per voice:
 
 - `x` is a hit at velocity 100, `X` an accent at 127, and `.` or `-` a rest.
-  Spaces and `|` are ignored, so `"x... x... | x... x..."` is fine.
+  `1` to `9` are hits from soft to hard, at velocities 14, 28, 42, 56, 71,
+  85, 99, 113 and 127, so `2` or `3` make ghost notes. Spaces and `|` are
+  ignored, so `"x... x... | x... x..."` is fine.
 - Each hit lasts one step. `steps_per_beat` sets the step: 4, the default,
   makes sixteenths, 2 eighths, 3 eighth-note triplets and 6 sixteenth-note
   triplets. It takes 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32.
@@ -146,16 +148,16 @@ reads back as a number, so writing it back keeps the note.
 - Keys are the device's voices or aliases, or MIDI note numbers. A track
   without a device takes only numbers. Pitch names such as `C4` need
   `set_notes`.
-- It replaces all the track's notes, and keeps its controls. Velocities
-  other than 100 and 127 need `set_notes`.
+- It replaces all the track's notes, and keeps its controls. Other
+  velocities, a release velocity and key pressure need `set_notes`.
 
-A two-bar groove: a crash on the one, with a bar of kick and snare and a
-beat of hats repeating inside it:
+A two-bar groove: a crash on the one, with a bar of kick and snare, ghost
+notes between the backbeats, and a beat of hats repeating inside it:
 
 ```mcp
 set_steps {"track": 1, "steps": {
   "kick":       "X..x..x...X..x..",
-  "snare":      "....X.......X..x",
+  "snare":      "....X..2.3..X..x",
   "closed_hat": "x.x.",
   "crash":      "X..............................."
 }}
@@ -171,7 +173,9 @@ set_steps {"track": 3, "steps": {"maracas": "x.xx.xx.xx.x"}, "steps_per_beat": 3
 ```
 
 `get_project` shows a loop as steps, with a space between beats, when
-every note is one step long, on a step, at velocity 100 or 127.
+every note is one step long, on a step, at a velocity a step writes, with
+no release velocity or key pressure of its own. A velocity of 127 reads
+back as `X`.
 
 ## Melodies, basslines and chords: set_notes
 
@@ -185,8 +189,14 @@ name or number, as above), a `start` and a `length` in beats, and a
   last note, rounded up to a whole bar. Every note must start inside the
   loop, and none may be longer than it. A note may run past the loop's end
   into the next pass.
+- A note can also give a `release`, 0-127: how fast its key comes up,
+  sent with its note-off, for gear that shapes the release by it. It is
+  64, MIDI's default, if left out.
+- A note can press its key as it sounds, with `pressure`: see
+  [Pitch bend and pressure](#pitch-bend-and-pressure).
 - A call holds at most 1024 notes.
-- It replaces all the track's notes, and keeps its controls.
+- It replaces all the track's notes, with their pressure, and keeps its
+  controls.
 
 Four bars of chords, C minor, A flat, B flat, G:
 
@@ -351,6 +361,19 @@ any control.
   removing or moving a track that left them off rest, or giving it a loop
   without them.
 
+Each note can press its own key too, with `pressure` in `set_notes`:
+polyphonic aftertouch, which gear that reads it applies to that note
+alone, so each note of a chord can swell on its own. Gear that doesn't
+read it ignores it.
+
+- It takes points, ramps and a repeat like a control, from 0 to 127, but
+  timed in beats from the note's start, and no later than its end. A ramp
+  can end at the note's end, where the key comes up and nothing is sent.
+- A note that runs past the loop's end takes its pressure into the next
+  pass.
+- A key's pressure acts on its note, so the note-off ends it: nothing
+  else puts it back at rest.
+
 The bass's last note sliding up an octave into each bar, and pressure
 swelling through each chord on the keys:
 
@@ -366,6 +389,26 @@ set_controls {"track": 4, "controls": {"pressure": {"points": [
   {"at": 3, "value": 100, "ramp": "linear"},
   {"at": 3.5, "value": 0, "ramp": "smooth"}
 ], "repeat_beats": 4}}}
+```
+
+A two-bar pad chord on keys of its own: the root comes up slowly, the
+fifth swells and fades, and the top note, two beats late, pulses once a
+beat:
+
+```mcp
+set_notes {"track": 6, "notes": [
+  {"note": "C3", "start": 0, "length": 8, "release": 20},
+  {"note": "G3", "start": 0, "length": 8, "pressure": {"points": [
+    {"at": 0, "value": 0},
+    {"at": 4, "value": 110, "ramp": "smooth"},
+    {"at": 8, "value": 0, "ramp": "smooth"}
+  ]}},
+  {"note": "Eb4", "start": 2, "length": 6, "pressure": {"points": [
+    {"at": 0, "value": 0},
+    {"at": 0.5, "value": 80, "ramp": "smooth"},
+    {"at": 1, "value": 0, "ramp": "smooth"}
+  ], "repeat_beats": 1}}
+]}
 ```
 
 ## Tracks
@@ -438,7 +481,8 @@ get_project {}
 `get_project` shows the tempo, the time signature and every track: its
 id, name, port, channel, device, program, bend range, mute, `loop_beats`, how many
 events its loop holds, and its notes, as steps (`pattern`) or as a list
-(`notes`), and its `controls`, each in the form the matching tool takes. A
+(`notes`, with each note's `release` and `pressure` where it has them),
+and its `controls`, each in the form the matching tool takes. A
 program reads back by the device's name for it, else as a number with its
 bank. Every tool
 that changes a track returns it in the same form, as it will play.
@@ -488,7 +532,8 @@ load_project {"name": "first groove"}
 | Steps in a step string | 1024 |
 | Points in a control | 8192 |
 | Control changes, bends and pressure changes in a loop | 8192 |
-| Control and `pressure` values | 0-127 |
+| Key pressure changes in a loop, all notes together | 8192 |
+| Control, `pressure` and `release` values | 0-127 |
 | `pitch_bend` values | -8192 to 8191, 0 the centre |
 | Program, `bank_msb`, `bank_lsb`, `bend_range` | 0-127 each |
 | Undo history | 256 edits |
@@ -644,8 +689,7 @@ by name, its program and bend range, and its events one to a line, with times in
 
 - Make sound: it only sends MIDI.
 - Record or follow MIDI input, or an external clock.
-- Change programs within a loop, or send poly aftertouch, release
-  velocity, NRPN or SysEx from the tools.
+- Change programs within a loop, or send NRPN or SysEx from the tools.
 - Probability, ratchets or conditional steps.
 - Arrange a song: every track loops. Change sections by editing tracks
   while playing, or by muting and unmuting them.

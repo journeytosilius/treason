@@ -16,7 +16,8 @@ use thiserror::Error;
 use toml::ser::ValueSerializer;
 use treason_core::midi::{Channel, U7, U14};
 use treason_core::model::{
-    Clip, ClipError, ClipEvent, EventKind, OutputTarget, PortId, Program, Project, Track, TrackId,
+    Clip, ClipError, ClipEvent, DEFAULT_RELEASE, EventKind, OutputTarget, PortId, Program, Project,
+    Track, TrackId,
 };
 use treason_core::time::{Bpm, ParseTimeSignatureError, Ticks};
 use treason_devices::DeviceRegistry;
@@ -136,6 +137,12 @@ enum EventFile {
         note: U7,
         velocity: U7,
         length: Ticks,
+        /// Left out when it's MIDI's default.
+        #[serde(
+            default = "default_release",
+            skip_serializing_if = "is_default_release"
+        )]
+        release: U7,
     },
     Control {
         start: Ticks,
@@ -154,6 +161,19 @@ enum EventFile {
         start: Ticks,
         value: U7,
     },
+    NotePressure {
+        start: Ticks,
+        note: U7,
+        value: U7,
+    },
+}
+
+const fn default_release() -> U7 {
+    DEFAULT_RELEASE
+}
+
+fn is_default_release(release: &U7) -> bool {
+    *release == DEFAULT_RELEASE
 }
 
 /// Pitch bend as files write it: from -8192 to 8191, with 0 at rest, as
@@ -189,11 +209,13 @@ impl From<&ClipEvent> for EventFile {
                 note,
                 velocity,
                 length,
+                release,
             } => Self::Note {
                 start,
                 note,
                 velocity,
                 length,
+                release,
             },
             EventKind::Control { controller, value } => Self::Control {
                 start,
@@ -206,6 +228,7 @@ impl From<&ClipEvent> for EventFile {
                 value: Bend(value),
             },
             EventKind::Pressure { value } => Self::Pressure { start, value },
+            EventKind::NotePressure { note, value } => Self::NotePressure { start, note, value },
         }
     }
 }
@@ -218,12 +241,14 @@ impl From<EventFile> for ClipEvent {
                 note,
                 velocity,
                 length,
+                release,
             } => Self {
                 start,
                 kind: EventKind::Note {
                     note,
                     velocity,
                     length,
+                    release,
                 },
             },
             EventFile::Control {
@@ -248,6 +273,10 @@ impl From<EventFile> for ClipEvent {
             EventFile::Pressure { start, value } => Self {
                 start,
                 kind: EventKind::Pressure { value },
+            },
+            EventFile::NotePressure { start, note, value } => Self {
+                start,
+                kind: EventKind::NotePressure { note, value },
             },
         }
     }
@@ -428,6 +457,40 @@ mod tests {
                 note: u7(note),
                 velocity: u7(velocity),
                 length: Ticks(length),
+                release: DEFAULT_RELEASE,
+            },
+        }
+    }
+
+    /// `event`, a note, coming up at `release`.
+    fn released(event: ClipEvent, release: u8) -> ClipEvent {
+        let EventKind::Note {
+            note,
+            velocity,
+            length,
+            ..
+        } = event.kind
+        else {
+            panic!("not a note: {event:?}");
+        };
+        let release = u7(release);
+        ClipEvent {
+            kind: EventKind::Note {
+                note,
+                velocity,
+                length,
+                release,
+            },
+            ..event
+        }
+    }
+
+    fn key(start: u64, note: u8, value: u8) -> ClipEvent {
+        ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::NotePressure {
+                note: u7(note),
+                value: u7(value),
             },
         }
     }
@@ -509,7 +572,7 @@ mod tests {
             0,
             vec![
                 note(0, 36, 127, 240),
-                note(960, 38, 100, 240),
+                released(note(960, 38, 100, 240), 0),
                 note(0, 42, 64, 120),
             ],
         );
@@ -527,7 +590,10 @@ mod tests {
                 control(0, 101, 0),
                 control(0, 100, 0),
                 control(0, 6, 12),
-                note(3600, 33, 90, 480),
+                released(note(3600, 33, 90, 480), 127),
+                // Key pressure through it, into the next pass.
+                key(3600, 33, 50),
+                key(120, 33, 0),
                 // Bends at both extremes and at rest, and pressure.
                 bend(0, 0),
                 bend(480, 16383),
@@ -585,6 +651,8 @@ mod tests {
             0,
             vec![
                 note(0, 36, 100, 240),
+                released(note(240, 38, 90, 240), 30),
+                key(240, 38, 80),
                 control(480, 74, 64),
                 bend(480, 4096),
                 pressure(720, 90),
@@ -628,6 +696,8 @@ muted = false
 loop_length = 3840
 events = [
     { type = "note", start = 0, note = 36, velocity = 100, length = 240 },
+    { type = "note", start = 240, note = 38, velocity = 90, length = 240, release = 30 },
+    { type = "note_pressure", start = 240, note = 38, value = 80 },
     { type = "control", start = 480, controller = 74, value = 64 },
     { type = "pitch_bend", start = 480, value = -4096 },
     { type = "pressure", start = 720, value = 90 },
@@ -804,6 +874,25 @@ events = []
             (
                 file("", "", &note.replace("velocity = 100, ", "")),
                 "missing field `velocity`",
+            ),
+            (
+                file(
+                    "",
+                    "",
+                    &note.replace("length = 240", "length = 240, release = 128"),
+                ),
+                "128",
+            ),
+            (
+                file(
+                    "",
+                    "",
+                    &format!(
+                        "{note},\n    {}",
+                        r#"{ type = "note_pressure", start = 240, note = 36, value = 1 }"#
+                    ),
+                ),
+                "track 1: the pressure on note 36 at 240 ticks comes while no note of that key sounds",
             ),
             (
                 file("", "", &note.replace("type = \"note\"", "type = \"bend\"")),

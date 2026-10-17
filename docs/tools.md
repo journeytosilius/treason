@@ -27,7 +27,7 @@ explains how the tools fit together, with examples.
 | [`set_controls`](#set_controls) | Sets how a track moves its synth's controls, such as the mod wheel or a filter's cutoff, by sending MIDI control changes (CC) through the loop, and how it bends pitch (pitch_bend) and presses on the keys (pressure, channel aftertouch). |
 | [`set_muted`](#set_muted) | Mutes or unmutes a track, at the next bar while playing. |
 | [`set_notes`](#set_notes) | Replaces a track's notes, for basslines, chords and melodies. |
-| [`set_steps`](#set_steps) | Replaces a track's notes with a step pattern: one step string per voice, the usual way to write drums. |
+| [`set_steps`](#set_steps) | Replaces a track's notes with a step pattern: one step string per voice, the usual way to write drums, with digits for ghost notes and other velocities. |
 | [`set_tempo`](#set_tempo) | Sets the tempo. |
 | [`set_time_signature`](#set_time_signature) | Sets the time signature, and with it the bar length. |
 | [`status`](#status) | Shows whether the sequencer is playing, where, and how fast, and the project's name and whether it has unsaved changes. |
@@ -251,7 +251,7 @@ Returns text.
 
 ## set_notes
 
-Replaces a track's notes, for basslines, chords and melodies. Name each note by pitch, such as "C4" (middle C), "F#2" or "Bb3", by MIDI note number, or by a voice of the track's device, and time it in beats from the start of the loop. For example, a bass figure: {"track": 2, "notes": [{"note": "C2", "start": 0, "length": 0.5}, {"note": "Eb2", "start": 1.5, "length": 0.5}]}. The track's controls stay where they are, cut off by a shorter loop; to fill a longer one, set them again with set_controls. While playing, the new clip starts at the next bar. Returns the track as it will play: as step strings if the notes fit a step grid, otherwise as notes.
+Replaces a track's notes, for basslines, chords and melodies. Name each note by pitch, such as "C4" (middle C), "F#2" or "Bb3", by MIDI note number, or by a voice of the track's device, and time it in beats from the start of the loop. For example, a bass figure: {"track": 2, "notes": [{"note": "C2", "start": 0, "length": 0.5}, {"note": "Eb2", "start": 1.5, "length": 0.5}]}. A note can also give its release velocity, and its key's pressure (polyphonic aftertouch) as points through the note, as set_controls takes them. The track's controls stay where they are, cut off by a shorter loop; to fill a longer one, set them again with set_controls. While playing, the new clip starts at the next bar. Returns the track as it will play: as step strings if the notes fit a step grid, otherwise as notes.
 
 Input:
 
@@ -265,13 +265,13 @@ Returns [`TrackView`](#trackview).
 
 ## set_steps
 
-Replaces a track's notes with a step pattern: one step string per voice, the usual way to write drums. The track's controls stay where they are, cut off by a shorter loop; to fill a longer one, set them again with set_controls. While playing, the new pattern starts at the next bar. Returns the track with its pattern as it will play.
+Replaces a track's notes with a step pattern: one step string per voice, the usual way to write drums, with digits for ghost notes and other velocities. The track's controls stay where they are, cut off by a shorter loop; to fill a longer one, set them again with set_controls. While playing, the new pattern starts at the next bar. Returns the track with its pattern as it will play.
 
 Input:
 
 | Field | Type | Description |
 |---|---|---|
-| `steps` | map of names to string | One step string per voice, keyed by the device's voice names (or their aliases) or by MIDI note number. Each character is a step: "x" a hit, "X" an accent, "." or "-" a rest. Spaces and "\|" are ignored. Example: {"kick": "x...x...x...x...", "snare": "....x.......x...", "closed_hat": "..x...x...x...x."}. The loop is as long as the longest string. A shorter one repeats to fill it, so {"closed_hat": "..x."} plays an off-beat hat in every beat; its length must divide the loop's. |
+| `steps` | map of names to string | One step string per voice, keyed by the device's voice names (or their aliases) or by MIDI note number. Each character is a step: "x" a hit (velocity 100), "X" an accent (127), "1" to "9" a hit from soft to hard (velocity 14, 28, 42, 56, 71, 85, 99, 113 and 127), such as "2" for a ghost note, and "." or "-" a rest. Spaces and "\|" are ignored. Example: {"kick": "x...x...x...x...", "snare": "....x.......x...", "closed_hat": "..x...x...x...x."}. The loop is as long as the longest string. A shorter one repeats to fill it, so {"closed_hat": "..x."} plays an off-beat hat in every beat; its length must divide the loop's. |
 | `track` | integer | The track's id. |
 | `steps_per_beat` | integer, optional | Steps per beat (a quarter note): 1, 2, 3, 4, 6, 8, 12, 16, 24 or 32. Defaults to 4, so each step is a sixteenth note; 3 gives eighth-note triplets. |
 
@@ -343,30 +343,30 @@ The types that the tools above take and return.
 
 ### ControlLane
 
-How one control moves through the loop.
+How one control moves through the loop, or a note's pressure through the note.
 
 | Field | Type | Description |
 |---|---|---|
-| `points` | list of [`ControlPoint`](#controlpoint) | The control's values, in any order, at most 8192. An empty list removes the control. Successive jumps at the same time are sent in their list order, including repeated values. |
-| `repeat_beats` | number, optional | Repeat the points every this many beats through the loop, such as 1 for an LFO that cycles once a beat. Defaults to the whole loop. A repeat that doesn't divide the loop starts again with it. |
+| `points` | list of [`ControlPoint`](#controlpoint) | The values, in any order, at most 8192. An empty list removes the control. Successive jumps at the same time are sent in their list order, including repeated values. |
+| `repeat_beats` | number, optional | Repeat the points every this many beats through the loop, or the note, such as 1 for an LFO that cycles once a beat. Defaults to the whole loop or note. A repeat that doesn't divide it starts again with it. |
 
 ### ControlPoint
 
-A control's value at a point in the loop.
+A control's value at a point in the loop, or a note's pressure at a point in the note.
 
 | Field | Type | Description |
 |---|---|---|
-| `at` | number | When, in beats from the start of the loop, or of each repeat: 0 is the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of a beat. A ramp can end at the end of the loop or repeat, which is where the next pass starts again from the first point. |
+| `at` | number | When, in beats from the start of the loop, or of the note, or of each repeat: 0 is the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of a beat. A ramp can end at the end of the loop, repeat or note, where it sends nothing: the next pass starts again from the first point there, or the key comes up. |
 | `value` | integer | The value, 0-127. For pitch_bend, -8192 to 8191: 0 is the centre, 8191 bends up by the track's bend_range and -8192 down by it, so with a range of 2, a whole tone up is 8191 and a semitone 4096. |
 | `ramp` | [`Ramp`](#ramp), optional | How the value gets here from the point before: "linear" ramps evenly, and "smooth" eases out and in, so smooth ramps between a low and a high make a sine wave. Without it, the value jumps here. The first point can't ramp, since nothing comes before it. A ramp must end later than the point before; same-time points must jump. |
 
 ### ControlView
 
-One control of a loop, as points in the form set_controls takes.
+One control of a loop, or a note's pressure, as points in the form set_controls and set_notes take.
 
 | Field | Type | Description |
 |---|---|---|
-| `points` | list of [`PointView`](#pointview) | The control's values, by time. Written back with set_controls and the track's loop_beats, they play the same, though they may not be the points first written: a repeat reads back as every pass of it. |
+| `points` | list of [`PointView`](#pointview) | The values, by time. Written back with set_controls and the track's loop_beats, or for a note's pressure with set_notes, they play the same, though they may not be the points first written: a repeat reads back as every pass of it. |
 
 ### DeviceView
 
@@ -401,6 +401,8 @@ One note.
 | `length` | number | How long it lasts, in beats: 1 is a quarter note in 4/4, 0.5 an eighth. |
 | `note` | [`NoteRef`](#noteref) | Which note. |
 | `start` | number | When it starts, in beats from the start of the loop: 0 is the first beat, 1.5 the offbeat after the second. Rounds to 1/960 of a beat. |
+| `pressure` | [`ControlLane`](#controllane), optional | How hard the key is pressed while the note sounds: polyphonic aftertouch, 0-127, which only this note's key gets. Points as set_controls takes them, with at in beats from the note's start, at most the note's length: a ramp can end at the end of the note, where the key comes up and nothing more is sent. A note that runs past the end of the loop takes its pressure into the next pass. Example: a swell over a two-beat note, {"points": [{"at": 0, "value": 0}, {"at": 2, "value": 100, "ramp": "smooth"}]}. |
+| `release` | integer, optional | How fast the key comes up, 0-127, sent with the note-off for gear that shapes the release by it. Defaults to 64, MIDI's default for gear that can't sense it. |
 | `velocity` | integer, optional | How hard, 1-127. Defaults to 100. |
 
 ### NoteView
@@ -413,6 +415,8 @@ One note of a loop.
 | `note` | string | The device's voice for the note if it has one, otherwise its pitch, such as "C4". A decimal MIDI number if the pitch name would resolve to a different device voice or alias. |
 | `start` | number | When it starts, in beats from the start of the loop. |
 | `velocity` | integer | How hard, 1-127. |
+| `pressure` | [`ControlView`](#controlview), optional | How hard the key is pressed while the note sounds, as points timed from its start. Missing when it sends no pressure. |
+| `release` | integer, optional | How fast the key comes up, 0-127. Missing when it's MIDI's default, 64. |
 
 ### PatternView
 
@@ -420,16 +424,16 @@ A loop written as step strings.
 
 | Field | Type | Description |
 |---|---|---|
-| `steps` | map of names to string | One step string per voice, with a space between beats: "x" a hit, "X" an accent, "." a rest. |
+| `steps` | map of names to string | One step string per voice, with a space between beats: "x" a hit, "X" an accent, "1" to "9" a hit from soft to hard, "." a rest. |
 | `steps_per_beat` | integer | Steps per beat, as in set_steps. |
 
 ### PointView
 
-A control's value at a point in the loop.
+A control's value at a point in the loop, or a note's pressure at a point in the note.
 
 | Field | Type | Description |
 |---|---|---|
-| `at` | number | When, in beats from the start of the loop. |
+| `at` | number | When, in beats from the start of the loop, or of the note for its pressure. |
 | `value` | integer | The value: 0-127, or for pitch_bend, -8192 to 8191 around the centre at 0. |
 | `ramp` | [`Ramp`](#ramp), optional | How the value gets here from the point before. Missing where it jumps. |
 
@@ -480,5 +484,5 @@ A track.
 | `controls` | map of names to [`ControlView`](#controlview), optional | The loop's controls (MIDI CC), pitch bend and pressure in the form set_controls takes, by name. Missing when it sends none. |
 | `device` | string, optional | The device profile that names its voices and parameters, if any. |
 | `notes` | list of [`NoteView`](#noteview), optional | The loop's notes in the form set_notes takes, by start. Shown for clips that aren't step patterns, such as melodies. |
-| `pattern` | [`PatternView`](#patternview), optional | The loop's notes as step strings, in the form set_steps takes. Shown when every note sits on a step grid at set_steps' velocities; missing for other clips, such as melodies. |
+| `pattern` | [`PatternView`](#patternview), optional | The loop's notes as step strings, in the form set_steps takes. Shown when every note sits on a step grid at set_steps' velocities, with no release or pressure of its own; missing for other clips, such as melodies. |
 | `program` | [`ProgramRef`](#programref), optional | The sound its channel is set to: the device's name for the program, or its number. Missing when the track sets none. |

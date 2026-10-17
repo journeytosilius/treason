@@ -12,15 +12,19 @@ pub enum Step {
     Hit,
     /// `X`: an accented hit.
     Accent,
+    /// `1` to `9`: a hit at that level, from ghost notes at `1` to as hard
+    /// as an accent at `9`.
+    Level(u8),
 }
 
 impl Step {
     /// The character that writes this step.
-    pub const fn symbol(self) -> char {
+    pub fn symbol(self) -> char {
         match self {
             Self::Rest => '.',
             Self::Hit => 'x',
             Self::Accent => 'X',
+            Self::Level(level) => char::from(b'0' + level.clamp(1, 9)),
         }
     }
 }
@@ -30,7 +34,7 @@ impl Step {
 pub enum NotationError {
     /// A character that isn't a step.
     #[error(
-        "unexpected `{found}` at step {position}: use `x` for a hit, `X` for an accent and `.` for a rest"
+        "unexpected `{found}` at step {position}: use `x` for a hit, `X` for an accent, `1` (softest) to `9` (hardest) for other velocities and `.` for a rest"
     )]
     UnexpectedStep {
         /// The character.
@@ -54,14 +58,16 @@ const PITCH_CLASSES: [&str; 12] = [
 ];
 
 /// Parses a step string such as `"x...x...x..x.x.."`: `x` is a hit, `X` an
-/// accent, and `.` or `-` a rest. Whitespace and `|` are ignored, so steps
-/// can be grouped: `"x... x... | x..x .x.."`.
+/// accent, `1` to `9` a hit at that level, and `.` or `-` a rest.
+/// Whitespace and `|` are ignored, so steps can be grouped: `"x... x2.. |
+/// x..x .x.."`.
 pub fn parse_steps(steps: &str) -> Result<Vec<Step>, NotationError> {
     let mut parsed = Vec::with_capacity(steps.len());
     for found in steps.chars() {
         let step = match found {
             'x' => Step::Hit,
             'X' => Step::Accent,
+            '1'..='9' => Step::Level(u8::try_from(found).map_or(0, |digit| digit - b'0')),
             '.' | '-' => Step::Rest,
             '|' => continue,
             _ if found.is_whitespace() => continue,
@@ -142,7 +148,7 @@ pub fn format_pitch(note: U7) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Step::{Accent, Hit, Rest};
+    use super::Step::{Accent, Hit, Level, Rest};
     use super::*;
 
     #[test]
@@ -164,8 +170,29 @@ mod tests {
                 position: 4
             })
         );
-        let message = parse_steps("x1").unwrap_err().to_string();
-        assert!(message.contains("`1` at step 2"), "{message}");
+        let message = parse_steps("x0").unwrap_err().to_string();
+        assert!(message.contains("`0` at step 2"), "{message}");
+        assert!(
+            message.contains("`1` (softest) to `9` (hardest)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn digits_are_hits_from_soft_to_hard() {
+        let steps = parse_steps("1.5 9").unwrap();
+        assert_eq!(steps, [Level(1), Rest, Level(5), Level(9)]);
+        assert_eq!(format_steps(&steps, 2), "1. 59");
+        // Zero, and a digit that isn't ASCII.
+        for found in ["0", "٣"] {
+            assert!(
+                matches!(
+                    parse_steps(found),
+                    Err(NotationError::UnexpectedStep { position: 1, .. })
+                ),
+                "{found}"
+            );
+        }
     }
 
     #[test]

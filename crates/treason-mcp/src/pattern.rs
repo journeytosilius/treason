@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 use treason_core::midi::U7;
-use treason_core::model::{Clip, ClipError, ClipEvent, EventKind};
+use treason_core::model::{Clip, ClipError, ClipEvent, DEFAULT_RELEASE, EventKind};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::DeviceProfile;
 
@@ -30,6 +30,10 @@ pub const HIT_VELOCITY: U7 = U7::saturating(100);
 
 /// The velocity of `X`.
 pub const ACCENT_VELOCITY: U7 = U7::MAX;
+
+/// The velocities of `1` to `9`: that many ninths of the most, rounded, so
+/// `9` is as hard as `X`.
+pub const LEVEL_VELOCITIES: [u8; 9] = [14, 28, 42, 56, 71, 85, 99, 113, 127];
 
 /// A clip written as step strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,10 +167,13 @@ pub fn clip_from_steps(
             });
         }
         for (index, current) in parsed.iter().cycle().take(loop_steps).enumerate() {
-            let velocity = match current {
+            let velocity = match *current {
                 Step::Rest => continue,
                 Step::Hit => HIT_VELOCITY,
                 Step::Accent => ACCENT_VELOCITY,
+                Step::Level(level) => {
+                    U7::saturating(LEVEL_VELOCITIES[usize::from(level.clamp(1, 9) - 1)])
+                }
             };
             events.push(ClipEvent {
                 start: Ticks(index as u64 * step),
@@ -174,6 +181,7 @@ pub fn clip_from_steps(
                     note: *note,
                     velocity,
                     length: Ticks(step),
+                    release: DEFAULT_RELEASE,
                 },
             });
         }
@@ -182,22 +190,26 @@ pub fn clip_from_steps(
 }
 
 /// A clip's notes as step strings, if they fit a step grid: every note one
-/// step long and starting on a step, at the velocity of `x` or `X`, with a
-/// step size on offer. Notes go by their voice name in `device` where it has
-/// one, and by number otherwise. Other events, such as control changes,
-/// don't count, and a clip without notes has no pattern.
+/// step long and starting on a step, at the velocity of `x`, `X` or a digit,
+/// with the default release and no key pressure, and with a step size on
+/// offer. Notes go by their voice name in `device` where it has one, and by
+/// number otherwise. Other events, such as control changes, don't count,
+/// and a clip without notes has no pattern.
 pub fn steps_from_clip(clip: &Clip, device: Option<&DeviceProfile>) -> Option<StepPattern> {
     let mut step = None;
     let mut hits = Vec::with_capacity(clip.events().len());
     for event in clip.events() {
-        // Only notes make up the pattern.
-        let EventKind::Note {
-            note,
-            velocity,
-            length,
-        } = event.kind
-        else {
-            continue;
+        let (note, velocity, length) = match event.kind {
+            EventKind::Note {
+                note,
+                velocity,
+                length,
+                release: DEFAULT_RELEASE,
+            } => (note, velocity, length),
+            // A step string has no way to write these.
+            EventKind::Note { .. } | EventKind::NotePressure { .. } => return None,
+            // Only notes make up the pattern.
+            _ => continue,
         };
         if *step.get_or_insert(length) != length {
             return None;
@@ -205,7 +217,12 @@ pub fn steps_from_clip(clip: &Clip, device: Option<&DeviceProfile>) -> Option<St
         let hit = match velocity {
             HIT_VELOCITY => Step::Hit,
             ACCENT_VELOCITY => Step::Accent,
-            _ => return None,
+            _ => {
+                let index = LEVEL_VELOCITIES
+                    .iter()
+                    .position(|&level| level == velocity.get())?;
+                Step::Level(u8::try_from(index + 1).ok()?)
+            }
         };
         hits.push((event.start, note, hit));
     }
@@ -308,6 +325,7 @@ mod tests {
                 note: U7::new(note).unwrap(),
                 velocity,
                 length: Ticks(length),
+                release: DEFAULT_RELEASE,
             },
         }
     }
@@ -449,6 +467,26 @@ mod tests {
     }
 
     #[test]
+    fn digits_are_hits_from_ghost_notes_to_accents() {
+        let steps = pattern(&[("36", "1234 5678 9xX.")]);
+        let clip = clip_from_steps(&steps, None, None).unwrap();
+        let velocities: Vec<u8> = clip
+            .events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::Note { velocity, .. } => Some(velocity.get()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(velocities, [14, 28, 42, 56, 71, 85, 99, 113, 127, 100, 127]);
+        // `9` is as hard as `X`, which reads back in its place.
+        let read = steps_from_clip(&clip, None).unwrap();
+        assert_eq!(read.steps["36"], "1234 5678 XxX.");
+        let again = clip_from_steps(&read.steps, Some(read.steps_per_beat), None);
+        assert_eq!(again.unwrap(), clip);
+    }
+
+    #[test]
     fn clips_off_the_grid_have_no_pattern() {
         let bar = Ticks::quarters(4);
         let clip = |events| Clip::new(bar, events).unwrap();
@@ -465,9 +503,31 @@ mod tests {
             note(480, 38, HIT_VELOCITY, 960),
         ]);
         assert_eq!(steps_from_clip(&held, None), None);
-        // A velocity that is neither x nor X.
+        // A velocity that no step writes.
         let soft = clip(vec![note(0, 36, U7::new(64).unwrap(), 240)]);
         assert_eq!(steps_from_clip(&soft, None), None);
+        // A release of its own, and key pressure, which steps can't write.
+        let released = clip(vec![ClipEvent {
+            start: Ticks::ZERO,
+            kind: EventKind::Note {
+                note: U7::new(36).unwrap(),
+                velocity: HIT_VELOCITY,
+                length: Ticks(240),
+                release: U7::MIN,
+            },
+        }]);
+        assert_eq!(steps_from_clip(&released, None), None);
+        let pressed = clip(vec![
+            note(0, 36, HIT_VELOCITY, 240),
+            ClipEvent {
+                start: Ticks::ZERO,
+                kind: EventKind::NotePressure {
+                    note: U7::new(36).unwrap(),
+                    value: U7::MAX,
+                },
+            },
+        ]);
+        assert_eq!(steps_from_clip(&pressed, None), None);
         // A step size that isn't on offer.
         let odd = clip(vec![note(0, 36, HIT_VELOCITY, 192)]);
         assert_eq!(steps_from_clip(&odd, None), None);

@@ -6,7 +6,7 @@ use std::ops::Range;
 
 use thiserror::Error;
 use treason_core::midi::{Channel, MidiMessage, U7};
-use treason_core::model::{EventKind, PortId, Program, Project, Track, TrackId};
+use treason_core::model::{DEFAULT_RELEASE, EventKind, PortId, Program, Project, Track, TrackId};
 use treason_core::time::{TICKS_PER_CLOCK_PULSE, Ticks};
 
 use crate::notes::{self, Expression, HOLD_PEDALS};
@@ -66,11 +66,14 @@ enum Rank {
     /// The clips' program changes, each followed by its channel's bend
     /// range when configured, since the program may reset it.
     Program,
-    /// Other control changes, pitch bend and pressure, so a note plays with
-    /// the values set on its tick.
+    /// Other control changes, pitch bend and channel pressure, so a note
+    /// plays with the values set on its tick.
     Control,
     /// Note-ons.
     NoteOn,
+    /// Key pressure, so a note's pressure on its first tick reaches a key
+    /// that is down.
+    NotePressure,
 }
 
 impl Rank {
@@ -87,8 +90,8 @@ impl Rank {
             MidiMessage::ProgramChange { .. } => Self::Program,
             MidiMessage::ControlChange { .. }
             | MidiMessage::PitchBend { .. }
-            | MidiMessage::ChannelPressure { .. }
-            | MidiMessage::PolyPressure { .. } => Self::Control,
+            | MidiMessage::ChannelPressure { .. } => Self::Control,
+            MidiMessage::PolyPressure { .. } => Self::NotePressure,
             _ => Self::NoteOn,
         }
     }
@@ -132,10 +135,12 @@ pub struct ClockPulses<'a> {
 /// Events are ordered by tick. At the same tick, clock pulses come first, so
 /// the tick starts on time, then note-offs, the tracks' channel setup, and
 /// then the clips' bank selects (controllers 0 and 32), program changes,
-/// other control changes with pitch bend and pressure, and note-ons. A
-/// retriggered note isn't cut short, the clips build on the setup, a
-/// program change gets the bank selected with it, and a note plays with the
-/// program, controller and bend values set on its tick. Within each of
+/// other control changes with pitch bend and channel pressure, note-ons and
+/// key pressure. A retriggered note isn't cut short, the clips build on the
+/// setup, a program change gets the bank selected with it, a note plays
+/// with the program, controller and bend values set on its tick, and its
+/// key is down before its pressure arrives. A note-off goes out with the
+/// note's release velocity. Within each of
 /// those groups, events keep their order, by track and then as written in
 /// the clip, so a sequence such as an RPN's parameter selection and data
 /// entry arrives as written. Each clip program change restores its
@@ -230,7 +235,7 @@ pub fn render_song(
             message: MidiMessage::NoteOff {
                 channel,
                 note,
-                velocity: U7::MIN,
+                velocity: DEFAULT_RELEASE,
             },
             rank: Rank::NoteOff,
             // After every pass, as the last word on each note.
@@ -447,13 +452,10 @@ fn visit(
     }
     for (index, track) in project.tracks.iter().enumerate() {
         if !track.muted && wanted(track.target.port) {
-            render_track(
-                index,
-                track,
-                channel_bend_range(project, track),
-                window.clone(),
-                &mut emit,
-            );
+            // Looked up only for a clip program change, so the tracks
+            // without one cost no pass over the others.
+            let bend_range = || channel_bend_range(project, track);
+            render_track(index, track, bend_range, window.clone(), &mut emit);
         }
     }
 }
@@ -613,6 +615,11 @@ fn channel_message(kind: EventKind, channel: Channel) -> Option<MidiMessage> {
             channel,
             pressure: value,
         }),
+        EventKind::NotePressure { note, value } => Some(MidiMessage::PolyPressure {
+            channel,
+            note,
+            pressure: value,
+        }),
     }
 }
 
@@ -635,11 +642,12 @@ pub fn clock_pulses(window: Range<Ticks>) -> impl Iterator<Item = Ticks> {
         .take_while(move |tick| *tick < window.end)
 }
 
-/// Visits one track's events in a non-empty `window`, unsorted.
+/// Visits one track's events in a non-empty `window`, unsorted. A clip
+/// program change is followed by the channel's `bend_range`, if it has one.
 fn render_track(
     track_index: usize,
     track: &Track,
-    bend_range: Option<U7>,
+    bend_range: impl Fn() -> Option<U7>,
     window: Range<Ticks>,
     mut emit: impl FnMut(RenderedEvent),
 ) {
@@ -687,6 +695,7 @@ fn render_track(
                     note,
                     velocity,
                     length,
+                    release,
                 } => {
                     if at >= start {
                         let on = MidiMessage::NoteOn {
@@ -701,7 +710,7 @@ fn render_track(
                         let off = MidiMessage::NoteOff {
                             channel,
                             note,
-                            velocity: U7::MIN,
+                            velocity: release,
                         };
                         emit(off_at, off, 0);
                     }
@@ -711,7 +720,7 @@ fn render_track(
                     if let Some(message) = channel_message(kind, channel).filter(|_| at >= start) {
                         emit(at, message, 0);
                         if matches!(kind, EventKind::Program { .. })
-                            && let Some(range) = bend_range
+                            && let Some(range) = bend_range()
                         {
                             for (slot, message) in bend_range_messages(channel, range) {
                                 emit(at, message, slot);
@@ -752,6 +761,7 @@ mod tests {
                 note: U7::new(note).unwrap(),
                 velocity: U7::MAX,
                 length: Ticks(length),
+                release: DEFAULT_RELEASE,
             },
         }
     }
@@ -875,7 +885,13 @@ mod tests {
                 let what = match event.message {
                     MidiMessage::TimingClock => format!("clock {}", event.port.0),
                     MidiMessage::NoteOn { note, .. } => format!("on {}", note.get()),
+                    MidiMessage::NoteOff { note, velocity, .. } if velocity != DEFAULT_RELEASE => {
+                        format!("off {} at {}", note.get(), velocity.get())
+                    }
                     MidiMessage::NoteOff { note, .. } => format!("off {}", note.get()),
+                    MidiMessage::PolyPressure { note, pressure, .. } => {
+                        format!("key {}={}", note.get(), pressure.get())
+                    }
                     MidiMessage::ControlChange {
                         controller, value, ..
                     } => format!("cc {}={}", controller.get(), value.get()),
@@ -1507,6 +1523,49 @@ mod tests {
     }
 
     #[test]
+    fn note_offs_carry_the_release_and_key_pressure_follows_its_note_on() {
+        let released = |start, length, release| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::Note {
+                note: U7::new(36).unwrap(),
+                velocity: U7::MAX,
+                length: Ticks(length),
+                release: U7::new(release).unwrap(),
+            },
+        };
+        let key = |start, value| ClipEvent {
+            start: Ticks(start),
+            kind: EventKind::NotePressure {
+                note: U7::new(36).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        };
+        // Pressure written before the notes it presses, retriggered.
+        let events = vec![
+            key(0, 20),
+            key(240, 70),
+            released(0, 240, 30),
+            released(240, 240, 90),
+            key(360, 0),
+        ];
+        let project = project(vec![track(1, 480, events)]);
+        assert_eq!(
+            play(&project, 0..720),
+            [
+                "0 on 36",
+                "0 key 36=20",
+                "240 off 36 at 30",
+                "240 on 36",
+                "240 key 36=70",
+                "360 key 36=0",
+                "480 off 36 at 90",
+                "480 on 36",
+                "480 key 36=20",
+            ]
+        );
+    }
+
+    #[test]
     fn notes_held_over_the_loop_point_end_in_the_next_pass() {
         // A note tied over the loop point, and one as long as the loop.
         let tied = project(vec![track(1, 960, vec![note(720, 60, 480)])]);
@@ -1629,6 +1688,7 @@ mod tests {
             note: U7::new(36).unwrap(),
             velocity: U7::MIN,
             length: Ticks(240),
+            release: DEFAULT_RELEASE,
         };
         let project = project(vec![track(1, 960, vec![silent])]);
         assert_eq!(play(&project, 0..960), Vec::<String>::new());
@@ -1766,6 +1826,7 @@ mod tests {
                 note: U7::new(42).unwrap(),
                 velocity: U7::MIN,
                 length: Ticks(240),
+                release: DEFAULT_RELEASE,
             },
         };
         let mut muted = track(2, 960, vec![note(0, 40, 240)]);
@@ -1894,6 +1955,7 @@ mod tests {
                 note: U7::new(42).unwrap(),
                 velocity: U7::MIN,
                 length: Ticks(240),
+                release: DEFAULT_RELEASE,
             },
         };
         // Muted, but with a program, which goes out all the same.

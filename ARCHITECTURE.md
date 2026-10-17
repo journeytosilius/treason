@@ -92,8 +92,8 @@ seams between modules are fixed and compile-checked before the logic exists.
 | mcp | `dto` | tool inputs and outputs | done |
 | mcp | `notation` | step strings and pitch names | done |
 | mcp | `pattern` | step patterns to clips and back | done |
-| mcp | `notes` | lists of notes in beats to clips | done |
-| mcp | `controls` | controls as points that jump or ramp, to control changes and back | done |
+| mcp | `notes` | lists of notes in beats, with release velocity and key pressure, to clips and back | done |
+| mcp | `controls` | controls as points that jump or ramp, to control changes and back; `Curve`, which notes reuse for key pressure | done |
 | mcp | `programs` | programs by number or by a device's name, and back | done |
 | mcp | `serve` | `serve_http`, `serve_stdio` | done |
 | mcp | `reference` (tests only) | `docs/tools.md`, made from the tool list | done |
@@ -215,10 +215,13 @@ and stops, and the transport tools report that it isn't running.
   resumes where playback stopped, and Stop keeps the position.
 - At the same tick, note-offs go out first, then the channels' setup, then
   the clips' bank selects, program changes, other control changes with
-  pitch bend and pressure, and note-ons. A retriggered note isn't cut
-  short, the clips build on the setup, a program change gets the bank
-  selected with it, and a note plays with the program, controller and bend
-  values set on its tick. Within each group, events keep their order, by
+  pitch bend and channel pressure, note-ons, and key pressure. A
+  retriggered note isn't cut short, the clips build on the setup, a
+  program change gets the bank selected with it, a note plays with the
+  program, controller and bend values set on its tick, and its key is down
+  before its pressure arrives. A note-off carries the note's release
+  velocity; one the engine sends to end a note itself carries 64, MIDI's
+  default. Within each group, events keep their order, by
   track and then as written in the clip, so RPN sequences and repeated
   controllers arrive as written. Each clip program change restores the
   channel's configured bend range, including on later loop passes, before
@@ -288,9 +291,13 @@ and stops, and the transport tools report that it isn't running.
   one target agree on its program and bend range, so an edit or a file
   that would give it two is refused.
 - A `Clip` has its own length, so clips of different lengths give polymeter.
-  It holds note, control-change, program-change, pitch-bend and
-  channel-pressure events sorted by start tick. Micro-timing is just where an event sits. A note can run past the
-  loop point into the next pass, but can't be longer than the loop.
+  It holds note, control-change, program-change, pitch-bend,
+  channel-pressure and key-pressure events sorted by start tick. A note
+  carries its velocity, length and release velocity. Micro-timing is just
+  where an event sits. A note can run past the loop point into the next
+  pass, but can't be longer than the loop. Key pressure comes only while a
+  note of its key sounds, counting that pass into the next, so the clip
+  refuses any other.
 - Planned event fields: probability, ratchets, conditions (every N loops,
   fills) and per-step control values.
 - The engine sees only resolved MIDI. Names such as "kick" or "cutoff" live
@@ -361,6 +368,17 @@ otherwise, with sharps: C4 is middle C, note 60. If that pitch name is a
 device voice or alias for another note, readback uses the decimal MIDI
 number instead, so writing the notes back preserves their pitches.
 
+Step strings write velocities as `x` (100), `X` (127) and the digits `1`
+to `9`, ninths of 127 for ghost notes and dynamics. `set_notes` also takes
+each note's release velocity, 64 by default, and its key pressure
+(polyphonic aftertouch) as points through the note, which the points of
+`set_controls` reuse: a `Curve` checks them against the note's length
+rather than the loop, and sends them from the note's start, wrapping into
+the next pass with a note that runs past the loop's end. Readback groups
+each key pressure with the note of its key sounding there and reads the
+note's changes back as points. A clip whose notes have a release or
+pressure of their own reads back as notes rather than steps.
+
 `set_controls` moves a track's controls (MIDI CC), such as a synth's mod
 wheel or filter cutoff, and its pitch bend and channel pressure, with or
 without notes on the track. Each control is a list of points, values at times in beats, that it jumps to or ramps to
@@ -372,14 +390,14 @@ beats through the loop.
   engine plays them like any other event. A ramp sends a value on a grid of
   1/32 beats, and only where it has changed, which bounds what it adds to a
   DIN port. A clip holds at most 8192 control changes, bends and pressure
-  changes together.
+  changes together, and its notes at most 8192 key pressure changes.
 - Pitch bend takes values from -8192 to 8191 around the centre, 0, and is
   sent as 14 bits. The tools write it signed, as musicians think of it,
   and the clip holds what goes on the wire.
 - A point may end a ramp on the end of the loop or of the repeat. It sends
   nothing there, since the next pass starts again from the first point.
-- `set_steps` and `set_notes` replace the notes and keep the control
-  changes where they are, cut off by a shorter loop. The clip holds the
+- `set_steps` and `set_notes` replace the notes, with their key pressure,
+  and keep the control changes where they are, cut off by a shorter loop. The clip holds the
   changes rather than the points, so a repeat doesn't stretch to fill a
   longer loop. `set_controls` replaces the controls it names and keeps the
   rest. Replaced changes retain their original positions among events on
@@ -412,7 +430,8 @@ lists them.
 - Tracks name their port, since a port's number is its place in
   `treason.toml`. Times are whole ticks, and events go one to a line, in
   the clip's order, so events on the same tick keep their order. Pitch
-  bends are written signed, -8192 to 8191, as the tools take them.
+  bends are written signed, -8192 to 8191, as the tools take them. A
+  note's release is written only when it isn't 64.
 - Loading checks what an edit would: every port and device exists, track
   ids are unique, tracks on one channel agree on its program and bend
   range, and clips are valid. A file that fails changes nothing.
@@ -580,6 +599,7 @@ Then expression, the rest of what MIDI 1.0 gives a sequencer to say:
     (RPN 0). Done.
 15. Per-note expression: polyphonic aftertouch and release velocity in
     `set_notes`, and more velocities in step strings, such as ghost notes.
+    Done.
 16. Fine control: 14-bit controllers, RPN and NRPN, with NRPN parameters
     in device profiles.
 17. SysEx, on its own path.

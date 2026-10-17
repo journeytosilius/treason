@@ -6,9 +6,11 @@ sequencer's tools. treason plays it as MIDI to external gear: drum machines,
 synths and other sequencers. It makes no sound itself.
 
 Status: early. `treason serve` plays what an agent writes on the MIDI ports
-in `treason.toml`: drum parts as step patterns, melodic parts as notes with
-pitch names such as `C4`, controls such as a synth's mod wheel or filter
-cutoff as values that jump or ramp, pitch bends and pressure the same way,
+in `treason.toml`: drum parts as step patterns, with ghost notes and
+accents, melodic parts as notes with pitch names such as `C4`, each with
+its own release velocity and key pressure (polyphonic aftertouch) if it
+likes, controls such as a synth's mod wheel or filter cutoff as values
+that jump or ramp, pitch bends and channel pressure the same way,
 and each track's sound as a program, such as `electric_bass_finger` from
 the General MIDI set, and how far it bends. Ports with `clock = true` get
 MIDI clock and Start, Stop and Continue, so their gear plays along. A
