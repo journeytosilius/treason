@@ -22,6 +22,9 @@ use crate::dto::{
 };
 use crate::{controls, notes, pattern};
 
+/// The guide for agents, `docs/guide.md`, which `get_guide` returns.
+const GUIDE: &str = include_str!("../../../docs/guide.md");
+
 /// The session behind the server: one project, shared by every agent.
 pub type SharedSession = Arc<Mutex<Session<Box<dyn Playback + Send>>>>;
 
@@ -202,6 +205,15 @@ fn parse_channel(number: u8) -> Result<Channel, String> {
 
 #[tool_router]
 impl TreasonServer {
+    /// The guide to driving treason: how projects, tracks and loops work,
+    /// what each tool is for, the names and notations, the limits, what the
+    /// errors mean and how to connect gear, with examples of every call.
+    /// Read it once before you start.
+    #[tool(annotations(read_only_hint = true))]
+    fn get_guide(&self) -> String {
+        GUIDE.into()
+    }
+
     /// Shows the project: tempo, time signature and every track, with each
     /// clip as step strings or notes, in the form set_steps or set_notes
     /// takes, and its controls in the form set_controls takes.
@@ -639,14 +651,15 @@ impl TreasonServer {
 #[tool_handler(
     router = self.tool_router,
     name = "treason",
-    instructions = "treason is a MIDI sequencer that plays external drum machines and synths; \
-it makes no sound itself. A project has a tempo, a time signature and tracks. Each track loops \
-its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
+    instructions = "treason is a MIDI sequencer that plays external drum machines and synths; it \
+makes no sound itself. Call get_guide once before you start: it explains how everything works, \
+with examples of every call. A project has a tempo, a time signature and tracks. Each track \
+loops its own clip on one MIDI port and channel, so clips of different lengths give polymeter. \
 Typical flow: list_devices and list_ports, add_track with a device, set_steps for drums or \
 set_notes for melodic parts, set_controls for modulation and other controls (MIDI CC), then \
-play. Edits apply while playing: tempo at once, everything else at the next bar. undo reverts \
-an edit. save_project keeps the work under a name, and load_project brings it back; status \
-says whether there are unsaved changes. export_midi writes a MIDI file that a DAW can open."
+play. Edits apply while playing: tempo at once, everything else at the next bar. undo reverts an \
+edit. save_project keeps the work under a name, and load_project brings it back; status says \
+whether there are unsaved changes. export_midi writes a MIDI file that a DAW can open."
 )]
 impl ServerHandler for TreasonServer {}
 
@@ -655,6 +668,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
+    use rmcp::ServiceExt;
+    use tokio::io::{
+        AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
+    };
     use treason_core::midi::U7;
     use treason_core::model::Project;
     use treason_core::playback::{PlaybackError, PlaybackStatus};
@@ -746,6 +763,7 @@ mod tests {
                 "add_track",
                 "edit_track",
                 "export_midi",
+                "get_guide",
                 "get_project",
                 "list_devices",
                 "list_ports",
@@ -779,6 +797,141 @@ mod tests {
             .find(|tool| tool.name == "get_project")
             .unwrap();
         assert!(get_project.output_schema.is_some());
+    }
+
+    #[test]
+    fn the_guide_names_every_tool() {
+        for tool in server().tool_router.list_all() {
+            assert!(
+                GUIDE.contains(&format!("`{}`", tool.name)),
+                "docs/guide.md doesn't mention `{}`",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_guide_fits_in_one_tool_result() {
+        // MCP clients cut long tool results short: Claude Code at 25,000
+        // tokens by default, with a warning from 10,000. 40,000 bytes of
+        // English is about 10,000 tokens.
+        assert!(
+            GUIDE.len() <= 40_000,
+            "docs/guide.md has {} bytes",
+            GUIDE.len()
+        );
+    }
+
+    /// The guide's example calls, in order. They sit in ```mcp blocks, each
+    /// a tool's name and then its arguments in JSON, which may run over
+    /// several lines.
+    fn guide_calls() -> Vec<(String, serde_json::Value)> {
+        let mut calls = Vec::new();
+        for block in GUIDE.split("```mcp\n").skip(1) {
+            let block = &block[..block.find("```").expect("every ```mcp block ends")];
+            let mut rest = block.trim_start();
+            while !rest.is_empty() {
+                let (tool, arguments) = rest
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("`{rest}` is not a tool's name and arguments"));
+                let mut values =
+                    serde_json::Deserializer::from_str(arguments).into_iter::<serde_json::Value>();
+                let value = values
+                    .next()
+                    .and_then(Result::ok)
+                    .unwrap_or_else(|| panic!("{tool}'s arguments are not JSON"));
+                calls.push((tool.to_owned(), value));
+                rest = arguments[values.byte_offset()..].trim_start();
+            }
+        }
+        calls
+    }
+
+    /// An agent's end of an MCP session: JSON-RPC messages, one to a line.
+    struct Agent {
+        lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
+        writer: WriteHalf<DuplexStream>,
+        id: u64,
+    }
+
+    impl Agent {
+        async fn send(&mut self, message: serde_json::Value) {
+            let line = format!("{message}\n");
+            self.writer.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        /// Sends a request, and returns the result the server answers with.
+        async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+            self.id += 1;
+            let request = serde_json::json!({
+                "jsonrpc": "2.0", "id": self.id, "method": method, "params": params,
+            });
+            self.send(request).await;
+            loop {
+                let line = self.lines.next_line().await.unwrap().expect("an answer");
+                let answer: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if answer["id"] == self.id {
+                    return answer
+                        .get("result")
+                        .cloned()
+                        .unwrap_or_else(|| panic!("{method} {params}: {answer}"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_guides_examples_run_in_order() {
+        let dir = TestDir::new("guide");
+        let (agent, transport) = tokio::io::duplex(1 << 20);
+        let server = server_in(&dir.0);
+        let service =
+            tokio::spawn(async move { server.serve(transport).await.unwrap().waiting().await });
+        let (reader, writer) = tokio::io::split(agent);
+        let mut agent = Agent {
+            lines: BufReader::new(reader).lines(),
+            writer,
+            id: 0,
+        };
+        let client = serde_json::json!({
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "guide", "version": "1"},
+        });
+        agent.request("initialize", client).await;
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        });
+        agent.send(initialized).await;
+
+        let calls = guide_calls();
+        assert!(
+            calls.len() >= 40,
+            "found only {} example calls",
+            calls.len()
+        );
+        for (tool, arguments) in calls {
+            let call = serde_json::json!({"name": tool, "arguments": arguments});
+            let result = agent.request("tools/call", call).await;
+            assert_ne!(result["isError"], true, "{tool} {arguments}: {result}");
+        }
+        drop(agent);
+        service.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn the_tool_reference_is_up_to_date() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/tools.md");
+        let reference = crate::reference::render(&server().tool_router.list_all());
+        if std::env::var_os("TREASON_UPDATE_DOCS").is_some() {
+            std::fs::write(&path, &reference).unwrap();
+        }
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(
+            written == reference,
+            "docs/tools.md is out of date: update it with \
+             TREASON_UPDATE_DOCS=1 cargo test -p treason-mcp"
+        );
     }
 
     #[test]

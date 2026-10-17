@@ -4,7 +4,8 @@ treason is a MIDI sequencer driven by an AI agent, written in Rust. It
 sends MIDI only, no audio, to drum machines, synths and other sequencers.
 [README.md](README.md) covers usage. [ARCHITECTURE.md](ARCHITECTURE.md)
 covers the design, which modules are still stubs and what comes next;
-read it before you change code.
+read it before you change code. [docs/guide.md](docs/guide.md) covers
+driving treason through its tools, as an agent does.
 
 ## Reuse first
 
@@ -153,19 +154,32 @@ watch treason's virtual port with `aseqdump`.
 
 ## Documentation
 
-Update the docs in the same PR as the behavior they describe:
+Docs change with the code. Every change to the code or its features
+updates the docs that describe it, in the same PR, without being asked: a
+PR that leaves a doc out of date isn't done. Its description says which
+docs it updated, or why none needed it.
 
+- `docs/guide.md`: the guide for agents that drive treason, which
+  `get_guide` serves over MCP. Update it whenever a tool, a notation, a
+  limit, the configuration or what treason sends changes. A test runs its
+  example calls in order, so keep them working, and it must stay under
+  40,000 bytes to fit in one tool result.
+- `docs/tools.md`: the tool reference, made from the tools' doc comments
+  and schemas. Don't edit it by hand: after changing a tool, run
+  `TREASON_UPDATE_DOCS=1 cargo test -p treason-mcp`. A test fails while it
+  is out of date.
+- Tool doc comments: they are the agent's documentation.
 - ARCHITECTURE.md: the design, the module status table and next steps.
 - README.md: requirements and usage.
 - `treason.toml`: the example configuration documents every setting.
   Keep it in step with `crates/treason/src/config.rs`.
-- Tool doc comments: they are the agent's documentation.
 
 ## Pull requests
 
 - One purpose per PR, on its own branch off `main`, small enough to
   review in one sitting.
-- The description says what changed, why, and how you tested it.
+- The description says what changed, why, how you tested it, and which
+  docs it updated.
 - Opening, updating and merging a PR posts to the team's Telegram Reviews
   topic, so push when the work is ready for review, not after every
   commit.

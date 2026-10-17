@@ -13,7 +13,8 @@
 //! back, [`notes`] turns lists of notes into clips, and [`controls`] turns
 //! points of control values into control changes and back. Then the
 //! agent's interface can stay stable while the internal model changes, and
-//! the other way round.
+//! the other way round. The `get_guide` tool returns `docs/guide.md`, which
+//! explains how the tools fit together.
 //!
 //! [`Session`]: treason_control::Session
 
@@ -22,6 +23,8 @@ pub mod dto;
 pub mod notation;
 pub mod notes;
 pub mod pattern;
+#[cfg(test)]
+mod reference;
 mod serve;
 pub mod server;
 

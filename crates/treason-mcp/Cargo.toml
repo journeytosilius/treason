@@ -20,5 +20,8 @@ treason-control.workspace = true
 treason-core.workspace = true
 treason-devices.workspace = true
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util"] }
+
 [lints]
 workspace = true
