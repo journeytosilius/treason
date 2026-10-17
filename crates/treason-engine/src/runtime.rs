@@ -1637,81 +1637,120 @@ mod tests {
 
         for scheduled in [false, true] {
             for pedal in HOLD_PEDALS {
-                for cleanup in [
-                    "stop", "restart", "locate", "panic", "shutdown", "mute", "remove", "clip",
-                    "port", "channel",
-                ] {
-                    let mut held = (*track(1, 10, 7680, &[(0, 60, 960)])).clone();
-                    let mut events = held.clip.events().to_vec();
-                    for (tick, value) in [(480, U7::MAX), (6000, U7::MIN)] {
-                        events.push(ClipEvent {
-                            start: Ticks(tick),
-                            kind: EventKind::Control {
-                                controller: pedal,
-                                value,
-                            },
-                        });
-                    }
-                    held.clip = Clip::new(held.clip.length(), events).unwrap();
-                    let output = if scheduled {
-                        RecordingOutput::scheduled(ms(50))
-                    } else {
-                        RecordingOutput::new()
-                    };
-                    let (mut handle, mut engine) =
-                        engine(project(vec![Arc::new(held.clone())]), output);
-                    let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
-                    run_until(&mut engine, origin + ms(1000));
-                    assert!(engine.sounding[0].notes.is_empty());
-                    assert!(sounding(engine.output.messages(), pedal));
-                    match cleanup {
-                        "stop" => {
-                            apply(&mut handle, &mut engine, TransportCommand::Stop);
+                // 64 is the lowest value that holds a pedal down.
+                for down in [U7::saturating(64), U7::MAX] {
+                    for cleanup in [
+                        "stop", "restart", "locate", "panic", "shutdown", "mute", "remove", "clip",
+                        "port", "channel",
+                    ] {
+                        let mut held = (*track(1, 10, 7680, &[(0, 60, 960)])).clone();
+                        let mut events = held.clip.events().to_vec();
+                        for (tick, value) in [(480, down), (6000, U7::MIN)] {
+                            events.push(ClipEvent {
+                                start: Ticks(tick),
+                                kind: EventKind::Control {
+                                    controller: pedal,
+                                    value,
+                                },
+                            });
                         }
-                        "restart" => {
-                            // Inspect cleanup before the next cycle plays
-                            // the new note at the top of the clip.
-                            engine
-                                .command(TransportCommand::Play, engine.clock.now())
-                                .unwrap();
-                        }
-                        "locate" => {
-                            apply(
-                                &mut handle,
-                                &mut engine,
-                                TransportCommand::Locate(Ticks(1920)),
-                            );
-                        }
-                        "panic" => {
-                            apply(&mut handle, &mut engine, TransportCommand::Panic);
-                        }
-                        "shutdown" => {
-                            drop(handle);
-                            assert!(!engine.cycle().unwrap());
-                        }
-                        _ => {
-                            match cleanup {
-                                "mute" => held.muted = true,
-                                "clip" => held.clip = Clip::new(Ticks(7680), Vec::new()).unwrap(),
-                                "port" => held.target.port = PortId(1),
-                                "channel" => held.target.channel = Channel::from_number(3).unwrap(),
-                                _ => {}
+                        held.clip = Clip::new(held.clip.length(), events).unwrap();
+                        let output = if scheduled {
+                            RecordingOutput::scheduled(ms(50))
+                        } else {
+                            RecordingOutput::new()
+                        };
+                        let (mut handle, mut engine) =
+                            engine(project(vec![Arc::new(held.clone())]), output);
+                        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                        run_until(&mut engine, origin + ms(1000));
+                        assert!(engine.sounding[0].notes.is_empty());
+                        assert!(sounding(engine.output.messages(), pedal));
+                        match cleanup {
+                            "stop" => {
+                                apply(&mut handle, &mut engine, TransportCommand::Stop);
                             }
-                            let tracks = if cleanup == "remove" {
-                                vec![]
-                            } else {
-                                vec![Arc::new(held)]
-                            };
-                            handle.publish(project(tracks));
-                            run_until(&mut engine, origin + ms(2100));
+                            "restart" => {
+                                // Inspect cleanup before the next cycle plays
+                                // the new note at the top of the clip.
+                                engine
+                                    .command(TransportCommand::Play, engine.clock.now())
+                                    .unwrap();
+                            }
+                            "locate" => {
+                                apply(
+                                    &mut handle,
+                                    &mut engine,
+                                    TransportCommand::Locate(Ticks(1920)),
+                                );
+                            }
+                            "panic" => {
+                                apply(&mut handle, &mut engine, TransportCommand::Panic);
+                            }
+                            "shutdown" => {
+                                drop(handle);
+                                assert!(!engine.cycle().unwrap());
+                            }
+                            _ => {
+                                match cleanup {
+                                    "mute" => held.muted = true,
+                                    "clip" => {
+                                        held.clip = Clip::new(Ticks(7680), Vec::new()).unwrap()
+                                    }
+                                    "port" => held.target.port = PortId(1),
+                                    "channel" => {
+                                        held.target.channel = Channel::from_number(3).unwrap()
+                                    }
+                                    _ => {}
+                                }
+                                let tracks = if cleanup == "remove" {
+                                    vec![]
+                                } else {
+                                    vec![Arc::new(held)]
+                                };
+                                handle.publish(project(tracks));
+                                run_until(&mut engine, origin + ms(2100));
+                            }
                         }
+                        assert!(
+                            !sounding(engine.output.messages(), pedal),
+                            "{cleanup}, pedal {pedal} at {down}, scheduled {scheduled}"
+                        );
                     }
-                    assert!(
-                        !sounding(engine.output.messages(), pedal),
-                        "{cleanup}, pedal {pedal}, scheduled {scheduled}"
-                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn cleanup_leaves_pedals_that_are_already_up_alone() {
+        for pedal in HOLD_PEDALS {
+            // The pedal goes down at beat 0.5 and back up at beat 1.
+            let mut part = (*track(1, 10, 7680, &[(0, 60, 960)])).clone();
+            let mut events = part.clip.events().to_vec();
+            for (tick, value) in [(480, U7::MAX), (960, U7::MIN)] {
+                events.push(ClipEvent {
+                    start: Ticks(tick),
+                    kind: EventKind::Control {
+                        controller: pedal,
+                        value,
+                    },
+                });
+            }
+            part.clip = Clip::new(part.clip.length(), events).unwrap();
+            let (mut handle, mut engine) =
+                engine(project(vec![Arc::new(part)]), RecordingOutput::new());
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1000));
+            let before = engine.output.messages().len();
+            apply(&mut handle, &mut engine, TransportCommand::Stop);
+            assert!(
+                !engine.output.messages()[before..].iter().any(|sent| matches!(
+                    sent.message,
+                    MidiMessage::ControlChange { controller, .. } if HOLD_PEDALS.contains(&controller)
+                )),
+                "pedal {pedal}"
+            );
         }
     }
 
@@ -2943,6 +2982,92 @@ mod tests {
                         message.at == origin + Duration::from_micros(112_500)
                             && matches!(message.message, MidiMessage::NoteOn { note, .. } if note.get() == 62)
                     }), "the backend must actually deliver the racing note-on");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transport_cleanup_releases_pedals_that_race_cancellation() {
+        let sustain = HOLD_PEDALS[0];
+        for cancel_first in [false, true] {
+            for command in [
+                Some(TransportCommand::Stop),
+                Some(TransportCommand::Play),
+                Some(TransportCommand::Locate(Ticks(960))),
+                Some(TransportCommand::Panic),
+                None,
+            ] {
+                // The note's off and the pedal going down are both queued
+                // for 112.5 ms.
+                let mut part = (*track(1, 10, 1920, &[(0, 60, 216)])).clone();
+                let mut events = part.clip.events().to_vec();
+                events.push(ClipEvent {
+                    start: Ticks(216),
+                    kind: EventKind::Control {
+                        controller: sustain,
+                        value: U7::MAX,
+                    },
+                });
+                part.clip = Clip::new(part.clip.length(), events).unwrap();
+                let (mut handle, link) = link(project(vec![Arc::new(part)]));
+                let origin = Instant::now();
+                let clock = SharedClock {
+                    origin,
+                    nanos: Arc::new(AtomicU64::new(0)),
+                };
+                let mut engine = Engine::new(
+                    link,
+                    ScheduledOutput::new(),
+                    clock,
+                    EngineConfig {
+                        ports: vec![PortSettings::default()],
+                        realtime: false,
+                        ..EngineConfig::default()
+                    },
+                );
+                handle.command(TransportCommand::Play).unwrap();
+                while engine.clock.now() < origin + ms(110) {
+                    assert!(engine.cycle().unwrap());
+                }
+                engine.output.deliver_until(engine.clock.now());
+                assert_eq!(engine.scheduled.len(), 2);
+                // The command samples 110 ms. Inside cancel_from, time
+                // reaches 113 ms, crossing the queued pedal.
+                engine.output.cancel_advance =
+                    Some((engine.clock.clone(), origin + ms(113), cancel_first));
+                if let Some(command) = command {
+                    handle.command(command).unwrap();
+                    assert!(engine.cycle().unwrap());
+                    while engine.clock.now() < origin + ms(400) {
+                        assert!(engine.cycle().unwrap());
+                    }
+                    handle.command(TransportCommand::Stop).unwrap();
+                    assert!(engine.cycle().unwrap());
+                } else {
+                    drop(handle);
+                    assert!(!engine.cycle().unwrap());
+                }
+                engine.output.deliver_until(origin + ms(1000));
+                let pedal = |message: &TimedMessage| match message.message {
+                    MidiMessage::ControlChange {
+                        controller, value, ..
+                    } if controller == sustain => Some(value),
+                    _ => None,
+                };
+                let last = engine.output.delivered.iter().filter_map(pedal).next_back();
+                assert!(
+                    last.is_none_or(|value| value.get() < 64),
+                    "{command:?}, cancellation first: {cancel_first}"
+                );
+                if !cancel_first {
+                    assert!(
+                        engine.output.delivered.iter().any(|message| {
+                            message.at == origin + Duration::from_micros(112_500)
+                                && pedal(message) == Some(U7::MAX)
+                        }),
+                        "the backend must actually deliver the racing pedal"
+                    );
                 }
             }
         }

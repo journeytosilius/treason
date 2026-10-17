@@ -612,7 +612,7 @@ impl TreasonServer {
     #[tool]
     fn panic(&self) -> Result<String, String> {
         self.command(TransportCommand::Panic)?;
-        Ok("Sent note-offs and All Notes Off on every channel.".into())
+        Ok("Sent note-offs, then pedal releases, All Sound Off and All Notes Off on every channel.".into())
     }
 
     /// Undoes the last edit.

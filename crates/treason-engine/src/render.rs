@@ -1045,6 +1045,30 @@ mod tests {
     }
 
     #[test]
+    fn song_cleanup_releases_only_the_hold_pedals() {
+        // Modulation and volume left up are settings, not held notes.
+        let project = project(vec![track(
+            1,
+            960,
+            vec![control(0, 1, 127), control(0, 7, 127), control(0, 64, 127)],
+        )]);
+        let events = render_song(&project, Ticks(480), u64::MAX).unwrap();
+        let at_end: Vec<_> = events
+            .iter()
+            .filter(|event| event.tick == Ticks(480))
+            .map(|event| event.message)
+            .collect();
+        assert_eq!(
+            at_end,
+            [MidiMessage::ControlChange {
+                channel: Channel::DRUMS,
+                controller: U7::new(64).unwrap(),
+                value: U7::MIN,
+            }]
+        );
+    }
+
+    #[test]
     fn songs_are_counted_exactly_before_they_are_rendered() {
         let silent = ClipEvent {
             start: Ticks(240),

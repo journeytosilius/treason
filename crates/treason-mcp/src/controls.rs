@@ -1576,6 +1576,26 @@ mod tests {
     }
 
     #[test]
+    fn new_changes_follow_the_others_on_their_tick() {
+        let control = |controller, value| ClipEvent {
+            start: Ticks::ZERO,
+            kind: EventKind::Control {
+                controller: U7::new(controller).unwrap(),
+                value: U7::new(value).unwrap(),
+            },
+        };
+        // RPN 0 is selected on tick 0, so Data Entry, new to the clip,
+        // must come after it.
+        let rpn = Clip::new(BAR, vec![control(101, 0), control(100, 0)]).unwrap();
+        let entry = vec![("6", lane(vec![at(0.0, 12, None)], None))];
+        let clip = set(&rpn, entry, None, None).unwrap();
+        assert_eq!(
+            clip.events(),
+            [control(101, 0), control(100, 0), control(6, 12)]
+        );
+    }
+
+    #[test]
     fn same_tick_jumps_are_written_in_input_order_including_repeats() {
         let points = vec![at(0.0, 100, None), at(0.0, 20, None), at(0.0, 20, None)];
         let clip = set(
