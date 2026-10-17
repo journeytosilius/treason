@@ -55,10 +55,10 @@ gear: see [Ports and gear](#ports-and-gear).
   you didn't just write.
 - **A track** plays one loop on one MIDI port and channel (1-16). It may
   name a device profile, so its notes, controls and programs can go by the
-  device's names, and set a program: the sound its channel plays. It can
-  be muted.
-- **A loop** holds notes and control changes (MIDI CC), and repeats until
-  `stop`. Each track's loop has its own length, `loop_beats`. Loops count
+  device's names, and set a program, the sound its channel plays, and a
+  bend range. It can be muted.
+- **A loop** holds notes, control changes (MIDI CC), pitch bend and
+  pressure, and repeats until `stop`. Each track's loop has its own length, `loop_beats`. Loops count
   from the start of bar 1, so a two-bar loop plays its first bar on bars 1,
   3, 5 and so on, even if you set it during bar 4. Loops of different
   lengths give polymeter: a 3-beat loop against a 4-beat one lines up again
@@ -112,11 +112,13 @@ A note goes by, in this order:
 
 A control (`set_controls`) goes by, in this order:
 
-1. a controller number in a string, such as `"74"`: 0-119. 120-127 are
+1. `pitch_bend` or `pressure`, which aren't controllers: see
+   [Pitch bend and pressure](#pitch-bend-and-pressure);
+2. a controller number in a string, such as `"74"`: 0-119. 120-127 are
    channel mode messages, such as All Notes Off, which treason sends
    itself, so they are refused;
-2. a param of the track's device;
-3. a standard name, with its number: `modulation` 1 (the mod wheel),
+3. a param of the track's device;
+4. a standard name, with its number: `modulation` 1 (the mod wheel),
    `breath` 2, `foot` 4, `portamento_time` 5, `volume` 7, `balance` 8,
    `pan` 10, `expression` 11, `sustain` 64, `portamento` 65, `sostenuto`
    66, `soft_pedal` 67, `legato` 68, `resonance` 71, `release` 72,
@@ -221,8 +223,8 @@ cutoff or a volume, by sending control changes through the loop. A track
 can send controls with no notes at all: modulation for a synth that plays
 its own notes, for example.
 
-- `controls` maps each control's name to its `points`: a `value`, 0-127,
-  at a time `at`, in beats. Without `ramp` the value jumps there.
+- `controls` maps each control's name to its `points`: a `value`, 0-127
+  (`pitch_bend` takes -8192 to 8191), at a time `at`, in beats. Without `ramp` the value jumps there.
   `"ramp": "linear"` ramps evenly from the point before, and
   `"ramp": "smooth"` eases out and in, along half a sine wave, so smooth
   ramps between a low and a high make a sine-wave LFO. The first point
@@ -243,7 +245,7 @@ its own notes, for example.
   track with nothing else, it runs to the last point or the end of the
   repeat, rounded up to a whole bar.
 - A control holds at most 8192 points, and a loop at most 8192 control
-  changes.
+  changes, bends and pressure changes together.
 
 A four-bar mod-wheel swell under the chords, ending on the loop's end, and
 an LFO on their cutoff, once every two beats:
@@ -324,6 +326,48 @@ edit_track {"track": 6, "program": null}
 edit_track {"track": 1, "program": "tr_808_kit"}
 ```
 
+## Pitch bend and pressure
+
+`set_controls` also bends a track's pitch, with `pitch_bend`, and presses
+on its keys, with `pressure`: channel aftertouch, which synths route to
+vibrato, brightness or volume. They take points, ramps and repeats like
+any control.
+
+- `pitch_bend` runs from -8192, all the way down, through 0, the centre,
+  to 8191, all the way up. How far that is depends on the synth's bend
+  range: 2 semitones on most gear, where 4096 is a semitone up and 8191 a
+  whole tone. A ramp glides, with a new bend every 1/32 of a beat.
+- `pressure` runs from 0, at rest, to 127.
+- `bend_range` in `add_track` and `edit_track` sets the synth's range in
+  semitones, 0-127; most synths take up to 24. treason sends it, as RPN 0,
+  after the track's program, where playback starts, after a jump and at
+  the bar line where an edit changes it, and after every program change
+  in a clip, including later loop passes, since a program change can reset
+  it. Explicit clip RPN controls can then override it. Like the program,
+  tracks on one port and channel share it, and `"bend_range": null` stops
+  sending one.
+- Bend and pressure act on the whole channel. `stop`, `panic`, a jump and
+  the end of an export put them back at rest, and so does muting,
+  removing or moving a track that left them off rest, or giving it a loop
+  without them.
+
+The bass's last note sliding up an octave into each bar, and pressure
+swelling through each chord on the keys:
+
+```mcp
+edit_track {"track": 2, "bend_range": 12}
+set_controls {"track": 2, "controls": {"pitch_bend": {"points": [
+  {"at": 0, "value": 0},
+  {"at": 3.25, "value": 0},
+  {"at": 4, "value": 8191, "ramp": "smooth"}
+]}}}
+set_controls {"track": 4, "controls": {"pressure": {"points": [
+  {"at": 0, "value": 0},
+  {"at": 3, "value": 100, "ramp": "linear"},
+  {"at": 3.5, "value": 0, "ramp": "smooth"}
+], "repeat_beats": 4}}}
+```
+
 ## Tracks
 
 ```mcp
@@ -335,10 +379,10 @@ undo {}
 ```
 
 - `add_track` takes a `name`, and optionally a `device`, a `port` (the
-  first by default), a `channel` (the device's, else 1) and a `program`.
-  The new track loops one empty bar.
+  first by default), a `channel` (the device's, else 1), a `program` and
+  a `bend_range`. The new track loops one empty bar.
 - `edit_track` renames a track, moves it to another port, channel or
-  device, or changes its program, keeping its loop. A new device renames
+  device, or changes its program or bend range, keeping its loop. A new device renames
   nothing already written.
 - `set_muted` silences a track and keeps its loop.
 - `remove_track` deletes it. `undo` brings it back.
@@ -364,9 +408,11 @@ panic {}
 
 - `play` starts from bar 1, or from `from_bar`, and restarts there if
   already playing. Every track loops until `stop`.
-- `stop` ends every sounding note and keeps the position.
-- `panic` ends every note on every port at once and releases the pedals,
-  for stuck notes. Playback carries on.
+- `stop` ends every sounding note, releases the pedals, puts bend and
+  pressure back at rest, and keeps the position.
+- `panic` ends every note on every port at once, releases the pedals and
+  puts bend and pressure at rest on every channel, for stuck notes and
+  bends. Playback carries on.
 - `status` says whether it's playing, the bar and beat, the tempo, the
   project's name and whether it has unsaved changes.
 - `set_tempo` takes 20-400 BPM, and applies at once.
@@ -390,7 +436,7 @@ get_project {}
 ```
 
 `get_project` shows the tempo, the time signature and every track: its
-id, name, port, channel, device, program, mute, `loop_beats`, how many
+id, name, port, channel, device, program, bend range, mute, `loop_beats`, how many
 events its loop holds, and its notes, as steps (`pattern`) or as a list
 (`notes`), and its `controls`, each in the form the matching tool takes. A
 program reads back by the device's name for it, else as a number with its
@@ -423,8 +469,9 @@ load_project {"name": "first groove"}
   projects, newest first.
 - `export_midi` writes a Standard MIDI File that a DAW opens, with a track
   for each unmuted track, the tempo and the time signature. Startup bank
-  selects and program changes go before the notes in the first unmuted
-  track on their port and channel, including programs set by muted tracks.
+  selects, program changes and bend ranges go before the notes in the
+  first unmuted track on their port and channel, including those set by
+  muted tracks.
   By default it runs from bar 1 until every loop ends on the same bar line,
   so each pattern is complete; `bars` sets the length, at most 1000. Its `name`
   defaults to the project's, and replacing another file needs
@@ -440,8 +487,10 @@ load_project {"name": "first groove"}
 | Notes in a `set_notes` call | 1024 |
 | Steps in a step string | 1024 |
 | Points in a control | 8192 |
-| Control changes in a loop | 8192 |
-| Program, `bank_msb`, `bank_lsb` | 0-127 each |
+| Control changes, bends and pressure changes in a loop | 8192 |
+| Control and `pressure` values | 0-127 |
+| `pitch_bend` values | -8192 to 8191, 0 the centre |
+| Program, `bank_msb`, `bank_lsb`, `bend_range` | 0-127 each |
 | Undo history | 256 edits |
 | Project and export names | 64 characters |
 | Saved project file | 16 MiB |
@@ -456,8 +505,8 @@ A refused call changes nothing, and its error says how to fix it, such as
   programs with similar names; `list_devices` shows its aliases and every
   program too. A track without a device takes only numbers, pitch names
   and standard control names: give it one with `edit_track`.
-- A program unlike the one another track on the same port and channel
-  sets.
+- A program or bend range unlike the one another track on the same port
+  and channel sets.
 - A step string whose length doesn't divide the loop's.
 - Two notes of the same pitch that overlap, or a note that starts outside
   the loop or is longer than it.
@@ -548,7 +597,8 @@ snare_tune = { cc = 20 }
 A synth's profile usually has only programs and params. Names need a
 letter, since a number means a MIDI note, controller or program. An alias must point to a voice and
 can't share its name. A param's name wins over a standard name of the
-same spelling. The MIDI Guide (github.com/pencilresearch/midi) lists the
+same spelling. `pitch_bend` and `pressure` aren't controllers, so no param
+takes those names. The MIDI Guide (github.com/pencilresearch/midi) lists the
 CC numbers of many synths and drum machines.
 
 ### Running treason
@@ -573,7 +623,7 @@ connect Claude Code:
 
 Saved projects are TOML files in the projects directory, `<name>.toml`:
 `format = 1`, the tempo, the time signature, and each track with its port
-by name, its program, and its events one to a line, with times in ticks,
+by name, its program and bend range, and its events one to a line, with times in ticks,
 960 to a beat.
 
 ## Tips
@@ -583,6 +633,8 @@ by name, its program, and its events one to a line, with times in ticks,
 - Leave out the program on gear whose sound the user set up by hand: a
   program change replaces it. On a General MIDI synth, give every melodic
   track one from `gm`.
+- Bends are only as wide as the synth's bend range: set `bend_range` on
+  tracks that bend, so values mean the same on any gear.
 - Edits land on the next bar line, so a change to a slow loop takes a
   moment to hear.
 - Save after each idea the user likes. `undo` takes back what didn't work.
@@ -592,8 +644,8 @@ by name, its program, and its events one to a line, with times in ticks,
 
 - Make sound: it only sends MIDI.
 - Record or follow MIDI input, or an external clock.
-- Change programs within a loop, or send pitch bend, aftertouch, NRPN or
-  SysEx from the tools.
+- Change programs within a loop, or send poly aftertouch, release
+  velocity, NRPN or SysEx from the tools.
 - Probability, ratchets or conditional steps.
 - Arrange a song: every track loops. Change sections by editing tracks
   while playing, or by muting and unmuting them.

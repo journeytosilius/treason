@@ -1,10 +1,25 @@
-//! Keeps track of sounding notes so the engine can always end them.
+//! Keeps track of sounding notes, held pedals, pitch bend and pressure so
+//! the engine can always end them.
 
-use treason_core::midi::{Channel, MidiMessage, U7};
+use treason_core::midi::{Channel, MidiMessage, U7, U14};
 use treason_core::model::TrackId;
 
 /// Pedals that can hold a note after its key's note-off.
 pub(crate) const HOLD_PEDALS: [U7; 2] = [U7::saturating(64), U7::saturating(66)];
+
+/// Whether `message` leaves something cleanup must end: a note sounding, a
+/// hold pedal down, pitch bend off centre, or channel pressure above zero.
+pub(crate) fn engages(message: MidiMessage) -> bool {
+    match message {
+        MidiMessage::NoteOn { velocity, .. } => velocity != U7::MIN,
+        MidiMessage::ControlChange {
+            controller, value, ..
+        } => HOLD_PEDALS.contains(&controller) && value.get() >= 64,
+        MidiMessage::PitchBend { value, .. } => value != U14::CENTER,
+        MidiMessage::ChannelPressure { pressure, .. } => pressure != U7::MIN,
+        _ => false,
+    }
+}
 
 /// The notes sounding on one output port, one bit per channel and note.
 ///
@@ -69,14 +84,63 @@ impl ActiveNotes {
     }
 }
 
-/// Active MIDI keys and the track that last started each one. Storage is
-/// fixed by MIDI's 16 channels and 128 notes, regardless of track count.
+/// Active MIDI keys and the track that last started each one, with each
+/// channel's pedals, bend and pressure. Storage is fixed by MIDI's 16
+/// channels and 128 notes, regardless of track count.
 #[derive(Clone)]
 pub(crate) struct OwnedNotes {
     pub(crate) notes: ActiveNotes,
     owners: [[TrackId; 128]; 16],
     /// Channels with sustain or sostenuto down, even after all keys end.
     pedals: [u16; 2],
+    /// Channels with pitch bend off centre, and with channel pressure
+    /// above zero.
+    expression: [u16; 2],
+    /// The track that last sent each channel's pitch bend, and its
+    /// pressure.
+    expressed_by: [[TrackId; 16]; 2],
+}
+
+/// Channel-wide expression that outlasts the notes: pitch bend and channel
+/// pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Expression {
+    /// Pitch bend, at rest in the centre.
+    Bend,
+    /// Channel pressure, at rest at zero.
+    Pressure,
+}
+
+impl Expression {
+    pub(crate) const ALL: [Self; 2] = [Self::Bend, Self::Pressure];
+
+    /// The message that puts it back at rest on `channel`.
+    pub(crate) const fn rest(self, channel: Channel) -> MidiMessage {
+        match self {
+            Self::Bend => MidiMessage::PitchBend {
+                channel,
+                value: U14::CENTER,
+            },
+            Self::Pressure => MidiMessage::ChannelPressure {
+                channel,
+                pressure: U7::MIN,
+            },
+        }
+    }
+
+    /// What `message` does to it: on which channel, and whether it leaves
+    /// it off rest.
+    const fn of(message: MidiMessage) -> Option<(Self, Channel, bool)> {
+        match message {
+            MidiMessage::PitchBend { channel, value } => {
+                Some((Self::Bend, channel, value.get() != U14::CENTER.get()))
+            }
+            MidiMessage::ChannelPressure { channel, pressure } => {
+                Some((Self::Pressure, channel, pressure.get() != 0))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl OwnedNotes {
@@ -85,6 +149,8 @@ impl OwnedNotes {
             notes: ActiveNotes::new(),
             owners: [[TrackId(0); 128]; 16],
             pedals: [0; 2],
+            expression: [0; 2],
+            expressed_by: [[TrackId(0); 16]; 2],
         }
     }
 
@@ -116,6 +182,18 @@ impl OwnedNotes {
                 self.pedals[index] &= !bit;
             }
         }
+        if let Some((expression, channel, off_rest)) = Expression::of(message) {
+            let index = expression as usize;
+            let bit = 1 << channel.index();
+            if off_rest {
+                self.expression[index] |= bit;
+            } else {
+                self.expression[index] &= !bit;
+            }
+            if let Some(track) = track {
+                self.expressed_by[index][usize::from(channel.index())] = track;
+            }
+        }
     }
 
     pub(crate) fn pedal_is_down(&self, channel: Channel, controller: U7) -> bool {
@@ -123,6 +201,13 @@ impl OwnedNotes {
             .iter()
             .position(|&pedal| pedal == controller)
             .is_some_and(|index| self.pedals[index] & (1 << channel.index()) != 0)
+    }
+
+    /// The track that left `channel`'s `expression` off rest, if it is.
+    pub(crate) fn off_rest(&self, channel: Channel, expression: Expression) -> Option<TrackId> {
+        let index = expression as usize;
+        (self.expression[index] & (1 << channel.index()) != 0)
+            .then(|| self.expressed_by[index][usize::from(channel.index())])
     }
 
     pub(crate) fn owns(&self, track: TrackId, channel: Channel, note: U7) -> bool {
@@ -240,6 +325,83 @@ mod tests {
         assert_eq!(offs, [note_off(bass, 40), note_off(bass, 43)]);
         assert!(notes.is_sounding(Channel::DRUMS, U7::new(36).unwrap()));
         assert!(!notes.is_sounding(bass, U7::new(40).unwrap()));
+    }
+
+    #[test]
+    fn follows_pitch_bend_and_pressure_and_who_left_them_off_rest() {
+        let lead = Channel::from_number(1).unwrap();
+        let bend = |value| MidiMessage::PitchBend {
+            channel: lead,
+            value: U14::new(value).unwrap(),
+        };
+        let press = |pressure| MidiMessage::ChannelPressure {
+            channel: lead,
+            pressure: U7::new(pressure).unwrap(),
+        };
+        let mut notes = OwnedNotes::new();
+        for expression in Expression::ALL {
+            assert_eq!(notes.off_rest(lead, expression), None);
+        }
+        notes.observe(bend(12_000), Some(TrackId(3)));
+        notes.observe(press(1), Some(TrackId(4)));
+        assert_eq!(notes.off_rest(lead, Expression::Bend), Some(TrackId(3)));
+        assert_eq!(notes.off_rest(lead, Expression::Pressure), Some(TrackId(4)));
+        assert_eq!(notes.off_rest(Channel::DRUMS, Expression::Bend), None);
+        // The last track to send it owns it, even within the same value.
+        notes.observe(bend(0), Some(TrackId(5)));
+        assert_eq!(notes.off_rest(lead, Expression::Bend), Some(TrackId(5)));
+        // Back at rest, by anyone, it's no one's.
+        notes.observe(Expression::Bend.rest(lead), None);
+        notes.observe(press(0), Some(TrackId(4)));
+        for expression in Expression::ALL {
+            assert_eq!(notes.off_rest(lead, expression), None);
+        }
+        assert!(notes.notes.is_empty());
+    }
+
+    #[test]
+    fn engaging_messages_are_the_ones_cleanup_ends() {
+        let channel = Channel::DRUMS;
+        let control = |controller, value| MidiMessage::ControlChange {
+            channel,
+            controller: U7::new(controller).unwrap(),
+            value: U7::new(value).unwrap(),
+        };
+        for (message, engages_it) in [
+            (note_on(channel, 36), true),
+            (note_off(channel, 36), false),
+            (
+                MidiMessage::NoteOn {
+                    channel,
+                    note: U7::MIN,
+                    velocity: U7::MIN,
+                },
+                false,
+            ),
+            (control(64, 64), true),
+            (control(66, 127), true),
+            (control(64, 63), false),
+            (control(1, 127), false),
+            (Expression::Bend.rest(channel), false),
+            (
+                MidiMessage::PitchBend {
+                    channel,
+                    value: U14::MIN,
+                },
+                true,
+            ),
+            (Expression::Pressure.rest(channel), false),
+            (
+                MidiMessage::ChannelPressure {
+                    channel,
+                    pressure: U7::MAX,
+                },
+                true,
+            ),
+            (MidiMessage::TimingClock, false),
+        ] {
+            assert_eq!(engages(message), engages_it, "{message:?}");
+        }
     }
 
     #[test]

@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 use arc_swap::Guard;
 use thiserror::Error;
 use treason_core::midi::{Channel, MidiMessage, U7};
-use treason_core::model::{PortId, Project, Track, TrackId};
+use treason_core::model::{EventKind, PortId, Project, Track, TrackId};
 use treason_core::output::{Delivery, MidiOutput, TimedMessage};
 use treason_core::playback::{TransportCommand, TransportState};
 use treason_core::time::Ticks;
 
 use crate::clock::Clock;
 use crate::link::EngineLink;
-use crate::notes::{HOLD_PEDALS, OwnedNotes};
-use crate::render::{ClockPulses, Programs, RenderedEvent, render_bounded};
+use crate::notes::{self, Expression, HOLD_PEDALS, OwnedNotes};
+use crate::render::{ClockPulses, RenderedEvent, Setup, render_bounded};
 use crate::timebase::Timebase;
 use crate::transport::{self, Transport, TransportEffect};
 
@@ -37,6 +37,10 @@ const ALL_NOTES_OFF: U7 = U7::saturating(123);
 
 /// All Sound Off also silences voices that ignore All Notes Off.
 const ALL_SOUND_OFF: U7 = U7::saturating(120);
+
+/// The most a channel's cleanup sends besides its note-offs: its pedal
+/// releases, its pitch bend recentred and its pressure lifted.
+const CHANNEL_RESTS: usize = HOLD_PEDALS.len() + Expression::ALL.len();
 
 /// A snapshot staged for a playback bar.
 struct SnapshotSwitch {
@@ -201,10 +205,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             sounding: vec![OwnedNotes::new(); config.ports.len()],
             delivered: vec![OwnedNotes::new(); config.ports.len()],
             delivered_pulses: vec![None; config.ports.len()],
-            // A full render batch plus one switch's note-offs and pedal
-            // releases on every port.
+            // A full render batch plus one switch's cleanup on every port.
             scheduled: Vec::with_capacity(
-                RENDER_CAPACITY + config.ports.len() * 16 * (128 + HOLD_PEDALS.len()),
+                RENDER_CAPACITY + config.ports.len() * 16 * (128 + CHANNEL_RESTS),
             ),
             streams: config.ports.iter().map(PortStream::new).collect(),
             max_latency,
@@ -444,7 +447,8 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         }
     }
 
-    /// Ends every sounding note at once. `tick` is where playback is.
+    /// Ends every sounding note at once, releases the pedals, recentres
+    /// pitch bend and lifts pressure. `tick` is where playback is.
     fn end_notes(&mut self, at: Instant, tick: Ticks) -> Result<(), O::Error> {
         for index in 0..self.sounding.len() {
             let port = PortId(index as u16);
@@ -460,9 +464,33 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             }
             for channel in (0..16).filter_map(Channel::from_index) {
                 self.release_pedals(port, channel, at, tick, None)?;
+                for expression in Expression::ALL {
+                    if self.sounding[index].off_rest(channel, expression).is_some() {
+                        self.rest(port, channel, expression, at, tick, None)?;
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Puts a channel's pitch bend or pressure back at rest.
+    fn rest(
+        &mut self,
+        port: PortId,
+        channel: Channel,
+        expression: Expression,
+        at: Instant,
+        tick: Ticks,
+        track: Option<TrackId>,
+    ) -> Result<(), O::Error> {
+        let message = TimedMessage {
+            at,
+            tick,
+            port,
+            message: expression.rest(channel),
+        };
+        self.emit(message, track)
     }
 
     /// Releases a channel's pedal holds, including when no keys remain.
@@ -495,8 +523,9 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Ends notes and releases pedals, then sends All Sound Off and All
-    /// Notes Off everywhere, including for untracked voices. Playback carries on.
+    /// Ends notes as a stop does, then sends pedal releases, pitch bend and
+    /// pressure at rest, All Sound Off and All Notes Off on every channel,
+    /// including for untracked voices. Playback carries on.
     fn panic(&mut self, at: Instant, tick: Ticks) -> Result<(), O::Error> {
         // Playback continues: each port renders its cancelled future again,
         // including its note-offs, after ending the notes that really
@@ -505,19 +534,20 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         self.end_notes(at, tick)?;
         for port in (0..).map(PortId).take(self.sounding.len()) {
             for channel in (0..16).filter_map(Channel::from_index) {
-                for controller in HOLD_PEDALS
-                    .into_iter()
-                    .chain([ALL_SOUND_OFF, ALL_NOTES_OFF])
-                {
+                let control = |controller| MidiMessage::ControlChange {
+                    channel,
+                    controller,
+                    value: U7::MIN,
+                };
+                let pedals = HOLD_PEDALS.map(control);
+                let expression = Expression::ALL.map(|expression| expression.rest(channel));
+                let silence = [ALL_SOUND_OFF, ALL_NOTES_OFF].map(control);
+                for message in pedals.into_iter().chain(expression).chain(silence) {
                     let message = TimedMessage {
                         at,
                         tick,
                         port,
-                        message: MidiMessage::ControlChange {
-                            channel,
-                            controller,
-                            value: U7::MIN,
-                        },
+                        message,
                     };
                     self.emit(message, None)?;
                 }
@@ -555,29 +585,30 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Renders only what fits, preserving a continuation within a tick.
-    /// Both sides of a staged bar use their own snapshot. Programs go out
-    /// where playback started, and where the staged snapshot changes them.
+    /// Both sides of a staged bar use their own snapshot. The channels'
+    /// setup goes out where playback started, and where the staged snapshot
+    /// changes it.
     fn render_until(&mut self, index: usize, horizon: Ticks) {
         let port = PortId(index as u16);
         let stream = &mut self.streams[index];
         while stream.cursor < horizon && stream.rendered.len() < stream.rendered.capacity() {
-            let started = Programs {
+            let started = Setup {
                 at: self.started,
                 since: None,
             };
-            let (project, end, programs) = match &self.waiting {
+            let (project, end, setup) = match &self.waiting {
                 Some(waiting) if stream.cursor >= waiting.line => {
                     // A switch staged before the first tick was heard
                     // replaces the snapshot that would have started, so
-                    // all its programs go out where playback starts.
-                    let programs = match waiting.line > self.started {
-                        true => Programs {
+                    // all its setup goes out where playback starts.
+                    let setup = match waiting.line > self.started {
+                        true => Setup {
                             at: waiting.line,
                             since: Some(&self.project),
                         },
                         false => started,
                     };
-                    (&waiting.project, horizon, programs)
+                    (&waiting.project, horizon, setup)
                 }
                 Some(waiting) => (&self.project, horizon.min(waiting.line), started),
                 None => (&self.project, horizon, started),
@@ -589,7 +620,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
             stream.render_after = render_bounded(
                 project,
                 clock,
-                Some(programs),
+                Some(setup),
                 port,
                 stream.cursor..end,
                 stream.render_after,
@@ -639,7 +670,8 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         Ok(())
     }
 
-    /// Submits the port's forced note-offs before any new events at the
+    /// Submits the port's forced note-offs, pedal releases and the bends
+    /// and pressure that tracks leave behind before any new events at the
     /// boundary. Keeps the snapshot pending until actual playback reaches
     /// that line.
     fn finish_switch(&mut self, index: usize) -> Result<(), O::Error> {
@@ -651,15 +683,19 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
         let at = self.timebase.time_of(line) - self.streams[index].latency;
         for track_index in 0..self.project.tracks.len() {
             let track = &self.project.tracks[track_index];
+            let next = &self.waiting.as_ref().unwrap().project;
             // A muted track has no notes of its own to end.
-            if track.target.port != port
-                || track.muted
-                || carries_on(track, &self.waiting.as_ref().unwrap().project)
-            {
+            if track.target.port != port || track.muted || carries_on(track, next) {
                 continue;
             }
             let id = track.id;
             let channel = track.target.channel;
+            // A bend or pressure the track left on its channel rests,
+            // unless its new clip goes on sending them there.
+            let resting = Expression::ALL.map(|expression| {
+                self.sounding[index].off_rest(channel, expression) == Some(id)
+                    && !still_sends(track, next, expression)
+            });
             let mut notes = self.sounding[index].for_track(id, channel);
             for message in notes.drain_channel(channel) {
                 let message = TimedMessage {
@@ -671,6 +707,11 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 self.emit(message, Some(id))?;
             }
             self.release_pedals(port, channel, at, line, Some(id))?;
+            for (expression, resting) in Expression::ALL.into_iter().zip(resting) {
+                if resting {
+                    self.rest(port, channel, expression, at, line, Some(id))?;
+                }
+            }
         }
         self.streams[index].switched = true;
         Ok(())
@@ -784,9 +825,10 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
     }
 
     /// Invalidates backend work and reconstructs projected notes. Delivery
-    /// can race cancellation: any removed note-on or pedal-on due by then
-    /// might have sounded. Keep those notes and holds until cleanup;
-    /// never assume a removed note-off or pedal-off was delivered.
+    /// can race cancellation: any removed note-on, pedal-on, bend or
+    /// pressure due by then might have reached the receiver. Keep those
+    /// notes, holds and bends until cleanup; never assume a removed
+    /// note-off, pedal-off or return to rest was delivered.
     fn cancel_scheduled(&mut self, from: Instant) -> Result<(), O::Error> {
         let scheduled = &mut self.scheduled;
         self.output.cancel_from(from, &mut |message| {
@@ -812,11 +854,7 @@ impl<O: MidiOutput, C: Clock> Engine<O, C> {
                 // each one. This pulse therefore reached the receiver, even
                 // if it raced cancellation. Do not render it a second time.
                 remember_pulse(&mut self.delivered_pulses, message);
-            } else if message.at <= now
-                && (matches!(message.message, MidiMessage::NoteOn { velocity, .. } if velocity != U7::MIN)
-                    || matches!(message.message, MidiMessage::ControlChange { controller, value, .. }
-                        if HOLD_PEDALS.contains(&controller) && value.get() >= 64))
-            {
+            } else if message.at <= now && notes::engages(message.message) {
                 self.delivered[usize::from(message.port.0)].observe(message.message, event.track);
             }
             false
@@ -864,7 +902,8 @@ fn remember_pulse(pulses: &mut [Option<Ticks>], message: &TimedMessage) {
 }
 
 /// Whether `track` carries on in `project` as it was, so its sounding notes
-/// can end as written. A new name, device or program doesn't matter here.
+/// can end as written. A new name, device, program or bend range doesn't
+/// matter here.
 fn carries_on(track: &Arc<Track>, project: &Project) -> bool {
     project.tracks.iter().any(|new| {
         Arc::ptr_eq(new, track)
@@ -872,6 +911,23 @@ fn carries_on(track: &Arc<Track>, project: &Project) -> bool {
                 && new.target == track.target
                 && new.muted == track.muted
                 && new.clip == track.clip)
+    })
+}
+
+/// Whether `track`, changed in `project`, still plays there on the same
+/// port and channel, with a clip that sends `expression`.
+fn still_sends(track: &Track, project: &Project, expression: Expression) -> bool {
+    project.tracks.iter().any(|new| {
+        new.id == track.id
+            && new.target == track.target
+            && !new.muted
+            && new.clip.events().iter().any(|event| {
+                matches!(
+                    (expression, event.kind),
+                    (Expression::Bend, EventKind::PitchBend { .. })
+                        | (Expression::Pressure, EventKind::Pressure { .. })
+                )
+            })
     })
 }
 
@@ -960,6 +1016,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
 
+    use treason_core::midi::U14;
     use treason_core::model::{Clip, ClipEvent, EventKind, OutputTarget, Program, TrackId};
     use treason_core::playback::{Playback, PlaybackStatus};
     use treason_core::time::Bpm;
@@ -1003,6 +1060,7 @@ mod tests {
             },
             muted: false,
             program: None,
+            bend_range: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
         })
     }
@@ -1143,6 +1201,18 @@ mod tests {
                 sent.port.0,
                 channel.number(),
                 program.get()
+            ),
+            MidiMessage::PitchBend { channel, value } => format!(
+                "port {} channel {} bend {}",
+                sent.port.0,
+                channel.number(),
+                value.get()
+            ),
+            MidiMessage::ChannelPressure { channel, pressure } => format!(
+                "port {} channel {} pressure {}",
+                sent.port.0,
+                channel.number(),
+                pressure.get()
             ),
             MidiMessage::TimingClock => "clock".to_owned(),
             MidiMessage::SongPosition(beats) => format!("SPP {}", beats.get()),
@@ -1479,6 +1549,52 @@ mod tests {
                 "0ns on 60",
             ]
         );
+    }
+
+    #[test]
+    fn bend_ranges_go_out_after_programs_where_playback_starts_and_where_they_change() {
+        let with = |track: &Arc<Track>, program: u8, range| {
+            Arc::new(Track {
+                program: Some(Program::new(U7::new(program).unwrap())),
+                bend_range: U7::new(range),
+                ..(**track).clone()
+            })
+        };
+        let lead = with(&track(1, 1, 960, &[(0, 60, 240)]), 5, 12);
+        let (mut handle, mut engine) = engine(project(vec![lead.clone()]), RecordingOutput::new());
+        let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+        run_until(&mut engine, origin + ms(10));
+        let rpn = |at: &str, semitones: u8| {
+            [
+                "cc 101=0".to_owned(),
+                "cc 100=0".to_owned(),
+                format!("cc 6={semitones}"),
+                "cc 38=0".to_owned(),
+                "cc 101=127".to_owned(),
+                "cc 100=127".to_owned(),
+            ]
+            .map(|what| format!("{at} port 0 channel 1 {what}"))
+        };
+        let mut expected = vec!["0ns port 0 channel 1 pc 5".to_owned()];
+        expected.extend(rpn("0ns", 12));
+        expected.push("0ns on 60".to_owned());
+        assert_eq!(sent(&mut engine, origin), expected);
+
+        // A new range goes out alone at the next bar, and a new program
+        // takes the range with it at the one after.
+        let at_bar = |sent: Vec<String>, at: &str| {
+            sent.into_iter()
+                .filter(|line| line.starts_with(&format!("{at} port")))
+                .collect::<Vec<_>>()
+        };
+        handle.publish(project(vec![with(&lead, 5, 2)]));
+        run_until(&mut engine, origin + ms(2010));
+        assert_eq!(at_bar(sent(&mut engine, origin), "2s"), rpn("2s", 2));
+        handle.publish(project(vec![with(&lead, 6, 2)]));
+        run_until(&mut engine, origin + ms(4010));
+        let mut expected = vec!["4s port 0 channel 1 pc 6".to_owned()];
+        expected.extend(rpn("4s", 2));
+        assert_eq!(at_bar(sent(&mut engine, origin), "4s"), expected);
     }
 
     #[test]
@@ -1874,6 +1990,175 @@ mod tests {
         }
     }
 
+    /// `track`, with these events added.
+    fn with_events(track: &Arc<Track>, events: &[(u64, EventKind)]) -> Track {
+        let mut track = (**track).clone();
+        let mut all = track.clip.events().to_vec();
+        all.extend(events.iter().map(|&(start, kind)| ClipEvent {
+            start: Ticks(start),
+            kind,
+        }));
+        track.clip = Clip::new(track.clip.length(), all).unwrap();
+        track
+    }
+
+    /// Where what the engine has sent so far leaves pitch bend and pressure
+    /// on port 0's channel 10: a receiver's state, at rest until something
+    /// moves it. A scheduled output has later messages too.
+    fn expression(engine: &TestEngine) -> (U14, U7) {
+        let mut state = (U14::CENTER, U7::MIN);
+        let now = engine.clock.now();
+        let heard = engine.output.messages().iter();
+        for sent in heard.filter(|sent| sent.port == PortId(0) && sent.at <= now) {
+            match sent.message {
+                MidiMessage::PitchBend {
+                    channel: Channel::DRUMS,
+                    value,
+                } => state.0 = value,
+                MidiMessage::ChannelPressure {
+                    channel: Channel::DRUMS,
+                    pressure,
+                } => state.1 = pressure,
+                _ => {}
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn cleanup_recentres_bends_and_lifts_pressure() {
+        let bent = (U14::new(12_000).unwrap(), U7::new(90).unwrap());
+        let at_rest = (U14::CENTER, U7::MIN);
+        for scheduled in [false, true] {
+            for cleanup in [
+                "stop",
+                "restart",
+                "locate",
+                "panic",
+                "shutdown",
+                "mute",
+                "remove",
+                "port",
+                "channel",
+                "clip without them",
+            ] {
+                // A bend and pressure at beat 0.5 of a two-bar loop.
+                let part = with_events(
+                    &track(1, 10, 7680, &[(0, 60, 960)]),
+                    &[
+                        (480, EventKind::PitchBend { value: bent.0 }),
+                        (480, EventKind::Pressure { value: bent.1 }),
+                    ],
+                );
+                let output = if scheduled {
+                    RecordingOutput::scheduled(ms(50))
+                } else {
+                    RecordingOutput::new()
+                };
+                let (mut handle, mut engine) =
+                    engine(project(vec![Arc::new(part.clone())]), output);
+                let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+                run_until(&mut engine, origin + ms(1000));
+                assert_eq!(expression(&engine), bent);
+                match cleanup {
+                    "stop" => {
+                        apply(&mut handle, &mut engine, TransportCommand::Stop);
+                    }
+                    "restart" => {
+                        // Before the next cycle plays the clip again.
+                        engine
+                            .command(TransportCommand::Play, engine.clock.now())
+                            .unwrap();
+                    }
+                    "locate" => {
+                        apply(
+                            &mut handle,
+                            &mut engine,
+                            TransportCommand::Locate(Ticks(1920)),
+                        );
+                    }
+                    "panic" => {
+                        apply(&mut handle, &mut engine, TransportCommand::Panic);
+                    }
+                    "shutdown" => {
+                        drop(handle);
+                        assert!(!engine.cycle().unwrap());
+                    }
+                    _ => {
+                        let mut changed = part.clone();
+                        match cleanup {
+                            "mute" => changed.muted = true,
+                            "port" => changed.target.port = PortId(1),
+                            "channel" => changed.target.channel = Channel::from_number(3).unwrap(),
+                            "clip without them" => {
+                                changed.clip = track(1, 10, 7680, &[(0, 62, 960)]).clip.clone()
+                            }
+                            _ => {}
+                        }
+                        let tracks = if cleanup == "remove" {
+                            vec![]
+                        } else {
+                            vec![Arc::new(changed)]
+                        };
+                        handle.publish(project(tracks));
+                        // They hold until the bar line.
+                        run_until(&mut engine, origin + ms(1990));
+                        assert_eq!(expression(&engine), bent, "{cleanup}");
+                        run_until(&mut engine, origin + ms(2100));
+                    }
+                }
+                assert_eq!(
+                    expression(&engine),
+                    at_rest,
+                    "{cleanup}, scheduled {scheduled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edits_leave_bends_to_tracks_that_go_on_sending_them() {
+        let bend = EventKind::PitchBend {
+            value: U14::new(12_000).unwrap(),
+        };
+        // The bender holds a bend through its two-bar loop.
+        let bender = with_events(&track(1, 10, 7680, &[]), &[(480, bend)]);
+        let other = track(2, 10, 7680, &[(0, 64, 960)]);
+        for edit in ["notes", "other track"] {
+            let (mut handle, mut engine) = engine(
+                project(vec![Arc::new(bender.clone()), other.clone()]),
+                RecordingOutput::new(),
+            );
+            let origin = apply(&mut handle, &mut engine, TransportCommand::Play);
+            run_until(&mut engine, origin + ms(1000));
+            let tracks = match edit {
+                // New notes, the same bend.
+                "notes" => vec![
+                    Arc::new(with_events(
+                        &track(1, 10, 7680, &[(0, 67, 480)]),
+                        &[(480, bend)],
+                    )),
+                    other.clone(),
+                ],
+                // Another track on the channel changes, not the bender.
+                _ => vec![
+                    Arc::new(bender.clone()),
+                    track(2, 10, 7680, &[(0, 65, 960)]),
+                ],
+            };
+            handle.publish(project(tracks));
+            run_until(&mut engine, origin + ms(2100));
+            let bends: Vec<_> = engine
+                .output
+                .messages()
+                .iter()
+                .filter(|sent| matches!(sent.message, MidiMessage::PitchBend { .. }))
+                .map(what)
+                .collect();
+            assert_eq!(bends, ["port 0 channel 10 bend 12000"], "{edit}");
+        }
+    }
+
     #[test]
     fn panic_ends_notes_and_sends_all_notes_off_everywhere() {
         let held = track(1, 10, 1920, &[(0, 60, 960)]);
@@ -1886,9 +2171,15 @@ mod tests {
         let all_notes_off: Vec<String> = (0..2)
             .flat_map(|port| {
                 (1..=16).flat_map(move |channel| {
-                    [64, 66, 120, 123].map(move |controller| {
-                        format!("100ms port {port} channel {channel} cc {controller}=0")
-                    })
+                    [
+                        "cc 64=0",
+                        "cc 66=0",
+                        "bend 8192",
+                        "pressure 0",
+                        "cc 120=0",
+                        "cc 123=0",
+                    ]
+                    .map(move |what| format!("100ms port {port} channel {channel} {what}"))
                 })
             })
             .collect();
@@ -2568,7 +2859,7 @@ mod tests {
         run_until(&mut engine, origin + ms(200));
         let notes = sent_per_port(&mut engine, origin).map(|port| {
             port.into_iter()
-                .filter(|line| !line.contains(" cc "))
+                .filter(|line| !line.contains(" channel "))
                 .collect::<Vec<_>>()
         });
         // The slower port's note ended with the panic. The faster port
@@ -3108,7 +3399,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_cleanup_releases_pedals_that_race_cancellation() {
+    fn transport_cleanup_releases_pedals_bends_and_pressure_that_race_cancellation() {
         let sustain = HOLD_PEDALS[0];
         for cancel_first in [false, true] {
             for command in [
@@ -3118,17 +3409,24 @@ mod tests {
                 Some(TransportCommand::Panic),
                 None,
             ] {
-                // The note's off and the pedal going down are both queued
-                // for 112.5 ms.
+                // The note's off, the pedal going down, a bend and pressure
+                // are all queued for 112.5 ms.
                 let mut part = (*track(1, 10, 1920, &[(0, 60, 216)])).clone();
                 let mut events = part.clip.events().to_vec();
-                events.push(ClipEvent {
-                    start: Ticks(216),
-                    kind: EventKind::Control {
-                        controller: sustain,
-                        value: U7::MAX,
-                    },
-                });
+                events.extend(
+                    [
+                        EventKind::Control {
+                            controller: sustain,
+                            value: U7::MAX,
+                        },
+                        EventKind::PitchBend { value: U14::MAX },
+                        EventKind::Pressure { value: U7::MAX },
+                    ]
+                    .map(|kind| ClipEvent {
+                        start: Ticks(216),
+                        kind,
+                    }),
+                );
                 part.clip = Clip::new(part.clip.length(), events).unwrap();
                 let (mut handle, link) = link(project(vec![Arc::new(part)]));
                 let origin = Instant::now();
@@ -3151,9 +3449,10 @@ mod tests {
                     assert!(engine.cycle().unwrap());
                 }
                 engine.output.deliver_until(engine.clock.now());
-                assert_eq!(engine.scheduled.len(), 2);
+                assert_eq!(engine.scheduled.len(), 4);
                 // The command samples 110 ms. Inside cancel_from, time
-                // reaches 113 ms, crossing the queued pedal.
+                // reaches 113 ms, crossing the queued pedal, bend and
+                // pressure.
                 engine.output.cancel_advance =
                     Some((engine.clock.clone(), origin + ms(113), cancel_first));
                 if let Some(command) = command {
@@ -3180,6 +3479,19 @@ mod tests {
                     last.is_none_or(|value| value.get() < 64),
                     "{command:?}, cancellation first: {cancel_first}"
                 );
+                for expression in Expression::ALL {
+                    let rest = expression.rest(Channel::DRUMS);
+                    let last = engine
+                        .output
+                        .delivered
+                        .iter()
+                        .map(|message| message.message)
+                        .rfind(|message| mem::discriminant(message) == mem::discriminant(&rest));
+                    assert!(
+                        last.is_none_or(|message| message == rest),
+                        "{expression:?} after {command:?}, cancellation first: {cancel_first}"
+                    );
+                }
                 if !cancel_first {
                     assert!(
                         engine.output.delivered.iter().any(|message| {

@@ -71,6 +71,10 @@ pub struct TrackView {
     /// Bank select LSB, sent before a program shown by number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bank_lsb: Option<u8>,
+    /// How many semitones pitch_bend reaches either way on its channel.
+    /// Missing when the track sets none, leaving the device's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bend_range: Option<u8>,
     /// A muted track plays nothing.
     pub muted: bool,
     /// The length of the track's loop, in beats.
@@ -84,8 +88,8 @@ pub struct TrackView {
     /// clips that aren't step patterns, such as melodies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<Vec<NoteView>>,
-    /// The loop's controls (MIDI CC) in the form set_controls takes, by
-    /// name. Missing when it sends none.
+    /// The loop's controls (MIDI CC), pitch bend and pressure in the form
+    /// set_controls takes, by name. Missing when it sends none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controls: Option<BTreeMap<String, ControlView>>,
     /// How many notes, control changes and other events the loop holds.
@@ -119,6 +123,7 @@ impl TrackView {
             program,
             bank_msb,
             bank_lsb,
+            bend_range: track.bend_range.map(U7::get),
             muted: track.muted,
             loop_beats: beats(track.clip.length()),
             pattern,
@@ -192,22 +197,22 @@ pub struct ControlView {
 }
 
 impl ControlView {
-    /// The controls `clip` sends, by name: `device`'s name for the
-    /// controller where it has one, then the standard name, then the
-    /// number.
+    /// The controls `clip` sends, by name: pitch_bend, pressure, or for a
+    /// controller, `device`'s name for it where it has one, then the
+    /// standard name, then the number.
     fn all(clip: &Clip, device: Option<&DeviceProfile>) -> BTreeMap<String, Self> {
         controls::controls_from_clip(clip)
             .into_iter()
-            .map(|(controller, points)| {
+            .map(|(control, points)| {
                 let points = points
                     .into_iter()
                     .map(|point| PointView {
                         at: beats(point.at),
-                        value: point.value.get(),
+                        value: control.written(point.value),
                         ramp: point.ramp,
                     })
                     .collect();
-                (controls::control_name(controller, device), Self { points })
+                (controls::control_name(control, device), Self { points })
             })
             .collect()
     }
@@ -218,8 +223,9 @@ impl ControlView {
 pub struct PointView {
     /// When, in beats from the start of the loop.
     pub at: f64,
-    /// The value, 0-127.
-    pub value: u8,
+    /// The value: 0-127, or for pitch_bend, -8192 to 8191 around the
+    /// centre at 0.
+    pub value: i32,
     /// How the value gets here from the point before. Missing where it
     /// jumps.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -424,6 +430,12 @@ pub struct AddTrack {
     /// Bank select LSB (controller 32), 0-127, sent before a program given
     /// by number, on gear with banks.
     pub bank_lsb: Option<u8>,
+    /// How many semitones pitch_bend reaches either way, 0-127, so 8191
+    /// bends up this far and -8192 down: sent to the track's channel as
+    /// RPN 0, pitch bend sensitivity, along with its program. Tracks on the
+    /// same port and channel share one. Without it, the device keeps its
+    /// own, often 2. Most synths take up to 24.
+    pub bend_range: Option<u8>,
 }
 
 /// A program: its number, or a name from the track's device.
@@ -482,6 +494,10 @@ pub struct EditTrack {
     pub bank_msb: Option<u8>,
     /// Bank select LSB (controller 32), 0-127, for the program.
     pub bank_lsb: Option<u8>,
+    /// Another bend range, as in add_track, or null to stop sending one.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schemars(with = "Option<u8>")]
+    pub bend_range: Option<Option<u8>>,
 }
 
 /// A field that can be null: `None` when it is missing, `Some(None)` when
@@ -564,14 +580,15 @@ pub struct SetControls {
     /// The track's id.
     pub track: u32,
     /// The controls to set, keyed by a parameter of the track's device (see
-    /// list_devices), a standard name, or a controller number, 0-119. The
-    /// standard names, with their numbers: modulation (1, the mod wheel),
-    /// breath (2), foot (4), portamento_time (5), volume (7), balance (8),
-    /// pan (10), expression (11), sustain (64), portamento (65), sostenuto
-    /// (66), soft_pedal (67), legato (68), resonance (71), release (72),
-    /// attack (73), cutoff (74), decay (75), vibrato_rate (76),
-    /// vibrato_depth (77), vibrato_delay (78), reverb (91), tremolo (92),
-    /// chorus (93), detune (94) and phaser (95).
+    /// list_devices), a standard name, or a controller number, 0-119; or
+    /// pitch_bend, for pitch bend, or pressure, for channel pressure
+    /// (aftertouch). The standard names, with their numbers: modulation (1,
+    /// the mod wheel), breath (2), foot (4), portamento_time (5), volume
+    /// (7), balance (8), pan (10), expression (11), sustain (64), portamento
+    /// (65), sostenuto (66), soft_pedal (67), legato (68), resonance (71),
+    /// release (72), attack (73), cutoff (74), decay (75), vibrato_rate
+    /// (76), vibrato_depth (77), vibrato_delay (78), reverb (91), tremolo
+    /// (92), chorus (93), detune (94) and phaser (95).
     pub controls: BTreeMap<String, ControlLane>,
     /// The loop length in beats, at most 1024, on a track without notes:
     /// on a track with notes, they set the loop. Defaults to the track's
@@ -604,8 +621,10 @@ pub struct ControlPoint {
     /// a beat. A ramp can end at the end of the loop or repeat, which is
     /// where the next pass starts again from the first point.
     pub at: f64,
-    /// The value, 0-127.
-    pub value: u8,
+    /// The value, 0-127. For pitch_bend, -8192 to 8191: 0 is the centre,
+    /// 8191 bends up by the track's bend_range and -8192 down by it, so with
+    /// a range of 2, a whole tone up is 8191 and a semitone 4096.
+    pub value: i32,
     /// How the value gets here from the point before: "linear" ramps
     /// evenly, and "smooth" eases out and in, so smooth ramps between a low
     /// and a high make a sine wave. Without it, the value jumps here. The

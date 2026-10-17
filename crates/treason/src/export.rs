@@ -39,8 +39,10 @@ impl MidiExport for SmfExport {
         for event in events {
             // Keep startup channel setup ahead of every track's notes when
             // a player merges file tracks in order. This also carries muted
-            // tracks' programs to the first unmuted track on their target.
+            // tracks' programs and bend ranges to the first unmuted track
+            // on their target.
             let startup_channel = match event.message {
+                _ if event.is_setup() && event.tick == Ticks::ZERO => event.message.channel(),
                 MidiMessage::ProgramChange { channel, .. } if event.tick == Ticks::ZERO => {
                     Some(channel)
                 }
@@ -133,7 +135,7 @@ mod tests {
 
     use midly::num::u15;
     use midly::{Format, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
-    use treason_core::midi::{Channel, U7};
+    use treason_core::midi::{Channel, U7, U14};
     use treason_core::model::{
         Clip, ClipEvent, EventKind, OutputTarget, PortId, Program, Track, TrackId,
     };
@@ -163,16 +165,21 @@ mod tests {
             },
             muted: false,
             program: None,
+            bend_range: None,
             clip: Clip::new(Ticks(length), events).unwrap(),
         }
     }
 
     #[test]
-    fn programs_go_first_on_the_tracks_that_play_on_their_channel() {
+    fn programs_and_bend_ranges_go_first_on_the_tracks_that_play_on_their_channel() {
         let program = |number| Some(Program::new(U7::new(number).unwrap()));
         let with = |program, muted, track: Track| Track {
             program,
             muted,
+            ..track
+        };
+        let ranged = |semitones, track: Track| Track {
+            bend_range: U7::new(semitones),
             ..track
         };
         let project = Project {
@@ -182,19 +189,25 @@ mod tests {
                     false,
                     track(1, "drums", 10, 3840, &[(0, 36, 240)]),
                 ),
-                // Muted, so not in the file, but its program sets channel 2
-                // for the sub, which leaves the program to it.
-                with(
-                    program(38),
-                    true,
-                    track(2, "bass", 2, 3840, &[(0, 33, 240)]),
+                // Muted, so not in the file, but its program and bend range
+                // set channel 2 for the sub, which leaves them to it.
+                ranged(
+                    12,
+                    with(
+                        program(38),
+                        true,
+                        track(2, "bass", 2, 3840, &[(0, 33, 240)]),
+                    ),
                 ),
                 with(None, false, track(3, "sub", 2, 3840, &[(0, 21, 240)])),
                 // Nothing plays on channel 3 in the file.
-                with(
-                    program(80),
-                    true,
-                    track(4, "lead", 3, 3840, &[(0, 60, 240)]),
+                ranged(
+                    2,
+                    with(
+                        program(80),
+                        true,
+                        track(4, "lead", 3, 3840, &[(0, 60, 240)]),
+                    ),
                 ),
             ]
             .into_iter()
@@ -216,12 +229,57 @@ mod tests {
                 vec![
                     "0 name sub",
                     "0 pc 38 ch2",
+                    // RPN 0, the bend range, then RPN null.
+                    "0 cc101 0 ch2",
+                    "0 cc100 0 ch2",
+                    "0 cc6 12 ch2",
+                    "0 cc38 0 ch2",
+                    "0 cc101 127 ch2",
+                    "0 cc100 127 ch2",
                     "0 on 21 ch2",
                     "240 off 21 ch2",
                     "3840 end"
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn clip_programs_keep_their_restored_range_in_the_export() {
+        let first = track(1, "first", 1, 3840, &[(0, 60, 240)]);
+        let mut setter = track(2, "setter", 1, 960, &[]);
+        setter.bend_range = U7::new(12);
+        setter.clip = Clip::new(
+            Ticks(960),
+            vec![ClipEvent {
+                start: Ticks::ZERO,
+                kind: EventKind::Program {
+                    program: U7::new(5).unwrap(),
+                },
+            }],
+        )
+        .unwrap();
+        let project = Project {
+            tracks: [first, setter].map(Arc::new).into(),
+            ..Project::default()
+        };
+        let file = SmfExport.export(&project, "shared", 1).unwrap();
+        let range = |at| {
+            [(101, 0), (100, 0), (6, 12), (38, 0), (101, 127), (100, 127)]
+                .map(|(cc, value)| format!("{at} cc{cc} {value} ch1"))
+        };
+        let mut first = vec!["0 name first".to_owned()];
+        first.extend(range(0));
+        first.push("0 pc 5 ch1".to_owned());
+        first.extend(range(0));
+        first.extend(["0 on 60 ch1", "240 off 60 ch1", "3840 end"].map(String::from));
+        let mut setter = vec!["0 name setter".to_owned()];
+        for at in [960, 1920, 2880] {
+            setter.push(format!("{at} pc 5 ch1"));
+            setter.extend(range(at));
+        }
+        setter.push("3840 end".to_owned());
+        assert_eq!(tracks(&file)[1..], [first, setter]);
     }
 
     #[test]
@@ -354,6 +412,14 @@ mod tests {
                                 channel,
                                 message: MidiMessage::ProgramChange { program },
                             } => format!("pc {program} ch{}", channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::PitchBend { bend },
+                            } => format!("bend {} ch{}", bend.0, channel.as_int() + 1),
+                            TrackEventKind::Midi {
+                                channel,
+                                message: MidiMessage::ChannelAftertouch { vel },
+                            } => format!("pressure {vel} ch{}", channel.as_int() + 1),
                             TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
                                 format!("name {}", String::from_utf8_lossy(name))
                             }
@@ -371,6 +437,45 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn files_end_with_bends_centred_and_pressure_lifted() {
+        let mut lead = track(1, "lead", 1, 3840, &[(0, 60, 960)]);
+        let mut events = lead.clip.events().to_vec();
+        events.extend([
+            ClipEvent {
+                start: Ticks(480),
+                kind: EventKind::PitchBend {
+                    value: U14::new(0).unwrap(),
+                },
+            },
+            ClipEvent {
+                start: Ticks(480),
+                kind: EventKind::Pressure {
+                    value: U7::new(90).unwrap(),
+                },
+            },
+        ]);
+        lead.clip = Clip::new(Ticks(3840), events).unwrap();
+        let project = Project {
+            tracks: vec![Arc::new(lead)],
+            ..Project::default()
+        };
+        let file = SmfExport.export(&project, "bent", 1).unwrap();
+        assert_eq!(
+            tracks(&file)[1],
+            [
+                "0 name lead",
+                "0 on 60 ch1",
+                "480 bend 0 ch1",
+                "480 pressure 90 ch1",
+                "960 off 60 ch1",
+                "3840 bend 8192 ch1",
+                "3840 pressure 0 ch1",
+                "3840 end",
+            ]
+        );
     }
 
     #[test]

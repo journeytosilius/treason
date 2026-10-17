@@ -74,13 +74,13 @@ seams between modules are fixed and compile-checked before the logic exists.
 | core | `output` | `MidiOutput`, `TimedMessage`, `Delivery` | done |
 | core | `playback` | `Playback`, `TransportCommand`, `PlaybackStatus` | done |
 | core | `export` | `MidiExport`, `ExportError`, `bars`: how long an export runs | done |
-| devices | `profile`, `registry`, `controllers` | `DeviceProfile`, `DeviceRegistry`, and the standard controller names such as `modulation` | done |
+| devices | `profile`, `registry`, `controllers` | `DeviceProfile`, `DeviceRegistry`, the standard controller names such as `modulation`, and `pitch_bend` and `pressure` | done |
 | engine | `link` | `EngineHandle` and `EngineLink`: snapshot pointer, command queue, status, returned snapshots | done |
 | engine | `timebase` | `Timebase`: ticks to when they're heard and back, across tempo changes | done |
-| engine | `notes` | `ActiveNotes`: sounding-note bitsets | done |
+| engine | `notes` | `ActiveNotes`: sounding-note bitsets; the pedals, bends and pressure cleanup ends | done |
 | engine | `clock` | `Clock`, `SystemClock` (spin_sleep), `ManualClock` | done |
 | engine | `transport` | `Transport`: MIDI transport semantics and the messages clock ports get | done |
-| engine | `render` | `render` (clip events, programs and clock pulses in a window), `clock_pulses`, `render_song` (a whole song, with its notes ended) | done |
+| engine | `render` | `render` (clip events, channel setup and clock pulses in a window), `clock_pulses`, `render_song` (a whole song, with its notes ended and its channels at rest) | done |
 | engine | `runtime` | `Engine`, `EngineConfig`, `spawn`, per-port latency, real-time priority | done |
 | io | `memory` | `RecordingOutput` | done |
 | io | `midir_output` (feature `midir`, default) | `MidirOutput`: ports, virtual ports, port listing | done |
@@ -191,9 +191,11 @@ and stops, and the transport tools report that it isn't running.
   resumes from its start tick, including its first clock pulse.
 - Tempo changes and transport commands apply at once. Other edits, such
   as a new clip, a mute or a move to another port, wait for the next bar
-  line. There the notes still sounding from tracks that changed end; a
-  track that only got a new name, device or program plays on. While stopped, edits
-  apply at once. The boundary comes from the playhead, even if lookahead has
+  line. There the notes still sounding from tracks that changed end, their
+  pedals are released, and the bend and pressure they left behind go back
+  to rest unless the new clip goes on sending them on the same channel; a
+  track that only got a new name, device, program or bend range plays on.
+  While stopped, edits apply at once. The boundary comes from the playhead, even if lookahead has
   already rendered or submitted that bar. Future work there is replaced,
   and the previous snapshot stays available until delivery, so another edit
   or undo can still replace the same upcoming bar.
@@ -211,22 +213,29 @@ and stops, and the transport tools report that it isn't running.
   including any pending bar switch.
 - Play starts from the top, and restarts there while playing. Continue
   resumes where playback stopped, and Stop keeps the position.
-- At the same tick, note-offs go out first, then bank selects, program
-  changes, other control changes and note-ons. A retriggered note isn't cut
-  short, a program change gets the bank selected with it, and a note plays
-  with the program and controller values set on its tick. Within each
-  group, events keep their order, by track and then as written in the
-  clip, so RPN sequences and repeated controllers arrive as written.
-- A track's program, after its bank selects, goes out where playback
-  starts, on Play, Continue and Locate, and at the bar line where a new
-  snapshot changes it, ahead of its clip's events on that tick. Tracks on
-  one port and channel share its program, so the first that sets one sends
-  it. A new snapshot sends only the programs the one before it didn't set
-  on that port and channel; one that sets none there leaves the device's
-  sound as it is. Muted tracks send theirs too, so a track sounds right
-  when it's unmuted, as do the tracks that share its channel. Programs are
+- At the same tick, note-offs go out first, then the channels' setup, then
+  the clips' bank selects, program changes, other control changes with
+  pitch bend and pressure, and note-ons. A retriggered note isn't cut
+  short, the clips build on the setup, a program change gets the bank
+  selected with it, and a note plays with the program, controller and bend
+  values set on its tick. Within each group, events keep their order, by
+  track and then as written in the clip, so RPN sequences and repeated
+  controllers arrive as written. Each clip program change restores the
+  channel's configured bend range, including on later loop passes, before
+  explicit clip controls can override it. The setup goes channel by channel.
+- A channel's setup goes out where playback starts, on Play, Continue and
+  Locate, and at the bar line where a new snapshot changes it: the
+  program, after its bank selects, then the bend range, as RPN 0
+  (controllers 101 and 100 select it, 6 and 38 set semitones and cents,
+  and selecting the null RPN afterwards keeps later data entry off it).
+  Tracks on one port and channel share both, so the first that sets each
+  sends it. A new snapshot sends only what the one before it didn't set on
+  that port and channel, and the bend range again after a new program,
+  since a program change can reset it; one that sets none there leaves the
+  device as it is. Muted tracks send theirs too, so a track sounds right
+  when it's unmuted, as do the tracks that share its channel. The setup is
   rendered with the clips, so rewinds and windows split within a tick send
-  each one once, in order.
+  each message once, in order.
 - treason is the clock master for the ports configured with
   `clock = true`. While playing, they get a MIDI clock pulse every 40 ticks,
   first among the messages on its tick. Play sends them Start. The engine
@@ -260,8 +269,13 @@ and stops, and the transport tools report that it isn't running.
    cancellation, even after normal note-offs have emptied the key set.
    Cleanup releases active pedals on the affected channels; pedals are
    channel-wide, so this also releases holds from other tracks sharing a
-   channel. Panic resets both pedals and sends All Sound Off and All Notes
-   Off on every channel, including for voices the engine did not start.
+   channel. The same bitsets track each channel's pitch bend off centre and
+   pressure above zero, with the track that left them there. Stop, jumps
+   and shutdown put them back at rest; at a bar line, a changed track rests
+   only the ones it left, unless its new clip goes on sending them, so
+   another track's bend stays. Panic resets both pedals, bend and pressure,
+   then sends All Sound Off and All Notes Off on every channel, including
+   for voices the engine did not start.
 
 ## Project model
 
@@ -270,11 +284,12 @@ and stops, and the transport tools report that it isn't running.
   list of old snapshots.
 - A `Track` sends to one `OutputTarget` (port and channel) and loops one
   `Clip`. It may set a `Program` there: a program number and, for gear
-  with banks, bank select bytes. Tracks on one target agree on its
-  program, so an edit or a file that would give it two is refused.
+  with banks, bank select bytes; and a bend range, in semitones. Tracks on
+  one target agree on its program and bend range, so an edit or a file
+  that would give it two is refused.
 - A `Clip` has its own length, so clips of different lengths give polymeter.
-  It holds note, control-change and program-change events sorted by start
-  tick. Micro-timing is just where an event sits. A note can run past the
+  It holds note, control-change, program-change, pitch-bend and
+  channel-pressure events sorted by start tick. Micro-timing is just where an event sits. A note can run past the
   loop point into the next pass, but can't be longer than the loop.
 - Planned event fields: probability, ratchets, conditions (every N loops,
   fills) and per-step control values.
@@ -289,7 +304,8 @@ with bank select bytes where the device has banks) and parameters (CC
 numbers; NRPN is planned). Names need a letter, because tools read a bare
 number as a MIDI note, controller or program. Any track can also name the controllers MIDI defines,
 such as `modulation` (1), `volume` (7) and `cutoff` (74), from
-`controllers`; a profile's own parameter names come first.
+`controllers`; a profile's own parameter names come first. `pitch_bend`
+and `pressure` name those messages, so no parameter may take them.
 `devices/gm-drums.toml` covers the General MIDI drum map and the GM2 and GS
 drum kits, and `devices/gm.toml` names the 128 General MIDI programs.
 Profiles for real gear can be generated from the MIDI Guide dataset
@@ -330,7 +346,8 @@ example calls in order over an MCP session, and another makes
 while the committed file differs, so neither drifts from the code.
 
 `add_track` and `edit_track` take a track's program by number, with bank
-select bytes, or by its device's name for it, which brings its own bank.
+select bytes, or by its device's name for it, which brings its own bank,
+and its bend range in semitones.
 `get_project` shows it back by name where the device has one for that
 program and bank, and by number otherwise. A name the device doesn't have
 is refused with up to five of its names that share a word with it.
@@ -345,8 +362,8 @@ device voice or alias for another note, readback uses the decimal MIDI
 number instead, so writing the notes back preserves their pitches.
 
 `set_controls` moves a track's controls (MIDI CC), such as a synth's mod
-wheel or filter cutoff, with or without notes on the track. Each control is
-a list of points, values at times in beats, that it jumps to or ramps to
+wheel or filter cutoff, and its pitch bend and channel pressure, with or
+without notes on the track. Each control is a list of points, values at times in beats, that it jumps to or ramps to
 from the point before, linearly or along half a sine wave, so ramps between
 a low and a high make an LFO. A control can repeat its points every few
 beats through the loop.
@@ -354,7 +371,11 @@ beats through the loop.
 - The MCP layer turns the points into control changes in the clip, so the
   engine plays them like any other event. A ramp sends a value on a grid of
   1/32 beats, and only where it has changed, which bounds what it adds to a
-  DIN port. A clip holds at most 8192 control changes.
+  DIN port. A clip holds at most 8192 control changes, bends and pressure
+  changes together.
+- Pitch bend takes values from -8192 to 8191 around the centre, 0, and is
+  sent as 14 bits. The tools write it signed, as musicians think of it,
+  and the clip holds what goes on the wire.
 - A point may end a ramp on the end of the loop or of the repeat. It sends
   nothing there, since the next pass starts again from the first point.
 - `set_steps` and `set_notes` replace the notes and keep the control
@@ -379,8 +400,8 @@ beats through the loop.
 
 `save_project` writes the project to `<projects>/<name>.toml`, and
 `load_project` reads it back exactly: the tempo, the time signature, and
-every track with its id, name, device, port, channel, program, mute and
-clip.
+every track with its id, name, device, port, channel, program, bend
+range, mute and clip.
 `treason serve --project <name>` starts with one, and `treason projects`
 lists them.
 
@@ -390,10 +411,11 @@ lists them.
   read is refused as such.
 - Tracks name their port, since a port's number is its place in
   `treason.toml`. Times are whole ticks, and events go one to a line, in
-  the clip's order, so events on the same tick keep their order.
+  the clip's order, so events on the same tick keep their order. Pitch
+  bends are written signed, -8192 to 8191, as the tools take them.
 - Loading checks what an edit would: every port and device exists, track
-  ids are unique, tracks on one channel agree on its program and clips are
-  valid. A file that fails changes nothing.
+  ids are unique, tracks on one channel agree on its program and bend
+  range, and clips are valid. A file that fails changes nothing.
 - Saving writes a temporary file and flushes it to disk. A new name is
   published with a hard link, which atomically refuses an existing name
   even when another process saves it concurrently. Replacements rename
@@ -426,11 +448,12 @@ saved project. A DAW opens it with each part on its own track.
   named after it, with its messages on its channel. Muted tracks are left
   out, as they are from playback. MIDI clock and transport messages are
   for live gear and stay out of the file.
-- Bank selects and program changes at tick 0 go to the first unmuted file
-  track on their port and channel, in render order, ahead of its notes.
-  This keeps channel setup ahead of notes on later file tracks too, even
-  when a later or muted track sets the program. A muted track's program
-  stays out when no unmuted track shares its port and channel.
+- The channels' setup, with their bend ranges, and the bank selects and
+  program changes with their restored ranges at tick 0 go to the first
+  unmuted file track on their port and channel, in render order, ahead of
+  its notes. This keeps channel setup ahead of notes on later file tracks
+  too, even when a later or muted track sets it. A muted track's setup stays
+  out when no unmuted track shares its port and channel.
 - The file plays from bar 1 for a number of bars: by default until every
   loop that plays something ends on the same bar line, so each pattern is
   complete. A one-bar drum loop with a three-bar bass line exports three
@@ -441,8 +464,9 @@ saved project. A DAW opens it with each part on its own track.
   plays it, so the file holds what `play` would send. Notes still sounding
   at the end stop there, and a note started again before it ended gets a
   note-off for each start. Active sustain and sostenuto pedals are then
-  released at the export boundary, even when all keys ended earlier.
-  Pedal state is shared by tracks on the same port and channel, and these
+  released at the export boundary, even when all keys ended earlier, and
+  pitch bend left off centre or pressure above zero goes back to rest.
+  This state is shared by tracks on the same port and channel, and these
   final releases count toward the export's event limit.
 - An export is counted before it is rendered, and one of more than
   1,000,000 events is refused, which bounds the memory and the file.
@@ -553,7 +577,7 @@ Then expression, the rest of what MIDI 1.0 gives a sequencer to say:
     in the `gm` profile and patch names in any profile. Done.
 14. Pitch bend and channel pressure: `pitch_bend` and `pressure` in
     `set_controls`, bend recentred on stop, and a bend range per track
-    (RPN 0).
+    (RPN 0). Done.
 15. Per-note expression: polyphonic aftertouch and release velocity in
     `set_notes`, and more velocities in step strings, such as ghost notes.
 16. Fine control: 14-bit controllers, RPN and NRPN, with NRPN parameters

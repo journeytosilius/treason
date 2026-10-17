@@ -1,18 +1,21 @@
-//! Controls (MIDI CC) written as points, for modulation and automation.
+//! Controls written as points, for modulation and automation: control
+//! changes (MIDI CC), pitch bend and channel pressure.
 //!
 //! The agent names a controller by a parameter of the track's device, a
-//! standard name such as `modulation`, or its number, and gives its values
-//! as points in beats, each jumping there or ramping from the point before.
-//! [`clip_with_controls`] turns those into control changes, a ramp sending
-//! its value at most every [`RAMP_STEP`]. [`controls_from_clip`] reads a
-//! clip's control changes back as points that send the same.
+//! standard name such as `modulation`, or its number, or names pitch bend
+//! or pressure, and gives its values as points in beats, each jumping there
+//! or ramping from the point before. [`clip_with_controls`] turns those
+//! into changes, a ramp sending its value at most every [`RAMP_STEP`].
+//! [`controls_from_clip`] reads a clip's changes back as points that send
+//! the same.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::f64::consts::PI;
+use std::fmt;
 
 use thiserror::Error;
-use treason_core::midi::U7;
+use treason_core::midi::{U7, U14};
 use treason_core::model::{Clip, ClipError, ClipEvent, EventKind};
 use treason_core::time::{PPQN, Ticks};
 use treason_devices::{DeviceProfile, controllers};
@@ -20,8 +23,9 @@ use treason_devices::{DeviceProfile, controllers};
 use crate::dto::{ControlLane, Ramp};
 use crate::notes::{MAX_LOOP_BEATS, beats, ticks};
 
-/// The most control changes a clip can hold. It bounds what a loop sends
-/// and what each edit keeps for undo.
+/// The most changes a clip's controls can hold, control changes, pitch
+/// bend and pressure together. It bounds what a loop sends and what each
+/// edit keeps for undo.
 pub const MAX_CONTROL_CHANGES: usize = 8192;
 
 /// The most points one control can have: one for each change a clip can
@@ -56,7 +60,7 @@ pub enum ControlsError {
     /// A name that is neither a parameter of the track's device nor a
     /// standard name.
     #[error(
-        "`{name}` is not a parameter of {device} ({params}), a standard name such as modulation or cutoff, or a controller number 0-119"
+        "`{name}` is not a parameter of {device} ({params}), a standard name such as modulation or cutoff, pitch_bend, pressure, or a controller number 0-119"
     )]
     UnknownParam {
         /// The name as written.
@@ -68,7 +72,7 @@ pub enum ControlsError {
     },
     /// A name that isn't a standard name, on a track without a device.
     #[error(
-        "`{0}` is not a standard name such as modulation or cutoff, or a controller number 0-119; for a device's own names, give the track a device with edit_track (see list_devices)"
+        "`{0}` is not a standard name such as modulation or cutoff, pitch_bend, pressure, or a controller number 0-119; for a device's own names, give the track a device with edit_track (see list_devices)"
     )]
     UnknownControl(String),
     /// A number that isn't a control's controller.
@@ -84,15 +88,15 @@ pub enum ControlsError {
         /// The controller it names.
         controller: U7,
     },
-    /// Two names for the same controller.
-    #[error("`{first}` and `{second}` are both controller {controller}: give each control once")]
-    SameController {
+    /// Two names for the same control.
+    #[error("`{first}` and `{second}` are both {control}: give each control once")]
+    SameControl {
         /// One name.
         first: String,
         /// The other.
         second: String,
-        /// The controller both name.
-        controller: U7,
+        /// The control both name.
+        control: Control,
     },
     /// A loop length out of range.
     #[error("loop_beats must be more than 0 and at most {MAX_LOOP_BEATS}, not {0}")]
@@ -108,9 +112,9 @@ pub enum ControlsError {
         "the controls need a {0}-beat loop of whole bars, longer than the longest of {MAX_LOOP_BEATS} beats: pass loop_beats, or move the last points earlier"
     )]
     PastLongestLoop(f64),
-    /// More control changes than a clip can hold.
+    /// More changes than a clip can hold.
     #[error(
-        "the track's controls would send more than {MAX_CONTROL_CHANGES} control changes each loop: use fewer points, ramps that change less, or a shorter loop"
+        "the track's controls would send more than {MAX_CONTROL_CHANGES} changes each loop: use fewer points, ramps that change less, or a shorter loop"
     )]
     TooManyChanges,
     /// One control is wrong.
@@ -175,9 +179,14 @@ pub enum PointError {
     /// A time out of range.
     #[error("at must be from 0 to {MAX_LOOP_BEATS} beats, not {0}")]
     At(f64),
-    /// A value past MIDI's range.
-    #[error("value must be 0-127, not {0}")]
-    Value(u8),
+    /// A value past the control's range.
+    #[error("value must be {range}, not {value}")]
+    Value {
+        /// The value as written.
+        value: i32,
+        /// The control's range.
+        range: &'static str,
+    },
     /// The first point ramps, from nothing.
     #[error(
         "it ramps, but it's the first point, with none before it to ramp from: drop its ramp, or add a point before it"
@@ -204,13 +213,103 @@ pub enum PointError {
     JumpAtEnd(&'static str),
 }
 
+/// What a control sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Control {
+    /// Control changes on this controller.
+    Controller(U7),
+    /// Channel pressure, or aftertouch.
+    Pressure,
+    /// Pitch bend.
+    PitchBend,
+}
+
+impl Control {
+    /// The control a clip event sends, and its value as sent, unless it's a
+    /// note or a program change.
+    pub fn of(kind: EventKind) -> Option<(Self, u16)> {
+        match kind {
+            EventKind::Control { controller, value } => {
+                Some((Self::Controller(controller), value.get().into()))
+            }
+            EventKind::Pressure { value } => Some((Self::Pressure, value.get().into())),
+            EventKind::PitchBend { value } => Some((Self::PitchBend, value.get())),
+            EventKind::Note { .. } | EventKind::Program { .. } => None,
+        }
+    }
+
+    /// The event that sends `value`, as sent.
+    fn event(self, value: u16) -> EventKind {
+        let u7 = || U7::saturating(u8::try_from(value).unwrap_or(u8::MAX));
+        match self {
+            Self::Controller(controller) => EventKind::Control {
+                controller,
+                value: u7(),
+            },
+            Self::Pressure => EventKind::Pressure { value: u7() },
+            Self::PitchBend => EventKind::PitchBend {
+                value: U14::new(value).unwrap_or(U14::MAX),
+            },
+        }
+    }
+
+    /// The highest value it sends.
+    const fn max(self) -> u16 {
+        match self {
+            Self::PitchBend => U14::MAX.get(),
+            Self::Controller(_) | Self::Pressure => U7::MAX.get() as u16,
+        }
+    }
+
+    /// What the value the agent writes is short of the value sent: pitch
+    /// bend is written from -8192 to 8191, around its centre at 0, and sent
+    /// from 0 to 16383.
+    const fn offset(self) -> i32 {
+        match self {
+            Self::PitchBend => U14::CENTER.get() as i32,
+            Self::Controller(_) | Self::Pressure => 0,
+        }
+    }
+
+    /// The values the agent can write, for errors.
+    const fn range(self) -> &'static str {
+        match self {
+            Self::PitchBend => "-8192 to 8191, with 0 the centre",
+            Self::Controller(_) | Self::Pressure => "0-127",
+        }
+    }
+
+    /// The value the agent writes for one sent.
+    pub fn written(self, value: u16) -> i32 {
+        i32::from(value) - self.offset()
+    }
+
+    /// The value sent for one the agent writes, if it's in range.
+    fn sent(self, value: i32) -> Option<u16> {
+        value
+            .checked_add(self.offset())
+            .and_then(|sent| u16::try_from(sent).ok())
+            .filter(|&sent| sent <= self.max())
+    }
+}
+
+impl fmt::Display for Control {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Controller(controller) => write!(f, "controller {controller}"),
+            Self::Pressure => f.write_str("channel pressure"),
+            Self::PitchBend => f.write_str("pitch bend"),
+        }
+    }
+}
+
 /// A control's value at a point in a loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Point {
     /// When, from the start of the loop, or of each repeat.
     pub at: Ticks,
-    /// The value.
-    pub value: U7,
+    /// The value, as sent.
+    pub value: u16,
     /// How the value gets here from the point before. `None` jumps.
     pub ramp: Option<Ramp>,
 }
@@ -219,7 +318,7 @@ pub struct Point {
 struct Lane<'a> {
     /// The control as written.
     name: &'a str,
-    controller: U7,
+    control: Control,
     /// Sorted by time; successive jumps on one tick keep their input order.
     points: Vec<Point>,
     /// Where each point was in the agent's list, counting from 1.
@@ -230,9 +329,9 @@ struct Lane<'a> {
 /// The clip `clip` becomes with `controls` set, on a track whose device is
 /// `device`, in a project whose bars are `bar` long.
 ///
-/// A control replaces the changes `clip` sends on its controller, and one
-/// with no points removes them. The notes, program changes and other
-/// controls stay. A track with notes keeps its loop. On any other,
+/// A control replaces the changes `clip` sends on its controller, or of
+/// pitch bend or pressure, and one with no points removes them. The notes,
+/// program changes and other controls stay. A track with notes keeps its loop. On any other,
 /// `loop_beats` sets the loop, which otherwise stays, unless the track
 /// holds only these controls: then it lasts until the end of the last point
 /// or repeat, rounded up to whole bars. A shorter loop cuts off the other
@@ -249,22 +348,20 @@ pub fn clip_with_controls(
     }
     let mut lanes: Vec<Lane<'_>> = Vec::with_capacity(controls.len());
     for (name, lane) in controls {
-        let controller = resolve(name, device)?;
-        if let Some(first) = lanes.iter().find(|lane| lane.controller == controller) {
-            return Err(ControlsError::SameController {
+        let control = resolve(name, device)?;
+        if let Some(first) = lanes.iter().find(|lane| lane.control == control) {
+            return Err(ControlsError::SameControl {
                 first: first.name.to_owned(),
                 second: name.clone(),
-                controller,
+                control,
             });
         }
-        lanes.push(place(name, controller, lane)?);
+        lanes.push(place(name, control, lane)?);
     }
 
-    let replaced = |event: &ClipEvent| match event.kind {
-        EventKind::Control { controller, .. } => {
-            lanes.iter().any(|lane| lane.controller == controller)
-        }
-        _ => false,
+    let replaced = |event: &ClipEvent| {
+        Control::of(event.kind)
+            .is_some_and(|(control, _)| lanes.iter().any(|lane| lane.control == control))
     };
     let kept: Vec<(usize, ClipEvent)> = clip
         .events()
@@ -313,18 +410,18 @@ pub fn clip_with_controls(
         .collect();
     let mut changes = events
         .iter()
-        .filter(|(_, event)| matches!(event.kind, EventKind::Control { .. }))
+        .filter(|(_, event)| Control::of(event.kind).is_some())
         .count();
-    // Replace each controller occurrence in its original same-tick slot.
+    // Replace each control's occurrence in its original same-tick slot.
     // Grouping lanes by name must not move RPN selection after Data Entry,
     // or regroup interleaved occurrences of a repeated controller.
-    let mut slots: BTreeMap<(Ticks, U7), VecDeque<usize>> = BTreeMap::new();
+    let mut slots: BTreeMap<(Ticks, Control), VecDeque<usize>> = BTreeMap::new();
     for (position, event) in clip.events().iter().enumerate() {
         if replaced(event)
-            && let EventKind::Control { controller, .. } = event.kind
+            && let Some((control, _)) = Control::of(event.kind)
         {
             slots
-                .entry((event.start, controller))
+                .entry((event.start, control))
                 .or_default()
                 .push_back(position);
         }
@@ -336,17 +433,14 @@ pub fn clip_with_controls(
                 return Err(ControlsError::TooManyChanges);
             }
             let position = slots
-                .get_mut(&(Ticks(tick), lane.controller))
+                .get_mut(&(Ticks(tick), lane.control))
                 .and_then(VecDeque::pop_front)
                 .unwrap_or(clip.events().len());
             events.push((
                 position,
                 ClipEvent {
                     start: Ticks(tick),
-                    kind: EventKind::Control {
-                        controller: lane.controller,
-                        value,
-                    },
+                    kind: lane.control.event(value),
                 },
             ));
             Ok(())
@@ -361,7 +455,7 @@ pub fn clip_with_controls(
     )?)
 }
 
-/// `notes`, a track's new clip of notes, with the control and program
+/// `notes`, a track's new clip of notes, with the controls and program
 /// changes of its `old` clip that start within it, so that writing notes
 /// leaves the controls as they are.
 pub fn keep_controls(old: &Clip, notes: Clip) -> Result<Clip, ClipError> {
@@ -374,18 +468,18 @@ pub fn keep_controls(old: &Clip, notes: Clip) -> Result<Clip, ClipError> {
     Clip::new(length, events)
 }
 
-/// The controls `clip` sends, by controller, as points that send the same
-/// control changes when set_controls writes them over the same loop.
+/// The controls `clip` sends, as points that send the same changes when
+/// set_controls writes them over the same loop.
 ///
 /// The changes a ramp sends read back as that ramp, so a control that
 /// set_controls wrote reads back much as it was written, but for a repeat,
 /// which reads back as every pass of it. Other changes read back as jumps.
-pub fn controls_from_clip(clip: &Clip) -> BTreeMap<U7, Vec<Point>> {
-    let mut changes: BTreeMap<U7, Vec<(u64, U7)>> = BTreeMap::new();
+pub fn controls_from_clip(clip: &Clip) -> BTreeMap<Control, Vec<Point>> {
+    let mut changes: BTreeMap<Control, Vec<(u64, u16)>> = BTreeMap::new();
     for event in clip.events() {
-        if let EventKind::Control { controller, value } = event.kind {
+        if let Some((control, value)) = Control::of(event.kind) {
             changes
-                .entry(controller)
+                .entry(control)
                 .or_default()
                 .push((event.start.0, value));
         }
@@ -393,18 +487,23 @@ pub fn controls_from_clip(clip: &Clip) -> BTreeMap<U7, Vec<Point>> {
     let mut budget = READ_BUDGET;
     changes
         .into_iter()
-        .map(|(controller, changes)| {
-            let points = read(&changes, clip.length().0, &mut budget);
-            (controller, points)
+        .map(|(control, changes)| {
+            let points = read(&changes, clip.length().0, control.max(), &mut budget);
+            (control, points)
         })
         .collect()
 }
 
-/// What to call `controller` on a track whose device is `device`: the
-/// device's name for it, else its standard name unless the device uses
-/// that name for another controller, else its number. Each resolves back to
-/// `controller`.
-pub fn control_name(controller: U7, device: Option<&DeviceProfile>) -> String {
+/// What to call `control` on a track whose device is `device`. A
+/// controller goes by the device's name for it, else its standard name
+/// unless the device uses that name for another controller, else its
+/// number. Each resolves back to `control`.
+pub fn control_name(control: Control, device: Option<&DeviceProfile>) -> String {
+    let controller = match control {
+        Control::Controller(controller) => controller,
+        Control::Pressure => return controllers::PRESSURE.to_owned(),
+        Control::PitchBend => return controllers::PITCH_BEND.to_owned(),
+    };
     if let Some(name) = device.and_then(|device| device.param_name(controller)) {
         return name.to_owned();
     }
@@ -414,10 +513,15 @@ pub fn control_name(controller: U7, device: Option<&DeviceProfile>) -> String {
     }
 }
 
-/// The controller a control names. Numbers, written as digits, are
-/// controller numbers. A name is a parameter of the device first, then a
-/// standard name.
-fn resolve(name: &str, device: Option<&DeviceProfile>) -> Result<U7, ControlsError> {
+/// The control a name names. Numbers, written as digits, are controller
+/// numbers, and pitch_bend and pressure name those. Another name is a
+/// parameter of the device first, then a standard name.
+fn resolve(name: &str, device: Option<&DeviceProfile>) -> Result<Control, ControlsError> {
+    match name {
+        controllers::PITCH_BEND => return Ok(Control::PitchBend),
+        controllers::PRESSURE => return Ok(Control::Pressure),
+        _ => {}
+    }
     let controller = if !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()) {
         name.parse()
             .ok()
@@ -453,11 +557,15 @@ fn resolve(name: &str, device: Option<&DeviceProfile>) -> Result<U7, ControlsErr
             controller,
         });
     }
-    Ok(controller)
+    Ok(Control::Controller(controller))
 }
 
 /// Checks one control on its own, and puts its points in order.
-fn place<'a>(name: &'a str, controller: U7, lane: &ControlLane) -> Result<Lane<'a>, ControlsError> {
+fn place<'a>(
+    name: &'a str,
+    control: Control,
+    lane: &ControlLane,
+) -> Result<Lane<'a>, ControlsError> {
     let wrong = |error| ControlsError::Control {
         control: name.to_owned(),
         error,
@@ -476,9 +584,12 @@ fn place<'a>(name: &'a str, controller: U7, lane: &ControlLane) -> Result<Lane<'
         .map_err(wrong)?;
     let mut points = Vec::with_capacity(lane.points.len());
     for (index, spec) in lane.points.iter().enumerate() {
-        let point = match (ticks(spec.at), U7::new(spec.value)) {
+        let point = match (ticks(spec.at), control.sent(spec.value)) {
             (None, _) => Err(PointError::At(spec.at)),
-            (_, None) => Err(PointError::Value(spec.value)),
+            (_, None) => Err(PointError::Value {
+                value: spec.value,
+                range: control.range(),
+            }),
             (Some(at), Some(value)) => Ok(Point {
                 at,
                 value,
@@ -515,7 +626,7 @@ fn place<'a>(name: &'a str, controller: U7, lane: &ControlLane) -> Result<Lane<'
     let (positions, points) = points.into_iter().unzip();
     Ok(Lane {
         name,
-        controller,
+        control,
         points,
         positions,
         repeat,
@@ -579,7 +690,7 @@ impl Lane<'_> {
     fn send<E>(
         &self,
         length: Ticks,
-        mut send: impl FnMut(u64, U7) -> Result<(), E>,
+        mut send: impl FnMut(u64, u16) -> Result<(), E>,
     ) -> Result<(), E> {
         let period = self.repeat.unwrap_or(length).0;
         if self.points.is_empty() {
@@ -612,19 +723,19 @@ impl Lane<'_> {
 /// of the loop, the value there if it has changed.
 struct RampValues {
     ramp: Ramp,
-    from: (u64, U7),
-    to: (u64, U7),
+    from: (u64, u16),
+    to: (u64, u16),
     /// The next step of the grid to work out.
     tick: u64,
     /// Where to stop: the next point, or the end of the loop.
     stop: u64,
     /// The value sent last.
-    last: U7,
+    last: u16,
 }
 
 impl RampValues {
     /// The values a ramp from `from` to `to` sends before `end`.
-    fn new(ramp: Ramp, from: (u64, U7), to: (u64, U7), end: u64) -> Self {
+    fn new(ramp: Ramp, from: (u64, u16), to: (u64, u16), end: u64) -> Self {
         let step = RAMP_STEP.0;
         Self {
             ramp,
@@ -638,7 +749,7 @@ impl RampValues {
 }
 
 impl Iterator for RampValues {
-    type Item = (u64, U7);
+    type Item = (u64, u16);
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.tick < self.stop {
@@ -657,8 +768,8 @@ impl Iterator for RampValues {
 /// A ramp's value at `tick`, between its points `from` and `to`. The
 /// change from `from`'s value rounds half away from zero, so ramps up and
 /// down mirror each other.
-fn value_at(ramp: Ramp, (start, from): (u64, U7), (end, to): (u64, U7), tick: u64) -> U7 {
-    let change = i128::from(to.get()) - i128::from(from.get());
+fn value_at(ramp: Ramp, (start, from): (u64, u16), (end, to): (u64, u16), tick: u64) -> u16 {
+    let change = i128::from(to) - i128::from(from);
     let (elapsed, span) = (i128::from(tick - start), i128::from(end - start));
     let offset = match ramp {
         Ramp::Linear => {
@@ -670,17 +781,19 @@ fn value_at(ramp: Ramp, (start, from): (u64, U7), (end, to): (u64, U7), tick: u6
             (change as f64 * eased).round() as i128
         }
     };
-    let value = (i128::from(from.get()) + offset).clamp(0, i128::from(U7::MAX.get()));
-    U7::saturating(value as u8)
+    // Between the two, which rounding can't overshoot.
+    let value = (i128::from(from) + offset).clamp(from.min(to).into(), from.max(to).into());
+    value as u16
 }
 
-/// Points that send `changes`, the changes one controller makes through a
-/// loop `length` long, in time order. Starting from the first change, each
-/// point reaches as far as one ramp can: to the last change a linear or
-/// smooth ramp sends exactly the changes up to, or failing that, a jump to
-/// the next change. Working out ramps spends `budget`.
-fn read(changes: &[(u64, U7)], length: u64, budget: &mut u64) -> Vec<Point> {
-    let point = |(tick, value): (u64, U7), ramp| Point {
+/// Points that send `changes`, the changes one control makes through a
+/// loop `length` long, in time order, its values at most `max`. Starting
+/// from the first change, each point reaches as far as one ramp can: to the
+/// last change a linear or smooth ramp sends exactly the changes up to, or
+/// failing that, a jump to the next change. Working out ramps spends
+/// `budget`.
+fn read(changes: &[(u64, u16)], length: u64, max: u16, budget: &mut u64) -> Vec<Point> {
+    let point = |(tick, value): (u64, u16), ramp| Point {
         at: Ticks(tick),
         value,
         ramp,
@@ -693,7 +806,7 @@ fn read(changes: &[(u64, U7)], length: u64, budget: &mut u64) -> Vec<Point> {
     'points: while from + 1 < changes.len() {
         let last = run_end(changes, from);
         if last == changes.len() - 1
-            && let Some(end) = ramp_to_loop_end(changes, from, length, first.1, budget)
+            && let Some(end) = ramp_to_loop_end(changes, from, length, (first.1, max), budget)
         {
             points.push(end);
             break;
@@ -716,7 +829,7 @@ fn read(changes: &[(u64, U7)], length: u64, budget: &mut u64) -> Vec<Point> {
 /// The last change a ramp from `changes[from]` could reach. The changes a
 /// ramp sends on its way sit on the grid, each later than the one before
 /// and a step the same way.
-fn run_end(changes: &[(u64, U7)], from: usize) -> usize {
+fn run_end(changes: &[(u64, u16)], from: usize) -> usize {
     let mut end = from + 1;
     let mut direction = None;
     // Could `changes[end]` be a value sent on the way to a later one?
@@ -738,12 +851,12 @@ fn run_end(changes: &[(u64, U7)], from: usize) -> usize {
 
 /// A ramp from `changes[from]` to the end of the loop that sends every
 /// change after it, preferring to end on `first`, the loop's first value,
-/// so the loop comes round smoothly.
+/// so the loop comes round smoothly. Values go up to `max`.
 fn ramp_to_loop_end(
-    changes: &[(u64, U7)],
+    changes: &[(u64, u16)],
     from: usize,
     length: u64,
-    first: U7,
+    (first, max): (u16, u16),
     budget: &mut u64,
 ) -> Option<Point> {
     let (start, value) = changes[from];
@@ -751,19 +864,19 @@ fn ramp_to_loop_end(
     if changes.len() <= from + 1 || length - start > MAX_LOOP {
         return None;
     }
-    // The ramp ends at or beyond the last value it sent.
-    let beyond: Vec<u8> = if last > value {
-        (last.get()..=U7::MAX.get()).collect()
+    // The ramp ends at or beyond the last value it sent, most likely just
+    // beyond it.
+    let beyond: Vec<u16> = if last > value {
+        (last..=max).collect()
     } else {
-        (0..=last.get()).rev().collect()
+        (0..=last).rev().collect()
     };
     let ends = beyond
         .iter()
-        .filter(|&&end| end == first.get())
-        .chain(beyond.iter().filter(|&&end| end != first.get()));
+        .filter(|&&end| end == first)
+        .chain(beyond.iter().filter(|&&end| end != first));
     for ramp in [Ramp::Linear, Ramp::Smooth] {
         for &end in ends.clone() {
-            let end = U7::saturating(end);
             if sends(changes, from, (length, end), changes.len(), ramp, budget) {
                 return Some(Point {
                     at: Ticks(length),
@@ -780,9 +893,9 @@ fn ramp_to_loop_end(
 /// between them, `changes[from + 1..until]`, spending `budget` on the
 /// values it works out.
 fn sends(
-    changes: &[(u64, U7)],
+    changes: &[(u64, u16)],
     from: usize,
-    to: (u64, U7),
+    to: (u64, u16),
     until: usize,
     ramp: Ramp,
     budget: &mut u64,
@@ -842,8 +955,13 @@ mod tests {
     }
 
     /// A point at `at` beats.
-    fn at(at: f64, value: u8, ramp: Option<Ramp>) -> ControlPoint {
+    fn at(at: f64, value: i32, ramp: Option<Ramp>) -> ControlPoint {
         ControlPoint { at, value, ramp }
+    }
+
+    /// Controller `number`.
+    fn cc(number: u8) -> Control {
+        Control::Controller(U7::new(number).unwrap())
     }
 
     fn lane(points: Vec<ControlPoint>, repeat_beats: Option<f64>) -> ControlLane {
@@ -914,11 +1032,12 @@ mod tests {
             ("119", None, 119),
         ];
         for (name, device, expected) in cases {
-            assert_eq!(
-                resolve(name, device),
-                Ok(U7::new(expected).unwrap()),
-                "{name}"
-            );
+            assert_eq!(resolve(name, device), Ok(cc(expected)), "{name}");
+        }
+        // Pitch bend and pressure aren't controllers, on any track.
+        for device in [None, Some(&synth)] {
+            assert_eq!(resolve("pitch_bend", device), Ok(Control::PitchBend));
+            assert_eq!(resolve("pressure", device), Ok(Control::Pressure));
         }
         assert_eq!(
             resolve("120", None),
@@ -963,22 +1082,23 @@ mod tests {
         let drums = drums();
         let mut unnamed = synth.clone();
         unnamed.params.remove("wheel");
-        for (controller, device, expected) in [
-            (74, Some(&synth), "filter"),
-            (1, Some(&synth), "wheel"),
-            (33, Some(&synth), "modulation"),
+        for (control, device, expected) in [
+            (cc(74), Some(&synth), "filter"),
+            (cc(1), Some(&synth), "wheel"),
+            (cc(33), Some(&synth), "modulation"),
             // The synth calls 33 modulation, so 1 can't go by that name.
-            (1, None, "modulation"),
-            (7, Some(&drums), "volume"),
-            (7, Some(&synth), "volume"),
-            (3, None, "3"),
+            (cc(1), None, "modulation"),
+            (cc(7), Some(&drums), "volume"),
+            (cc(7), Some(&synth), "volume"),
+            (cc(3), None, "3"),
             // Without its own name for 1, the synth's modulation still means 33.
-            (1, Some(&unnamed), "1"),
+            (cc(1), Some(&unnamed), "1"),
+            (Control::PitchBend, Some(&synth), "pitch_bend"),
+            (Control::Pressure, None, "pressure"),
         ] {
-            let controller = U7::new(controller).unwrap();
-            let name = control_name(controller, device);
+            let name = control_name(control, device);
             assert_eq!(name, expected);
-            assert_eq!(resolve(&name, device), Ok(controller), "{name}");
+            assert_eq!(resolve(&name, device), Ok(control), "{name}");
         }
     }
 
@@ -1307,6 +1427,26 @@ mod tests {
                 "`modulation`: point 1: value must be 0-127, not 128",
             ),
             (
+                one(vec![at(0.0, -1, None)], None),
+                None,
+                "`modulation`: point 1: value must be 0-127, not -1",
+            ),
+            (
+                vec![("pressure", lane(vec![at(0.0, 128, None)], None))],
+                None,
+                "`pressure`: point 1: value must be 0-127, not 128",
+            ),
+            (
+                vec![("pitch_bend", lane(vec![at(0.0, 8192, None)], None))],
+                None,
+                "`pitch_bend`: point 1: value must be -8192 to 8191, with 0 the centre, not 8192",
+            ),
+            (
+                vec![("pitch_bend", lane(vec![at(0.0, i32::MIN, None)], None))],
+                None,
+                "not -2147483648",
+            ),
+            (
                 one(vec![at(-1.0, 1, None)], None),
                 None,
                 "at must be from 0",
@@ -1394,7 +1534,7 @@ mod tests {
     fn a_clip_holds_a_bounded_number_of_control_changes() {
         // A control can have a point for each change a clip holds.
         let points = (0..MAX_POINTS)
-            .map(|tick| at(tick as f64 / 960.0, u8::from(tick % 2 == 1), None))
+            .map(|tick| at(tick as f64 / 960.0, i32::from(tick % 2 == 1), None))
             .collect();
         let full = set(&empty(), vec![("1", lane(points, None))], None, None).unwrap();
         assert_eq!(changes(&full, 1).len(), MAX_CONTROL_CHANGES);
@@ -1442,16 +1582,16 @@ mod tests {
 
     /// Reads `clip`'s controls back, writes them back over the same loop,
     /// and checks the clip is the same.
-    fn round_trip(clip: &Clip) -> BTreeMap<U7, Vec<Point>> {
+    fn round_trip(clip: &Clip) -> BTreeMap<Control, Vec<Point>> {
         let read = controls_from_clip(clip);
         let lanes = read
             .iter()
-            .map(|(controller, points)| {
+            .map(|(&control, points)| {
                 let points = points
                     .iter()
-                    .map(|point| at(beats(point.at), point.value.get(), point.ramp))
+                    .map(|point| at(beats(point.at), control.written(point.value), point.ramp))
                     .collect();
-                (controller.get().to_string(), lane(points, None))
+                (control_name(control, None), lane(points, None))
             })
             .collect();
         let rewritten =
@@ -1460,11 +1600,134 @@ mod tests {
         read
     }
 
-    fn written(points: &[Point]) -> Vec<(f64, u8, Option<Ramp>)> {
+    /// Points as (beat, value as sent, ramp).
+    fn written(points: &[Point]) -> Vec<(f64, u16, Option<Ramp>)> {
         points
             .iter()
-            .map(|point| (beats(point.at), point.value.get(), point.ramp))
+            .map(|point| (beats(point.at), point.value, point.ramp))
             .collect()
+    }
+
+    /// The pitch bends `clip` sends, as (tick, value as sent).
+    fn bends(clip: &Clip) -> Vec<(u64, u16)> {
+        clip.events()
+            .iter()
+            .filter_map(|event| match event.kind {
+                EventKind::PitchBend { value } => Some((event.start.0, value.get())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pitch_bend_is_written_around_the_centre_and_sent_as_14_bits() {
+        let points = vec![
+            at(0.0, -8192, None),
+            at(1.0, 8191, None),
+            at(2.0, 0, None),
+            at(3.0, -1, None),
+        ];
+        let clip = set(
+            &empty(),
+            vec![("pitch_bend", lane(points, None))],
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            bends(&clip),
+            [(0, 0), (960, 16_383), (1920, 8192), (2880, 8191)]
+        );
+        let read = round_trip(&clip);
+        let written: Vec<_> = read[&Control::PitchBend]
+            .iter()
+            .map(|point| Control::PitchBend.written(point.value))
+            .collect();
+        assert_eq!(written, [-8192, 8191, 0, -1]);
+    }
+
+    #[test]
+    fn bend_ramps_move_on_every_step_of_the_grid_and_read_back_as_ramps() {
+        // Up a whole range over a beat, then smoothly back over two: every
+        // 1/32 beat sends a new value.
+        let points = vec![
+            at(0.0, 0, None),
+            at(1.0, 8191, Some(Ramp::Linear)),
+            at(3.0, 0, Some(Ramp::Smooth)),
+            at(3.5, -4096, None),
+            // Back to the centre at the loop's end, where the next pass
+            // starts again.
+            at(4.0, 0, Some(Ramp::Linear)),
+        ];
+        let clip = set(
+            &empty(),
+            vec![("pitch_bend", lane(points.clone(), None))],
+            None,
+            None,
+        )
+        .unwrap();
+        let sent = bends(&clip);
+        // The first point and a value at each of the 31 steps on its way to
+        // the top, which the second point sends; 63 steps and the point on
+        // the way down; then the jump and 15 steps of the last ramp, which
+        // ends where the next pass starts again.
+        assert_eq!(sent.len(), 1 + 31 + 1 + 63 + 1 + 1 + 15);
+        assert!(sent.iter().all(|(tick, _)| tick % RAMP_STEP.0 == 0));
+        assert_eq!(sent[32], (960, 16_383));
+        let read = round_trip(&clip);
+        let read_back: Vec<_> = read[&Control::PitchBend]
+            .iter()
+            .map(|point| {
+                let value = Control::PitchBend.written(point.value);
+                (beats(point.at), value, point.ramp)
+            })
+            .collect();
+        let written: Vec<_> = points
+            .iter()
+            .map(|point| (point.at, point.value, point.ramp))
+            .collect();
+        assert_eq!(read_back, written);
+    }
+
+    #[test]
+    fn pressure_is_a_control_of_its_own() {
+        let swell = |value| {
+            lane(
+                vec![at(0.0, 0, None), at(2.0, value, Some(Ramp::Linear))],
+                None,
+            )
+        };
+        let clip = set(
+            &empty(),
+            vec![("pressure", swell(127)), ("expression", swell(127))],
+            None,
+            None,
+        )
+        .unwrap();
+        let pressure = |clip: &Clip| {
+            clip.events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    EventKind::Pressure { value } => Some((event.start.0, value.get())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        // It moves just as a controller does.
+        assert_eq!(pressure(&clip), changes(&clip, 11));
+        // Setting it again replaces only its own changes, and no points
+        // remove them.
+        let quieter = set(&clip, vec![("pressure", swell(10))], None, None).unwrap();
+        assert_eq!(pressure(&quieter).last(), Some(&(1920, 10)));
+        assert_eq!(changes(&quieter, 11), changes(&clip, 11));
+        let gone = set(&clip, vec![("pressure", lane(vec![], None))], None, None).unwrap();
+        assert_eq!(pressure(&gone), []);
+        assert_eq!(changes(&gone, 11), changes(&clip, 11));
+        let read = controls_from_clip(&clip);
+        assert_eq!(
+            read.keys().copied().collect::<Vec<_>>(),
+            [cc(11), Control::Pressure]
+        );
     }
 
     #[test]
@@ -1497,11 +1760,11 @@ mod tests {
         for points in cases {
             let specs = points
                 .iter()
-                .map(|&(beat, value, ramp)| at(beat, value, ramp))
+                .map(|&(beat, value, ramp)| at(beat, i32::from(value), ramp))
                 .collect();
             let clip = set(&empty(), vec![("1", lane(specs, None))], Some(4.0), None).unwrap();
             let read = round_trip(&clip);
-            assert_eq!(written(&read[&U7::new(1).unwrap()]), points);
+            assert_eq!(written(&read[&cc(1)]), points);
         }
     }
 
@@ -1526,16 +1789,16 @@ mod tests {
             let value = if half % 2 == 1 { 96 } else { 32 };
             expected.push((f64::from(half) / 2.0, value, Some(Ramp::Smooth)));
         }
-        assert_eq!(written(&read[&U7::new(1).unwrap()]), expected);
+        assert_eq!(written(&read[&cc(1)]), expected);
 
         // A step sequence repeated every bar reads back as every step of
         // every pass, and writes back the same, however many there are.
-        let steps = (0..16u8)
+        let steps = (0..16)
             .map(|step| at(f64::from(step) / 4.0, 8 * step, None))
             .collect();
         let sequence = vec![("1", lane(steps, Some(4.0)))];
         let clip = set(&empty(), sequence, Some(512.0), None).unwrap();
-        assert_eq!(round_trip(&clip)[&U7::new(1).unwrap()].len(), 16 * 128);
+        assert_eq!(round_trip(&clip)[&cc(1)].len(), 16 * 128);
     }
 
     #[test]
@@ -1617,15 +1880,15 @@ mod tests {
     fn reading_back_stops_working_out_ramps_when_its_budget_runs_out() {
         // A long, slow ramp: it checks out with budget to spare, and falls
         // back to jumps without it.
-        let changes: Vec<(u64, U7)> =
-            RampValues::new(Ramp::Linear, (0, U7::MIN), (MAX_LOOP, U7::MAX), MAX_LOOP).collect();
-        let start = [(0, U7::MIN)];
+        let changes: Vec<(u64, u16)> =
+            RampValues::new(Ramp::Linear, (0, 0), (MAX_LOOP, 127), MAX_LOOP).collect();
+        let start = [(0, 0)];
         let all: Vec<_> = start.iter().chain(&changes).copied().collect();
         let mut budget = READ_BUDGET;
         assert!(sends(
             &all,
             0,
-            (MAX_LOOP, U7::MAX),
+            (MAX_LOOP, 127),
             all.len(),
             Ramp::Linear,
             &mut budget
@@ -1635,7 +1898,7 @@ mod tests {
         assert!(!sends(
             &all,
             0,
-            (MAX_LOOP, U7::MAX),
+            (MAX_LOOP, 127),
             all.len(),
             Ramp::Linear,
             &mut empty
@@ -1643,12 +1906,12 @@ mod tests {
         // Reading back, the ramp is one point, or without budget, a jump
         // for each change.
         let mut budget = READ_BUDGET;
-        let read_back = read(&all, MAX_LOOP, &mut budget);
+        let read_back = read(&all, MAX_LOOP, 127, &mut budget);
         assert_eq!(
             written(&read_back),
             [(0.0, 0, None), (1024.0, 127, Some(Ramp::Linear))]
         );
-        let jumps = read(&all, MAX_LOOP, &mut empty);
+        let jumps = read(&all, MAX_LOOP, 127, &mut empty);
         assert_eq!(jumps.len(), all.len());
         assert!(jumps.iter().all(|point| point.ramp.is_none()));
     }

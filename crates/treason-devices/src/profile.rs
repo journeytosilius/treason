@@ -9,6 +9,8 @@ use thiserror::Error;
 use treason_core::midi::{Channel, U7};
 use treason_core::model::Program;
 
+use crate::controllers;
+
 /// What one synth or drum machine calls its notes and controls.
 ///
 /// Written in TOML; `devices/gm-drums.toml` is an example.
@@ -61,18 +63,33 @@ pub enum ProfileError {
         "`{0}` is a number, which tools read as a MIDI note, controller or program: give it a name with a letter"
     )]
     NumericName(String),
+    /// A parameter named like pitch bend or channel pressure, which tools
+    /// send as messages of their own.
+    #[error(
+        "parameter `{0}` has the name set_controls gives pitch bend or channel pressure, which aren't controllers: give it another name"
+    )]
+    ReservedParam(String),
 }
 
 impl DeviceProfile {
     /// Checks that every alias points to a voice, that no alias hides one,
-    /// and that no name is a number, since tools read numbers as MIDI notes,
-    /// controllers and programs.
+    /// that no name is a number, since tools read numbers as MIDI notes,
+    /// controllers and programs, and that no parameter takes the name of
+    /// pitch bend or channel pressure.
     pub fn validate(&self) -> Result<(), ProfileError> {
         let numeric = |name: &&String| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
         let names = self.voices.keys().chain(self.aliases.keys());
         let names = names.chain(self.programs.keys());
         if let Some(name) = names.chain(self.params.keys()).find(numeric) {
             return Err(ProfileError::NumericName(name.clone()));
+        }
+        let reserved = [controllers::PITCH_BEND, controllers::PRESSURE];
+        if let Some(name) = self
+            .params
+            .keys()
+            .find(|name| reserved.contains(&name.as_str()))
+        {
+            return Err(ProfileError::ReservedParam(name.clone()));
         }
         for (alias, voice) in &self.aliases {
             if self.voices.contains_key(alias) {
@@ -283,6 +300,22 @@ mod tests {
         }
         let named: DeviceProfile = toml::from_str(&format!("{MINIMAL}\nkick2 = 40")).unwrap();
         assert_eq!(named.validate(), Ok(()));
+    }
+
+    #[test]
+    fn parameters_leave_pitch_bend_and_pressure_their_names() {
+        for name in ["pitch_bend", "pressure"] {
+            let text = format!("{MINIMAL}\n[params]\n{name} = {{ cc = 1 }}");
+            let profile: DeviceProfile = toml::from_str(&text).unwrap();
+            assert_eq!(
+                profile.validate(),
+                Err(ProfileError::ReservedParam(name.into()))
+            );
+            // Voices and programs live apart from controls.
+            let text = format!("{MINIMAL}\n{name} = 40\n[programs]\n{name} = 1");
+            let profile: DeviceProfile = toml::from_str(&text).unwrap();
+            assert_eq!(profile.validate(), Ok(()));
+        }
     }
 
     #[test]

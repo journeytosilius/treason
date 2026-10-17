@@ -31,6 +31,10 @@ pub enum ControlError {
     /// channel, which plays one program at a time.
     #[error("tracks {0} and {1} would set different programs on the same port and channel")]
     ProgramClash(TrackId, TrackId),
+    /// Two tracks would set different bend ranges on the same port and
+    /// channel, which has one.
+    #[error("tracks {0} and {1} would set different bend ranges on the same port and channel")]
+    BendRangeClash(TrackId, TrackId),
     /// Playback refused the request.
     #[error(transparent)]
     Playback(#[from] PlaybackError),
@@ -240,9 +244,12 @@ fn edited(
         Edit::SetClip { track, clip } => track_mut(&mut next, track)?.clip = clip,
         Edit::SetMuted { track, muted } => track_mut(&mut next, track)?.muted = muted,
     }
-    // Edits keep this true, so a clash involves the edited track.
+    // Edits keep these true, so a clash involves the edited track.
     if let Some((first, second)) = next.program_clash() {
         return Err(ControlError::ProgramClash(first, second));
+    }
+    if let Some((first, second)) = next.bend_range_clash() {
+        return Err(ControlError::BendRangeClash(first, second));
     }
     Ok(next)
 }
@@ -303,6 +310,7 @@ mod tests {
             },
             muted: false,
             program: None,
+            bend_range: None,
             clip: Clip::default(),
         }
     }
@@ -402,6 +410,31 @@ mod tests {
             .apply(Edit::ReplaceTrack(with_program(1, 7)))
             .unwrap();
         assert_eq!(session.project().program_clash(), None);
+    }
+
+    #[test]
+    fn tracks_on_one_channel_cannot_set_different_bend_ranges() {
+        let with_range = |id, semitones| Track {
+            bend_range: U7::new(semitones),
+            ..track(id)
+        };
+        let mut session = session(vec![with_range(1, 2), track(2)]);
+        let clash = Err(ControlError::BendRangeClash(TrackId(1), TrackId(3)));
+        assert_eq!(session.apply(Edit::AddTrack(with_range(3, 12))), clash);
+        let clash = Err(ControlError::BendRangeClash(TrackId(1), TrackId(2)));
+        assert_eq!(session.apply(Edit::ReplaceTrack(with_range(2, 12))), clash);
+        assert_eq!(session.project().tracks.len(), 2);
+
+        // The same range, none, or another channel is fine.
+        session.apply(Edit::AddTrack(with_range(3, 2))).unwrap();
+        let mut moved = with_range(2, 12);
+        moved.target.channel = Channel::from_number(2).unwrap();
+        session.apply(Edit::ReplaceTrack(moved)).unwrap();
+        session.apply(Edit::ReplaceTrack(track(3))).unwrap();
+        session
+            .apply(Edit::ReplaceTrack(with_range(1, 24)))
+            .unwrap();
+        assert_eq!(session.project().bend_range_clash(), None);
     }
 
     #[test]

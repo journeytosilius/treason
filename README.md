@@ -8,8 +8,9 @@ synths and other sequencers. It makes no sound itself.
 Status: early. `treason serve` plays what an agent writes on the MIDI ports
 in `treason.toml`: drum parts as step patterns, melodic parts as notes with
 pitch names such as `C4`, controls such as a synth's mod wheel or filter
-cutoff as values that jump or ramp, and each track's sound as a program,
-such as `electric_bass_finger` from the General MIDI set. Ports with `clock = true` get
+cutoff as values that jump or ramp, pitch bends and pressure the same way,
+and each track's sound as a program, such as `electric_bass_finger` from
+the General MIDI set, and how far it bends. Ports with `clock = true` get
 MIDI clock and Start, Stop and Continue, so their gear plays along. A
 port's `latency_ms` makes up for its gear's delay, so everything sounds
 together. On Linux, `backend = "alsa-seq"` hands messages to the kernel's
@@ -70,8 +71,8 @@ Ctrl-C or SIGTERM stops `treason serve`, and every sounding note ends first.
 The project lives in memory until an agent saves it, so ask for a save
 before you stop: `save_project` writes it to `projects/<name>.toml`, and
 `load_project` or `serve --project` brings it back with its tempo, time
-signature and tracks, each with its clip, port, channel, device, program
-and mute.
+signature and tracks, each with its clip, port, channel, device, program,
+bend range and mute.
 `status` says whether there are unsaved changes.
 
 A track can also move its gear's controls (MIDI CC) with `set_controls`,
@@ -79,9 +80,11 @@ alongside its notes or on its own, such as modulation for a synth that
 plays its own notes. The agent names a control by the device's parameter,
 by a standard name such as `modulation`, `volume` or `cutoff`, or by its
 number, and gives it points that jump or ramp, smoothly enough for an LFO.
+`pitch_bend` and `pressure` (channel aftertouch) take points the same way.
 Stop and track cleanup release sustain and sostenuto holds, even after a
-note's key has ended. Pedals affect a whole MIDI channel, so tracks sharing
-that channel share its pedal release. Panic also sends All Sound Off.
+note's key has ended, and put bends and pressure back at rest. Pedals,
+bends and pressure affect a whole MIDI channel, so tracks sharing that
+channel share them. Panic also sends All Sound Off.
 
 `export_midi` writes the project as a MIDI file, `exports/<name>.mid`, with
 the tempo, the time signature and a track for each unmuted track, and

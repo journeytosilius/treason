@@ -37,6 +37,14 @@ pub const STANDARD: [(&str, u8); 26] = [
     ("phaser", 95),
 ];
 
+/// What tools call pitch bend, which is a message of its own rather than a
+/// controller, so no device parameter can take the name.
+pub const PITCH_BEND: &str = "pitch_bend";
+
+/// What tools call channel pressure, or aftertouch: like pitch bend, a
+/// message of its own.
+pub const PRESSURE: &str = "pressure";
+
 /// The controller a standard name stands for, such as 1 for `modulation`.
 pub fn standard_controller(name: &str) -> Option<U7> {
     STANDARD
@@ -76,6 +84,13 @@ mod tests {
             let controller = U7::new(number).unwrap();
             assert_eq!(standard_controller(name), Some(controller));
             assert_eq!(standard_name(controller), Some(name));
+        }
+    }
+
+    #[test]
+    fn pitch_bend_and_pressure_are_not_controllers() {
+        for name in [PITCH_BEND, PRESSURE] {
+            assert_eq!(standard_controller(name), None);
         }
     }
 

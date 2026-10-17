@@ -73,7 +73,10 @@ fn cycle_bars(project: &Project) -> Option<u32> {
     for track in playing.filter(|track| {
         track.clip.events().iter().any(|event| match event.kind {
             EventKind::Note { velocity, .. } => velocity != U7::MIN,
-            EventKind::Control { .. } | EventKind::Program { .. } => true,
+            EventKind::Control { .. }
+            | EventKind::Program { .. }
+            | EventKind::PitchBend { .. }
+            | EventKind::Pressure { .. } => true,
         })
     }) {
         let length = track.clip.length().0;
@@ -99,7 +102,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::midi::{Channel, U7};
+    use crate::midi::{Channel, U7, U14};
     use crate::model::{Clip, ClipEvent, EventKind, OutputTarget, PortId, Track, TrackId};
     use crate::time::{Ticks, TimeSignature};
 
@@ -125,6 +128,7 @@ mod tests {
             },
             muted,
             program: None,
+            bend_range: None,
             clip: Clip::new(length, events).unwrap(),
         })
     }
@@ -266,13 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn control_and_program_changes_still_extend_the_default_cycle() {
+    fn messages_other_than_notes_still_extend_the_default_cycle() {
         for kind in [
             EventKind::Control {
                 controller: U7::MIN,
                 value: U7::MIN,
             },
             EventKind::Program { program: U7::MIN },
+            EventKind::PitchBend { value: U14::CENTER },
+            EventKind::Pressure { value: U7::MIN },
         ] {
             let mut messages = track(1, Ticks::quarters(5), false, true);
             Arc::make_mut(&mut messages).clip = Clip::new(
